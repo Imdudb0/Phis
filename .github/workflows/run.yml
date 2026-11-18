@@ -29,8 +29,8 @@ jobs:
         run: |
           #cargo check
           #cargo run --release --bin phisharp -- eval --model out/sharp.phis --episodes 50
-          #cargo run --release --bin ask -- --model out/sharp.phis --file perceived.eff
-          cargo run --release --bin phisharp -- train --steps 800 --batch 4 --nodes 20 --dim 20 --max-search 8 --out out/sharp.phis
+          cargo run --release --bin ask -- --model out/sharp.phis --file perceived.eff
+          #cargo run --release --bin phisharp -- train --steps 800 --batch 4 --nodes 20 --dim 20 --max-search 8 --out out/sharp.phis
         env:
           RUSTFLAGS: "-C target-cpu=native"
 
