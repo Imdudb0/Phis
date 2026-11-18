@@ -1,0 +1,10 @@
+[package]
+name = "phisharp"
+version = "0.1.0"
+edition = "2024"
+description = "Modèle général de compréhension par abduction sur substrat connexionniste non-réciproque"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
