@@ -87,7 +87,8 @@ pub fn episode(rng: &mut PyRandom, tries: usize) -> (Vec<u8>, Cause) {
         }
     }
     let alpha: Vec<u8> = (base..base + 8).map(|x| x as u8).collect();
-    let c = sample_cause(rng, &alpha, rng.randint(2, 3));
+    let depth = rng.randint(2, 3);
+    let c = sample_cause(rng, &alpha, depth);
     let e = values(&c, None)[c.root].clone();
     (e, c)
 }
