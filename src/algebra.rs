@@ -1,6 +1,6 @@
 //! Algèbre de causes : le méta-a-priori abductif. Zéro donnée de domaine.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Op {
@@ -473,9 +473,141 @@ pub fn indegrees(c: &Cause) -> Vec<usize> {
     deg
 }
 
+/// Partition IIT : coupe le partage de u en copies indépendantes.
+pub fn sever(c: &Cause, u: usize) -> Cause {
+    fn rec(
+        i: usize,
+        u: usize,
+        c: &Cause,
+        b: &mut Builder,
+        memo: &mut HashMap<usize, usize>,
+    ) -> usize {
+        if i != u {
+            if let Some(&cached) = memo.get(&i) {
+                return cached;
+            }
+        }
+        let n = &c.nodes[i];
+        let kids: Vec<usize> = n.kids.iter().map(|&k| rec(k, u, c, b, memo)).collect();
+        let j = b.add(Node {
+            op: n.op,
+            lit: n.lit.clone(),
+            kids,
+            k: n.k,
+            key: n.key,
+            sel: n.sel,
+            var: n.var,
+        });
+        if i != u {
+            memo.insert(i, j);
+        }
+        j
+    }
+
+    let mut b = Builder::new(false);
+    let mut memo = HashMap::new();
+    let root = rec(c.root, u, c, &mut b, &mut memo);
+    b.cause(root)
+}
+
+/// Forme normale associative (pour comparaison uniquement, jamais pour Φ).
+/// - Inline un SEQ non partagé dans son parent SEQ.
+/// - Fusionne les LIT non partagés adjacents à l'intérieur d'un SEQ.
+pub fn normal_form(c: &Cause) -> Cause {
+    if c.nodes.is_empty() {
+        return c.clone();
+    }
+    let (_out, occ) = emit(c, None);
+    let shared: HashSet<usize> = occ
+        .iter()
+        .enumerate()
+        .filter_map(|(i, spans)| if spans.len() >= 2 { Some(i) } else { None })
+        .collect();
+
+    fn build(
+        i: usize,
+        c: &Cause,
+        shared: &HashSet<usize>,
+        b: &mut Builder,
+        memo: &mut HashMap<usize, usize>,
+        seq_flat: &mut HashMap<usize, Vec<(usize, bool)>>,
+    ) -> usize {
+        if let Some(&cached) = memo.get(&i) {
+            return cached;
+        }
+        let n = &c.nodes[i];
+        let j = if n.op == Op::Seq {
+            let mut flat: Vec<(usize, bool)> = Vec::new();
+            for &k in &n.kids {
+                let kn = &c.nodes[k];
+                if kn.op == Op::Seq && !shared.contains(&k) {
+                    let bk = build(k, c, shared, b, memo, seq_flat);
+                    if let Some(sub) = seq_flat.get(&bk) {
+                        flat.extend(sub.iter().copied());
+                    } else {
+                        for &sk in &b.nodes[bk].kids {
+                            flat.push((sk, false));
+                        }
+                    }
+                } else {
+                    let bk = build(k, c, shared, b, memo, seq_flat);
+                    flat.push((bk, shared.contains(&k)));
+                }
+            }
+
+            let mut merged: Vec<(usize, bool)> = Vec::new();
+            let mut buf: Vec<u8> = Vec::new();
+            for (k_b, k_shared) in flat {
+                if b.nodes[k_b].op == Op::Lit && !k_shared {
+                    buf.extend_from_slice(&b.nodes[k_b].lit);
+                } else {
+                    if !buf.is_empty() {
+                        let lit_node = b.add(Node::lit(std::mem::take(&mut buf)));
+                        merged.push((lit_node, false));
+                    }
+                    merged.push((k_b, k_shared));
+                }
+            }
+            if !buf.is_empty() {
+                let lit_node = b.add(Node::lit(buf));
+                merged.push((lit_node, false));
+            }
+
+            let kids: Vec<usize> = merged.iter().map(|&(idx, _)| idx).collect();
+            let seq_id = b.add(Node::seq(kids));
+            seq_flat.entry(seq_id).or_insert(merged);
+            seq_id
+        } else {
+            let kids: Vec<usize> = n
+                .kids
+                .iter()
+                .map(|&k| build(k, c, shared, b, memo, seq_flat))
+                .collect();
+            b.add(Node {
+                op: n.op,
+                lit: n.lit.clone(),
+                kids,
+                k: n.k,
+                key: n.key,
+                sel: n.sel,
+                var: n.var,
+            })
+        };
+        memo.insert(i, j);
+        j
+    }
+
+    let mut b = Builder::new(true);
+    let mut memo = HashMap::new();
+    let mut seq_flat = HashMap::new();
+    let root = build(c.root, c, &shared, &mut b, &mut memo, &mut seq_flat);
+    b.cause(root)
+}
+
 /// Signature MÉTA-RELATIONNELLE : constantes effacées, topologie conservée.
 pub fn signature(c: &Cause, rounds: usize) -> Vec<[u8; 8]> {
-    let deg = indegrees(c);
+    let c = normal_form(c);
+    let deg = indegrees(&c);
     let mut lab: Vec<[u8; 8]> = c
         .nodes
         .iter()
@@ -515,95 +647,84 @@ pub fn signature(c: &Cause, rounds: usize) -> Vec<[u8; 8]> {
     lab
 }
 
-/// Subsomption relationnelle : VAR lie un nœud, topologie de partage préservée.
+/// Subsomption relationnelle AVEC BIJECTION : l'identité des causes (le partage)
+/// est préservée. Sans elle, SEQ(U,X,U,Y) unifie avec SEQ(P,Q,R,S).
 pub fn unify(sc: &Cause, si: usize, tc: &Cause, ti: usize, abstract_lit: bool) -> bool {
+    let sc_norm = if si == sc.root {
+        normal_form(sc)
+    } else {
+        normal_form(&Cause {
+            nodes: sc.nodes.clone(),
+            root: si,
+        })
+    };
+    let tc_norm = if ti == tc.root {
+        normal_form(tc)
+    } else {
+        normal_form(&Cause {
+            nodes: tc.nodes.clone(),
+            root: ti,
+        })
+    };
+
     fn rec(
         a: usize,
         b: usize,
         sc: &Cause,
         tc: &Cause,
         abstract_lit: bool,
+        fwd: &mut HashMap<usize, usize>,
+        bwd: &mut HashMap<usize, usize>,
         binds: &mut HashMap<isize, usize>,
-        pairs: &mut HashMap<(usize, usize), bool>,
     ) -> bool {
-        if let Some(&cached) = pairs.get(&(a, b)) {
-            return cached;
-        }
         let na = &sc.nodes[a];
         let nb = &tc.nodes[b];
-        let ok = if na.op == Op::Var {
+        if na.op == Op::Var {
             if let Some(&bound) = binds.get(&na.var) {
-                bound == b
-            } else {
-                binds.insert(na.var, b);
-                true
+                return bound == b;
             }
-        } else if na.op != nb.op || na.kids.len() != nb.kids.len() {
-            false
-        } else if na.op == Op::Lit {
-            if abstract_lit {
-                true
-            } else {
-                na.lit == nb.lit
+            binds.insert(na.var, b);
+            return true;
+        }
+        if fwd.contains_key(&a) || bwd.contains_key(&b) {
+            return fwd.get(&a) == Some(&b) && bwd.get(&b) == Some(&a);
+        }
+        if na.op != nb.op || na.kids.len() != nb.kids.len() {
+            return false;
+        }
+        if !abstract_lit {
+            if na.op == Op::Lit && na.lit != nb.lit {
+                return false;
             }
-        } else {
-            let mut sub_ok = na
-                .kids
-                .iter()
-                .zip(nb.kids.iter())
-                .all(|(&x, &y)| rec(x, y, sc, tc, abstract_lit, binds, pairs));
-            if sub_ok && !abstract_lit {
-                if na.op == Op::Rep {
-                    sub_ok = na.k == nb.k;
-                }
-                if na.op == Op::Rec {
-                    sub_ok = na.key == nb.key;
-                }
+            if na.op == Op::Rep && na.k != nb.k {
+                return false;
             }
-            sub_ok
-        };
-        pairs.insert((a, b), ok);
-        ok
+            if na.op == Op::Rec && na.key != nb.key {
+                return false;
+            }
+        }
+        fwd.insert(a, b);
+        bwd.insert(b, a);
+        if na.op == Op::Lit {
+            return true;
+        }
+        na.kids
+            .iter()
+            .zip(nb.kids.iter())
+            .all(|(&x, &y)| rec(x, y, sc, tc, abstract_lit, fwd, bwd, binds))
     }
 
+    let mut fwd = HashMap::new();
+    let mut bwd = HashMap::new();
     let mut binds = HashMap::new();
-    let mut pairs = HashMap::new();
-    rec(si, ti, sc, tc, abstract_lit, &mut binds, &mut pairs)
-}
-
-/// Partition IIT : coupe le partage de u en copies indépendantes.
-pub fn sever(c: &Cause, u: usize) -> Cause {
-    fn rec(
-        i: usize,
-        u: usize,
-        c: &Cause,
-        b: &mut Builder,
-        memo: &mut HashMap<usize, usize>,
-    ) -> usize {
-        if i != u {
-            if let Some(&cached) = memo.get(&i) {
-                return cached;
-            }
-        }
-        let n = &c.nodes[i];
-        let kids: Vec<usize> = n.kids.iter().map(|&k| rec(k, u, c, b, memo)).collect();
-        let j = b.add(Node {
-            op: n.op,
-            lit: n.lit.clone(),
-            kids,
-            k: n.k,
-            key: n.key,
-            sel: n.sel,
-            var: n.var,
-        });
-        if i != u {
-            memo.insert(i, j);
-        }
-        j
-    }
-
-    let mut b = Builder::new(false);
-    let mut memo = HashMap::new();
-    let root = rec(c.root, u, c, &mut b, &mut memo);
-    b.cause(root)
+    rec(
+        sc_norm.root,
+        tc_norm.root,
+        &sc_norm,
+        &tc_norm,
+        abstract_lit,
+        &mut fwd,
+        &mut bwd,
+        &mut binds,
+    )
 }
