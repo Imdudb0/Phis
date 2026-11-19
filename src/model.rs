@@ -11,7 +11,6 @@ use crate::ptgrs::episode;
 use crate::json::Json;
 use crate::rng::PyRandom;
 use crate::phi::phi;
-use crate::core::Cfg;
 
 #[derive(Clone, Debug)]
 pub struct Matched {
