@@ -7,7 +7,7 @@ use std::process::ExitCode;
 
 use phisharp::algebra::{sever, Cause, Node};
 use phisharp::core::{abduce, residual, Cfg, Perception, Router};
-use phisharp::gen::episode;
+use phisharp::ptgrs::episode;
 use phisharp::model::{load, save, train, understand};
 use phisharp::phi::phi;
 use phisharp::rng::PyRandom;
