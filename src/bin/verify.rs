@@ -143,6 +143,22 @@ fn main() -> ExitCode {
     let (router, manifest) = train_manifest(&cfg, 200, 1, None);
     save(&router, &cfg, "out/sharp.phis").expect("save failed");
     let (router, cfg) = load("out/sharp.phis").expect("load failed");
+    
+    for (tag, names) in [("WORDS", WORDS), ("NONCE", NONCE)] {
+        let (e, _) = fixture(names, false, 7, false, false);
+        let mut p = Perception::new(e.clone(), &cfg);
+        p.ensure_frames();
+        let (s, _) = router.score(&p);
+        for &(a, b, c, r) in &p.slots {
+            if c != 0 { continue; }
+            let ab = abduce(&p, a, b, &s, &cfg, &mut PyRandom::new(0), None);
+            let ops: Vec<String> = ab.cause.as_ref()
+                .map(|cc| cc.nodes.iter().map(|n| format!("{:?}", n.op)).collect())
+                .unwrap_or_default();
+            let arite = ab.cause.as_ref().map(|cc| cc.nodes[cc.root].kids.len()).unwrap_or(0);
+            eprintln!("{tag} rec{r} ({a},{b}) cover={:?} arite={arite} ops={ops:?} phi={:.3}", ab.cover.iter().map(|&i| (p.items[i].i, p.items[i].j)).collect::<Vec<_>>(), ab.phi);
+        }
+    }
 
     // A9 : non-réciprocité (Jacobien M du routage graphe + F != B^T)
     let per0 = Perception::new(fixture(WORDS, false, 7, false, false).0, &cfg);
@@ -356,7 +372,7 @@ fn main() -> ExitCode {
     let pu = gains.iter().map(|g| g.3).sum::<f64>() / gains.len() as f64;
     check(&mut results, "A8a efficacité : pops réduits", mt <= mu, &format!("pops {mt:.1} vs {mu:.1}"));
     check(&mut results, "A8b non-infériorité Φ (tolérance = bruit mesuré)", pt >= pu - floor, &format!("phi {pt:.3} vs {pu:.3} | plancher_bruit={floor:.3}"));
-    
+
     check(&mut results, "A1bis sondes A7/A8 hors entraînement", !manifest.contains(&er), "");
 
     // ---- A13 : ablation — sans abduction, pas de réponse ----------------
