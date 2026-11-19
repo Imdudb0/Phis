@@ -12,10 +12,8 @@ use phisharp::model::{load, save, train, understand};
 use phisharp::phi::phi;
 use phisharp::rng::PyRandom;
 
-#[path = "common/fixture.rs"] mod fixture;
-use fixture::{fixture, WORDS};
-
-const NONCE: [&str; 3] = ["brintok", "muvane", "selpic"];
+#[path = "common/fixture.rs"] mod fix;
+use fix::{fixture, WORDS, NONCE};
 
 fn check(results: &mut Vec<(String, bool, String)>, name: &str, cond: bool, detail: &str) {
     results.push((name.to_string(), cond, detail.to_string()));
