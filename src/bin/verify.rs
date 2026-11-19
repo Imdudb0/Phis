@@ -12,6 +12,9 @@ use phisharp::model::{load, save, train, understand};
 use phisharp::phi::phi;
 use phisharp::rng::PyRandom;
 
+#[path = "common/fixture.rs"] mod fixture;
+use fixture::{fixture, WORDS};
+
 const WORDS: [&str; 3] = ["ambiguity", "univocity", "redundancy"];
 const NONCE: [&str; 3] = ["brintok", "muvane", "selpic"];
 
