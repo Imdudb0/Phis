@@ -10,6 +10,7 @@ use crate::core::{abduce, residual, Abduction, Cfg, Perception, Residual, Router
 use crate::ptgrs::episode;
 use crate::json::Json;
 use crate::rng::PyRandom;
+use crate::phi::phi;
 
 #[derive(Clone, Debug)]
 pub struct Matched {
@@ -352,20 +353,24 @@ pub fn train(
     let mut rng = PyRandom::new(seed);
     let mut seen: HashSet<Vec<u8>> = HashSet::new();
     let mut phi_ref: f64 = 1.0;  // référence glissante, non saturante
-
+    
     for ep in 0..episodes {
-        let (e, _truth) = episode(&mut rng, 60);
+        let (e, truth) = episode(&mut rng, 60);
         assert!(!seen.contains(&e), "violation une-seule-passe");
         seen.insert(e.clone());
 
         let per = Perception::new(e.clone(), cfg);
         let (scores, hm) = router.score(&per);
         let ab = abduce(&per, 0, e.len(), &scores, cfg, &mut rng, None);
-        let q    = (1.0 + ab.phi).ln() / (1.0 + phi_ref).ln();   // ~0.3 .. ~1.5
-        let cost = ab.pops as f64 / cfg.pops.max(1) as f64;      // 0 .. 1
-        let r    = q - 0.05 * cost;                              // qualité dominante
+        
+        let (phi_oracle, _) = phi(&truth, &e, &mut PyRandom::new(seed ^ 0x5eed), 32, &[], 3);
+        let q    = ab.phi / (phi_oracle + 1.0);          // LINÉAIRE en Φ, aucun plateau
+        let cost = ab.pops as f64 / cfg.pops.max(1) as f64;
+        let r    = q - 0.05 * cost;
+        
         phi_ref  = 0.95 * phi_ref + 0.05 * ab.phi;
         router.update(&per, &hm, &ab.used, r, 0.05);
+        if ep % 20 == 0 { eprintln!("r range check: q={q:.3} cost={cost:.3} r={r:.3}"); }
         if let Some(logger) = log {
             if ep % 20 == 0 {
                 logger(ep, r, ab.phi, ab.pops);
