@@ -349,6 +349,16 @@ fn main() -> ExitCode {
         let a2 = abduce(&pe, 0, ee.len(), &st, &cfg, &mut PyRandom::new(6), None);
         floor = floor.max((a1.phi - a2.phi).abs());
     }
+    let mut gains = Vec::new();
+    for s in 0..12u64 {
+        let (ee, _) = episode(&mut PyRandom::new(1000 + s), 60);
+        let pe = Perception::new(ee.clone(), &cfg);
+        let (st, _) = router.score(&pe);
+        let (su, _) = rand_router.score(&pe);
+        let at = abduce(&pe, 0, ee.len(), &st, &cfg, &mut PyRandom::new(5), None);
+        let au = abduce(&pe, 0, ee.len(), &su, &cfg, &mut PyRandom::new(5), None);
+        gains.push((at.pops, au.pops, at.phi, au.phi));
+    }
     let mt = gains.iter().map(|g| g.0 as f64).sum::<f64>() / gains.len() as f64;
     let mu = gains.iter().map(|g| g.1 as f64).sum::<f64>() / gains.len() as f64;
     let pt = gains.iter().map(|g| g.2).sum::<f64>() / gains.len() as f64;
