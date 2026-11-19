@@ -65,8 +65,8 @@ pub fn sample_cause(rng: &mut PyRandom, alpha: &[u8], depth: usize) -> Cause {
 }
 
 pub fn episode(rng: &mut PyRandom, tries: usize) -> (Vec<u8>, Cause) {
+    let base = rng.randrange_range(32, 200);
     for _ in 0..tries {
-        let base = rng.randrange_range(32, 200);
         let alpha_len = rng.randint(6, 12);
         let alpha: Vec<u8> = (base..base + alpha_len).map(|x| x as u8).collect();
         let depth = rng.randint(2, 3);
@@ -86,8 +86,8 @@ pub fn episode(rng: &mut PyRandom, tries: usize) -> (Vec<u8>, Cause) {
             }
         }
     }
-    let alpha: Vec<u8> = (65..73).collect();
-    let c = sample_cause(rng, &alpha, 2);
+    let alpha: Vec<u8> = (base..base + 8).map(|x| x as u8).collect();
+    let c = sample_cause(rng, &alpha, rng.randint(2, 3));
     let e = values(&c, None)[c.root].clone();
     (e, c)
 }
