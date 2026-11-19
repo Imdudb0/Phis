@@ -7,7 +7,7 @@ use std::path::Path;
 
 use crate::algebra::{signature, unify};
 use crate::core::{abduce, residual, Abduction, Cfg, Perception, Residual, Router};
-use crate::ptgrs::episode;
+use crate::ptgrs::{episode, episode_hard};
 use crate::json::Json;
 use crate::rng::PyRandom;
 use crate::phi::phi;
