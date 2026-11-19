@@ -3,7 +3,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::hash::Hash;
 
-use crate::algebra::{emit, values, Cause, Intervention, Op};
+use crate::algebra::{emit, values, Cause, Intervention, Op, IDENT};
 use crate::rng::PyRandom;
 
 #[derive(Clone, Debug)]
@@ -57,10 +57,7 @@ fn first_k_permutations(n: usize, limit: usize) -> Vec<Vec<usize>> {
     out
 }
 
-pub fn state_spaces(
-    c: &Cause,
-    extra_keys: &[[u8; 256]],
-) -> Vec<(usize, Vec<Intervention>)> {
+pub fn state_spaces(c: &Cause, _extra_keys: &[[u8; 256]]) -> Vec<(usize, Vec<Intervention>)> {
     let mut out = Vec::new();
     for (i, n) in c.nodes.iter().enumerate() {
         let vs: Vec<Intervention> = match n.op {
@@ -95,18 +92,14 @@ pub fn state_spaces(
                 res
             }
             Op::Alt => (0..n.kids.len()).map(Intervention::Sel).collect(),
-            Op::Rec => {
-                let mut keys = vec![n.key];
-                for &k in extra_keys {
-                    if !keys.contains(&k) {
-                        keys.push(k);
-                        if keys.len() == 4 {
-                            break;
-                        }
-                    }
-                }
-                keys.into_iter().map(Intervention::Key).collect()
-            }
+                    Op::Rec => {
+            // P21 : {clé du mécanisme, identité} = « ce recodage porte-t-il un pouvoir causal ? »
+            // Aucune clé étrangère venue de E ⇒ Φ(c,E) ne dépend plus de l'alphabet global.
+            // Cardinalité ≤ 2, commensurable avec les alternatives LIT (rev/rot/vide).
+            let mut keys = vec![n.key];
+            if !keys.contains(&IDENT) { keys.push(IDENT); }
+            keys.into_iter().map(Intervention::Key).collect()
+        }
             _ => Vec::new(),
         };
         if vs.len() > 1 {
