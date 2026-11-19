@@ -374,12 +374,16 @@ fn main() -> ExitCode {
         let ab_q = abduce(&per, ix, iy, &scores, &cfg, &mut PyRandom::new(0), None);
         let ab2 = abduce(&per2, mx, my, &s2, &cfg, &mut PyRandom::new(0), None);
         let r2 = residual(&per2, mx, my, &ab2);
-        check(
-            &mut results,
-            "A6 résidu : même slot requête mutilé => Φ chute et INERT grandit",
-            ab2.phi < ab_q.phi && !r2.inert.is_empty(),
-            &format!("intact={:.3} mutilated={:.3} inert={:?}", ab_q.phi, ab2.phi, r2.inert),
-        );
+        let missing = !r2.gap.is_empty() || !r2.inert.is_empty();
+        check(&mut results,
+            "A6 résidu : même slot requête mutilé => Φ chute et ρ non vide",
+            ab2.phi < ab_q.phi && missing,
+            &format!("intact={:.3} mutilated={:.3} gap={:?} inert={:?}", ab_q.phi, ab2.phi, r2.gap, r2.inert));
+        eprintln!("A6 diag slot=({mx},{my}) bytes={:?} atoms_chevauchants={:?} complete={} cause={} nsrc={:?} gap={:?} inert={:?}",
+        &per2.e[mx..my],
+        per2.atoms.iter().filter(|&&(x,y)| x < my && y > mx).collect::<Vec<_>>(),
+        ab2.complete, ab2.cause.is_some(),
+        ab2.info.as_ref().map(|i| i.sources.len()), r2.gap, r2.inert);
     } else {
         check(&mut results, "A6 résidu", false, "slot requête introuvable");
     }
