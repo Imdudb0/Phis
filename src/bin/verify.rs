@@ -444,6 +444,11 @@ fn main() -> ExitCode {
         same_effect && signature(&c1, 3) == signature(&c2, 3) && unify(&c1,     4, &c2, 3, true),
         &format!("same_effect={same_effect}"),
     );
+    
+    if let Ok(demo) = fs::read("perceived.eff") {
+        let (e, _) = fixture(WORDS, false, 7, false, false);
+        check(&mut results, "A16 perceived.eff == fixture valide (anti-drift)", demo == e, "");
+    }
 
     let n_ok = results.iter().filter(|(_, c, _)| *c).count();
     println!("\n=== {n_ok}/{} PASS ===", results.len());
