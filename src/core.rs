@@ -934,6 +934,7 @@ pub fn abduce(
         return empty(0);
     }
 
+    let sel_seed: u64 = 0x9E37_79B9_7F4A_7C15 ^ ((a as u64) << 32) ^ (b as u64);
     let mut starts: HashMap<usize, Vec<usize>> = HashMap::new();
     for pos in a..b {
         if let Some(lst) = per.by_start.get(&pos) {
@@ -1040,7 +1041,6 @@ pub fn abduce(
             if values(&c, None)[c.root].as_slice() != target {
                 continue;
             }
-            let sel_seed: u64 = 0x9E37_79B9_7F4A_7C15 ^ ((a as u64) << 32) ^ (b as u64);
             let mut rng_sel = PyRandom::new(sel_seed);          // REMISE À ZÉRO par variante
             let extra_slice = &extra_keys[..extra_keys.len().min(3)];
             let (ph, info) = phi(&c, target, &mut rng_sel, cfg.phi_n, extra_slice, 3);
