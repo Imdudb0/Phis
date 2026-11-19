@@ -8,9 +8,9 @@ use std::process::ExitCode;
 use phisharp::algebra::{sever, signature, unify, Cause, Node, values};
 use phisharp::core::{abduce, residual, Cfg, Perception, Router};
 use phisharp::ptgrs::episode;
-use phisharp::model::{load, save, train, understand};
 use phisharp::phi::phi;
 use phisharp::rng::PyRandom;
+use phisharp::model::{load, save, train_manifest, understand};
 
 #[path = "common/fixture.rs"] mod fix;
 use fix::{fixture, WORDS, NONCE};
@@ -140,7 +140,7 @@ fn main() -> ExitCode {
     );
 
     eprintln!("entraînement : une seule séance, une passe…");
-    let router = train(&cfg, 200, 1, None);
+    let (router, manifest) = train_manifest(&cfg, 200, 1, None);
     save(&router, &cfg, "out/sharp.phis").expect("save failed");
     let (router, cfg) = load("out/sharp.phis").expect("load failed");
 
@@ -180,12 +180,8 @@ fn main() -> ExitCode {
         let (e, _) = episode(&mut rng, 60);
         train_set.insert(e);
     }
-    check(
-        &mut results,
-        "A10 une-seule-passe",
-        true,
-        "assert interne à train()",
-    );
+    check(&mut results, "A10 une-seule-passe (unicité construite, pas subie)",
+      manifest.len() == 200, &format!("uniques={}", manifest.len()));
 
     // ---- Preuve principale : réponse NL, zéro-shot ---------------------
     for (tag, names, hi) in [
@@ -194,12 +190,7 @@ fn main() -> ExitCode {
         ("A11 termes NONCE (anti-mémorisation)", NONCE, false),
     ] {
         let (e, bodies) = fixture(names, hi, 7, false, false);
-        check(
-            &mut results,
-            "A1 fixture absente de l'entraînement",
-            !train_set.contains(&e),
-            "",
-        );
+        check(&mut results, "A1 fixture absente de l'entraînement", !manifest.contains(&e), "");
         let (ans, rep) = understand(&e, &router, &cfg, 0);
         let mut expect = Vec::new();
         expect.extend_from_slice(b"the cause of ");
@@ -338,7 +329,7 @@ fn main() -> ExitCode {
         ab_r.phi >= ab_t.phi - 1e-9,
         &format!("trained={:.3} random={:.3}", ab_t.phi, ab_r.phi),
     );
-    
+
     // bruit intrinsèque : même routeur, deux graines Monte-Carlo
     let mut floor = 0.0f64;
     for s in 0..32u64 {
