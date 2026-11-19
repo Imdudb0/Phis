@@ -1,6 +1,8 @@
+use std::collections::HashSet;
+
 use phisharp::rng::PyRandom;
 
-const WORDS: [&str; 3] = ["ambiguity", "univocity", "redundancy"];
+pub const WORDS: [&str; 3] = ["ambiguity", "univocity", "redundancy"];
 
 fn pools(hi: bool) -> Vec<Vec<u8>> {
     if hi {
@@ -44,7 +46,7 @@ fn motif(kind: usize, u: &[u8], v1: &[u8], v2: &[u8], w: &[u8], sep: &[u8]) -> V
     out
 }
 
-fn fixture(
+pub fn fixture(
     names: [&str; 3],
     hi: bool,
     seed: u64,
