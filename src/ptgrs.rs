@@ -69,7 +69,8 @@ pub fn episode_hard(rng: &mut PyRandom, tries: usize) -> (Vec<u8>, Cause) {
         let base = rng.randrange_range(32, 180);
         let alpha_len = rng.randint(8, 16);
         let alpha: Vec<u8> = (base..base + alpha_len).map(|x| x as u8).collect();
-        let c = sample_cause(rng, &alpha, rng.randint(3, 4));
+        let depth = rng.randint(3, 4);
+        let c = sample_cause(rng, &alpha, depth);
         let e = values(&c, None)[c.root].clone();
         if (40..=140).contains(&e.len()) {
             let mut seen = [false; 256]; let mut uniq = 0usize;
