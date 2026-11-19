@@ -351,6 +351,7 @@ pub fn train(
     let mut router = Router::new(cfg.d, cfg.h, seed);
     let mut rng = PyRandom::new(seed);
     let mut seen: HashSet<Vec<u8>> = HashSet::new();
+    let mut phi_ref: f64 = 1.0;  // référence glissante, non saturante
 
     for ep in 0..episodes {
         let (e, _truth) = episode(&mut rng, 60);
@@ -360,7 +361,10 @@ pub fn train(
         let per = Perception::new(e.clone(), cfg);
         let (scores, hm) = router.score(&per);
         let ab = abduce(&per, 0, e.len(), &scores, cfg, &mut rng, None);
-        let r = ab.phi.tanh() - 0.25 * (ab.pops as f64 / cfg.pops.max(1) as f64);
+        let q    = (1.0 + ab.phi).ln() / (1.0 + phi_ref).ln();   // ~0.3 .. ~1.5
+        let cost = ab.pops as f64 / cfg.pops.max(1) as f64;      // 0 .. 1
+        let r    = q - 0.05 * cost;                              // qualité dominante
+        phi_ref  = 0.95 * phi_ref + 0.05 * ab.phi;
         router.update(&per, &hm, &ab.used, r, 0.05);
         if let Some(logger) = log {
             if ep % 20 == 0 {
