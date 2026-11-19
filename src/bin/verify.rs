@@ -349,6 +349,10 @@ fn main() -> ExitCode {
         let a2 = abduce(&pe, 0, ee.len(), &st, &cfg, &mut PyRandom::new(6), None);
         floor = floor.max((a1.phi - a2.phi).abs());
     }
+    let mt = gains.iter().map(|g| g.0 as f64).sum::<f64>() / gains.len() as f64;
+    let mu = gains.iter().map(|g| g.1 as f64).sum::<f64>() / gains.len() as f64;
+    let pt = gains.iter().map(|g| g.2).sum::<f64>() / gains.len() as f64;
+    let pu = gains.iter().map(|g| g.3).sum::<f64>() / gains.len() as f64;
     check(&mut results, "A8a efficacité : pops réduits", mt <= mu, &format!("pops {mt:.1} vs {mu:.1}"));
     check(&mut results, "A8b non-infériorité Φ (tolérance = bruit mesuré)", pt >= pu - floor, &format!("phi {pt:.3} vs {pu:.3} | plancher_bruit={floor:.3}"));
 
