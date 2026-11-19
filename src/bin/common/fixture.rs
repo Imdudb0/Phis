@@ -1,0 +1,1 @@
+const WORDS: [&str; 3] = ["ambiguity", "univocity", "redundancy"];
