@@ -356,6 +356,8 @@ fn main() -> ExitCode {
     let pu = gains.iter().map(|g| g.3).sum::<f64>() / gains.len() as f64;
     check(&mut results, "A8a efficacité : pops réduits", mt <= mu, &format!("pops {mt:.1} vs {mu:.1}"));
     check(&mut results, "A8b non-infériorité Φ (tolérance = bruit mesuré)", pt >= pu - floor, &format!("phi {pt:.3} vs {pu:.3} | plancher_bruit={floor:.3}"));
+    
+    check(&mut results, "A1bis sondes A7/A8 hors entraînement", !manifest.contains(&er), "");
 
     // ---- A13 : ablation — sans abduction, pas de réponse ----------------
     let (e3, _) = fixture(WORDS, false, 7, false, false);
