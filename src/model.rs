@@ -441,6 +441,7 @@ pub fn save(router: &Router, cfg: &Cfg, path: &str) -> Result<(), String> {
             Json::Arr(router.u.iter().map(|&v| Json::Float(v)).collect()),
         ),
         ("baseline".to_string(), Json::Float(router.baseline)),
+        ("m2".to_string(), Json::Float(router.m2)),
     ]);
     fs::write(p, root.to_pretty_string()).map_err(|e| e.to_string())
 }
@@ -483,7 +484,8 @@ pub fn load(path: &str) -> Result<(Router, Cfg), String> {
     let baseline = root
         .get("baseline")
         .and_then(Json::as_f64)
-        .ok_or("missing baseline")?;
+        .ok_or("missing baseline")?;    
+    let m2 = root.get("m2").and_then(Json::as_f64).unwrap_or(0.0);
     Ok((
         Router {
             d: cfg.d,
@@ -493,6 +495,7 @@ pub fn load(path: &str) -> Result<(Router, Cfg), String> {
             wb,
             u,
             baseline,
+            m2,
         },
         cfg,
     ))
