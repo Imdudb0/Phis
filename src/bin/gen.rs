@@ -1,7 +1,13 @@
-#[path = "common/fixture.rs"] mod fixture;
-fn main() -> std::process::ExitCode {
-    let (e, bodies) = fixture::fixture(fixture::WORDS, false, 7, false, false);
-    std::fs::write("perceived.eff", &e).expect("write perceived.eff");
-    eprintln!("perceived.eff écrit, corps requête = {:?}", String::from_utf8_lossy(&bodies[3]));
-    std::process::ExitCode::SUCCESS
+#[path = "common/fixture.rs"] mod fix;
+use std::process::ExitCode;
+
+fn main() -> ExitCode {
+    let (e, bodies) = fix::fixture(fix::WORDS, false, 7, false, false);
+    if let Err(err) = std::fs::write("perceived.eff", &e) {
+        eprintln!("write perceived.eff: {err}");
+        return ExitCode::FAILURE;
+    }
+    eprintln!("perceived.eff : {} octets, corps requête = {:?}",
+              e.len(), String::from_utf8_lossy(&bodies[3]));
+    ExitCode::SUCCESS
 }
