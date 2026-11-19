@@ -644,7 +644,8 @@ pub struct Router {
     pub wp: Vec<Vec<f64>>,
     pub wb: Vec<Vec<f64>>,
     pub u: Vec<f64>,
-    pub baseline: f64,
+    pub baseline: f64, 
+    pub m2: f64,
 }
 
 impl Router {
@@ -695,7 +696,7 @@ impl Router {
         }
         (s, hm)
     }
-
+    
     pub fn update(
         &mut self,
         per: &Perception,
@@ -704,12 +705,14 @@ impl Router {
         reward: f64,
         eta: f64,
     ) {
-        if used.is_empty() {
-            self.baseline += 0.05 * (reward - self.baseline);
-            return;
-        }
-        let adv = reward - self.baseline;
-        self.baseline += 0.05 * (reward - self.baseline);
+        let adv_raw = reward - self.baseline;
+        self.baseline += 0.05 * adv_raw;
+        self.m2       += 0.05 * (reward * reward - self.m2);
+        let var = (self.m2 - self.baseline * self.baseline).max(1e-8);
+        let adv = (adv_raw / var.sqrt()).clamp(-3.0, 3.0);
+        if used.is_empty() { return; }
+    
+        self.baseline += 0.05 * adv;
         let m = used.len().max(1) as f64;
         let cols = self.d.min(12);
         let mut mean_hm = vec![0.0; self.h];
