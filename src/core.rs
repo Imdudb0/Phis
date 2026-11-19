@@ -998,7 +998,7 @@ pub fn abduce(
     let mut best = empty(pops);
     let mut best_key: (f64, isize, isize) = (-1.0, -1, -1);
     let mut extra_keys: Vec<[u8; 256]> = Vec::new();
-    
+
     {
         let mut local: Vec<usize> = per.items.iter().enumerate()
             .filter(|(_, it)| it.kind == Op::Lit && it.i >= a && it.j <= b)
@@ -1042,7 +1042,6 @@ pub fn abduce(
                 if (is.lit.len(), pattern(&is.lit)) != pat { continue; }
                 if let Some(key) = per.key_between(s, idx) {
                     linkable.push((t, s, key));
-                    extra_keys.push(key);
                     break;
                 }
             }
