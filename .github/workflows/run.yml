@@ -1,7 +1,17 @@
 name: Run Phisharp
 
 on:
-  workflow_dispatch
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Execution mode"
+        required: true
+        default: "verify"
+        type: choice
+        options:
+          - verify
+          - train_and_ask
+          - fixture_only
 
 permissions:
   contents: write
@@ -12,48 +22,55 @@ env:
   MKL_NUM_THREADS: "1"
   OMP_NUM_THREADS: "1"
   RAYON_NUM_THREADS: "4"
+  RUSTFLAGS: "-C target-cpu=native"
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Build
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo dependencies and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binaries
         run: cargo build --release --bins
-        env:
-          RUSTFLAGS: "-C target-cpu=native"
 
       - name: Run Phisharp
         run: |
-          #cargo check
-          #cargo run --release --bin gen
-          #cargo run --release --bin phisharp -- ask --model out/sharp.phis --file perceived.eff --json
-          #cargo run --release --bin phisharp -- train --out out/sharp.phis --episodes 240 --seed 1
-          #cargo run --release --bin verify
-          make verify
-        env:
-          RUSTFLAGS: "-C target-cpu=native"
-
-      #- name: Run test
-        #run: |
-          #cargo test 
-#--workspace
-          #cargo clippy --workspace --all-targets
+          mkdir -p out
+          case "${{ inputs.mode }}" in
+            fixture_only)
+              ./target/release/gen
+              ;;
+            train_and_ask)
+              ./target/release/gen
+              ./target/release/phisharp train --out out/sharp.phis --episodes 240 --seed 1
+              ./target/release/phisharp ask --model out/sharp.phis --file perceived.eff --json > out/ask.json
+              ;;
+            verify|*)
+              ./target/release/gen
+              ./target/release/verify
+              ;;
+          esac
 
       - name: Debug - Show files and Git status
         if: always()
         run: |
-          echo "=== Files in directories ==="
+          echo "=== Files in out/ ==="
           ls -la out/ || echo "Directory out/ not found!"
           echo "=== Git Status (including ignored) ==="
           git status --ignored
 
       - name: Commit and Push changes
-        if: always()
+        if: success()
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "Résultats simulation: ${{ github.run_number }}"
-          file_pattern: 'out/'
-          add_options: '-f'
+          commit_message: "Résultats simulation (${{ inputs.mode }}): ${{ github.run_number }}"
+          file_pattern: "out/*"
+          add_options: "-f"
