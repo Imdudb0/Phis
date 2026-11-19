@@ -152,7 +152,7 @@ impl Perception {
         per.compute_features();
         per
     }
-    
+
     pub fn ensure_frames(&mut self) {
         if self.frames_ready { return; }
         self.compute_frames();
@@ -719,7 +719,7 @@ impl Router {
         }
         (s, hm)
     }
-
+    
     pub fn update(
         &mut self,
         per: &Perception,
@@ -727,13 +727,13 @@ impl Router {
         used: &[usize],
         reward: f64,
         eta: f64,
-    ) {
+    ) -> f64 {
         let adv_raw = reward - self.baseline;
         self.baseline += 0.05 * adv_raw;
         self.m2       += 0.05 * (reward * reward - self.m2);
         let var = (self.m2 - self.baseline * self.baseline).max(1e-8);
         let adv = (adv_raw / var.sqrt()).clamp(-3.0, 3.0);
-        if used.is_empty() { return; }
+        if used.is_empty() { return adv; }
 
         let m = used.len().max(1) as f64;
         let cols = self.d.min(12);
@@ -753,6 +753,7 @@ impl Router {
         for c in 0..self.h {
             self.u[c] += eta * adv * (mean_hm[c] / m);
         }
+        adv
     }
 
     /// Wp != Wb^T.
