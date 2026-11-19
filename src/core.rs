@@ -1047,52 +1047,34 @@ pub struct Residual {
     pub open: Vec<(usize, usize, Vec<usize>)>,
 }
 
-/// ρ : ce qui MANQUE à la perception, en termes purement causaux.
 pub fn residual(per: &Perception, a: usize, b: usize, ab: &Abduction) -> Residual {
-    if !ab.complete || ab.cause.is_none() {
-        return Residual {
-            gap: vec![(a, b)],
-            inert: Vec::new(),
-            undet: Vec::new(),
-            open: Vec::new(),
-        };
-    }
-
     let mut covered = HashSet::new();
-    if let Some(ref info) = ab.info {
-        for d in &info.sources {
-            if d.iota > 0.0 && d.eps > 0.0 {
-                for &(x, y) in &info.occ[d.node] {
-                    for pos in x..y {
-                        covered.insert(pos);
-                    }
+    if ab.complete {
+        if let Some(ref info) = ab.info {
+            for d in &info.sources {
+                if d.iota > 0.0 && d.eps > 0.0 {
+                    for &(x, y) in &info.occ[d.node] { for p in x..y { covered.insert(p); } }
                 }
             }
         }
     }
-
     let mut inert = Vec::new();
     let mut cur: Option<usize> = None;
     for t in 0..(b - a) {
-        if !covered.contains(&t) {
-            if cur.is_none() {
-                cur = Some(t);
-            }
-        } else if let Some(c) = cur {
-            inert.push((a + c, a + t));
-            cur = None;
-        }
+        if !covered.contains(&t) { if cur.is_none() { cur = Some(t); } }
+        else if let Some(c) = cur { inert.push((a + c, a + t)); cur = None; }
     }
-    if let Some(c) = cur {
-        inert.push((a + c, b));
-    }
+    if let Some(c) = cur { inert.push((a + c, b)); }
 
-    let cause = ab.cause.as_ref().unwrap();
-    let (undet, open_alt) = underdetermined(cause, &per.e[a..b]);
-    Residual {
-        gap: Vec::new(),
-        inert,
-        undet: undet.into_iter().map(|(n, vs)| (a, n, vs)).collect(),
-        open: open_alt.into_iter().map(|(n, ss)| (a, n, ss)).collect(),
-    }
+    let incomplete = !ab.complete || ab.cause.is_none();
+    let gap = if incomplete { vec![(a, b)] } else { Vec::new() };
+    let (undet, open_alt) = match ab.cause {
+        Some(ref c) if ab.complete => underdetermined(c, &per.e[a..b]),
+        _ => (Vec::new(), Vec::new()),
+    };
+    debug_assert!(incomplete || covered.len() + inert.iter().map(|(x,y)| y-x).sum::<usize>() == b - a,
+                  "rho doit couvrir [a,b)");
+    Residual { gap, inert,
+               undet: undet.into_iter().map(|(n,vs)| (a,n,vs)).collect(),
+               open:  open_alt.into_iter().map(|(n,ss)| (a,n,ss)).collect() }
 }
