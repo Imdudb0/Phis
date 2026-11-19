@@ -5,7 +5,7 @@ use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
 
-use phisharp::algebra::{sever, signature, unify, Cause, Node};
+use phisharp::algebra::{sever, signature, unify, Cause, Node, values};
 use phisharp::core::{abduce, residual, Cfg, Perception, Router};
 use phisharp::ptgrs::episode;
 use phisharp::model::{load, save, train, understand};
@@ -489,7 +489,7 @@ fn main() -> ExitCode {
             Node::lit(b"D".to_vec()),
             Node::lit(b"FF".to_vec()),
             Node::lit(b"AA".to_vec()),
-            Node::seq(vec![0, 1, 0, 2, 3]),
+            Node::seq(vec![0, 1, 2, 0, 3]),  // ÉTAIT [0,1,0,2,3]
         ],
         root: 4,
     };
@@ -502,11 +502,13 @@ fn main() -> ExitCode {
         ],
         root: 3,
     };
+    // GARDE-FOU : deux causes ne sont comparables que si elles régénèrent le même effet.   
+    let same_effect = values(&c1, None)[c1.root] == values(&c2, None)[c2.root];
     check(
         &mut results,
-        "A15 invariance associative (signature & unify après normal_form)",
-        signature(&c1, 3) == signature(&c2, 3) && unify(&c1, 4, &c2, 3, true),
-        "",
+        "A15 invariance associative (même effet + signature & unify après normal_form)",
+        same_effect && signature(&c1, 3) == signature(&c2, 3) && unify(&c1,     4, &c2, 3, true),
+        &format!("same_effect={same_effect}"),
     );
 
     let n_ok = results.iter().filter(|(_, c, _)| *c).count();
