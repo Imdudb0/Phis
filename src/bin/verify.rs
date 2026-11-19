@@ -443,9 +443,13 @@ fn main() -> ExitCode {
         &format!("same_effect={same_effect}"),
     );
     
-    if let Ok(demo) = fs::read("perceived.eff") {
-        let (e, _) = fixture(WORDS, false, 7, false, false);
-        check(&mut results, "A16 perceived.eff == fixture valide (anti-drift)", demo == e, "");
+    match fs::read("perceived.eff") {
+        Ok(demo) => {
+            let (e, _) = fixture(WORDS, false, 7, false, false);
+            check(&mut results, "A16 perceived.eff == fixture valide (anti-drift)", demo == e, &format!("demo={} octets, attendu={}", demo.len(), e.len()));
+        }
+        Err(_) => check(&mut results, "A16 perceived.eff présent", false,
+                    "absent — lancer `cargo run --release --bin gen`"),
     }
 
     let n_ok = results.iter().filter(|(_, c, _)| *c).count();
