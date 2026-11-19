@@ -1,3 +1,5 @@
+use phisharp::rng::PyRandom;
+
 const WORDS: [&str; 3] = ["ambiguity", "univocity", "redundancy"];
 
 fn pools(hi: bool) -> Vec<Vec<u8>> {
