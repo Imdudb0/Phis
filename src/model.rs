@@ -11,6 +11,7 @@ use crate::ptgrs::episode;
 use crate::json::Json;
 use crate::rng::PyRandom;
 use crate::phi::phi;
+use crate::core::Cfg;
 
 #[derive(Clone, Debug)]
 pub struct Matched {
@@ -342,42 +343,60 @@ pub fn understand(e: &[u8], router: &Router, cfg: &Cfg, seed: u64) -> (Vec<u8>, 
     (answer, report)
 }
 
-/// UNE SEULE séance : une passe, chaque épisode vu exactement une fois.
-pub fn train(
+pub fn train_manifest(
     cfg: &Cfg,
     episodes: usize,
     seed: u64,
     log: Option<&dyn Fn(usize, f64, f64, usize)>,
-) -> Router {
+) -> (Router, HashSet<Vec<u8>>) {
     let mut router = Router::new(cfg.d, cfg.h, seed);
-    let mut rng = PyRandom::new(seed);
+
+    // TROIS FLUX INDÉPENDANTS
+    let mut rng_env = PyRandom::new(seed);                              // épisodes
+    let mut rng_mc  = PyRandom::new(seed ^ 0xA5A5_5A5A_DEAD_BEEF);      // Φ pendant l'abduction
+    let mut rng_ref = PyRandom::new(seed ^ 0x0123_4567_89AB_CDEF);      // référence budget riche
+
     let mut seen: HashSet<Vec<u8>> = HashSet::new();
-    let mut phi_ref: f64 = 1.0;  // référence glissante, non saturante
-    
+    let mut rejected = 0usize;
+
+    // référence : même routeur, même perception, budget ET complètes élargis
+    let cfg_ref = Cfg { completes: cfg.completes * 4, ..cfg.clone() };
+
     for ep in 0..episodes {
-        let (e, truth) = episode(&mut rng, 60);
-        assert!(!seen.contains(&e), "violation une-seule-passe");
-        seen.insert(e.clone());
+        // SANS REMISE : l'unicité est construite, plus subie.
+        let (e, _truth) = loop {
+            let (e, c) = episode(&mut rng_env, 60);
+            if seen.insert(e.clone()) { break (e, c); }
+            rejected += 1;
+            assert!(rejected < 10_000, "espace d'épisodes épuisé");
+        };
 
         let per = Perception::new(e.clone(), cfg);
         let (scores, hm) = router.score(&per);
-        let ab = abduce(&per, 0, e.len(), &scores, cfg, &mut rng, None);
-        
-        let (phi_oracle, _) = phi(&truth, &e, &mut PyRandom::new(seed ^ 0x5eed), 32, &[], 3);
-        let q    = ab.phi / (phi_oracle + 1.0);          // LINÉAIRE en Φ, aucun plateau
+        let ab     = abduce(&per, 0, e.len(), &scores, cfg,     &mut rng_mc,  None);
+        let ab_ref = abduce(&per, 0, e.len(), &scores, &cfg_ref, &mut rng_ref, Some(cfg.pops * 4));
+
+        // P15 : regret vs budget riche — borné, non saturant, ALIGNÉ sur A8
+        let q    = ab.phi / (ab_ref.phi + 1e-6);          // ∈ (0, 1]
         let cost = ab.pops as f64 / cfg.pops.max(1) as f64;
         let r    = q - 0.05 * cost;
-        
-        phi_ref  = 0.95 * phi_ref + 0.05 * ab.phi;
-        router.update(&per, &hm, &ab.used, r, 0.05);
-        if ep % 20 == 0 { eprintln!("r range check: q={q:.3} cost={cost:.3} r={r:.3}"); }
+
+        let adv = router.update(&per, &hm, &ab.used, r, 0.05);
+
         if let Some(logger) = log {
             if ep % 20 == 0 {
                 logger(ep, r, ab.phi, ab.pops);
+                eprintln!("   q={q:.3} cost={cost:.3} adv={adv:+.3} ref_phi={:.3}", ab_ref.phi);
             }
         }
     }
-    router
+    eprintln!("one-pass : {} épisodes uniques, {rejected} doublons rejetés à la génération", seen.len());
+    (router, seen)
+}
+
+pub fn train(cfg: &Cfg, episodes: usize, seed: u64,
+             log: Option<&dyn Fn(usize, f64, f64, usize)>) -> Router {
+    train_manifest(cfg, episodes, seed, log).0
 }
 
 fn mat_to_json(m: &[Vec<f64>]) -> Json {
