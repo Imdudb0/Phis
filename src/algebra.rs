@@ -601,12 +601,12 @@ pub fn normal_form(c: &Cause) -> Cause {
     let mut memo = HashMap::new();
     let mut seq_flat = HashMap::new();
     let root = build(c.root, c, &shared, &mut b, &mut memo, &mut seq_flat);
-    b.cause(root)
+    gc(&b.cause(root))
 }
 
 /// Signature MÉTA-RELATIONNELLE : constantes effacées, topologie conservée.
 pub fn signature(c: &Cause, rounds: usize) -> Vec<[u8; 8]> {
-    let c = normal_form(c);
+    let c = gc(&normal_form(c));
     let deg = indegrees(&c);
     let mut lab: Vec<[u8; 8]> = c
         .nodes
@@ -727,4 +727,36 @@ pub fn unify(sc: &Cause, si: usize, tc: &Cause, ti: usize, abstract_lit: bool) -
         &mut bwd,
         &mut binds,
     )
+}
+
+pub fn reachable(c: &Cause) -> Vec<usize> {
+    let mut seen = vec![false; c.nodes.len()];
+    let mut stack = vec![c.root];
+    while let Some(i) = stack.pop() {
+        if i >= c.nodes.len() || seen[i] { continue; }
+        seen[i] = true;
+        for &k in &c.nodes[i].kids { stack.push(k); }
+    }
+    (0..c.nodes.len()).filter(|&i| seen[i]).collect()
+}
+
+/// Compacte à ce qui est accessible par les ENFANTS (pas par emit :
+/// les branches ALT non sélectionnées doivent être conservées).
+pub fn gc(c: &Cause) -> Cause {
+    if c.nodes.is_empty() { return c.clone(); }
+    fn rec(i: usize, c: &Cause, b: &mut Builder, memo: &mut HashMap<usize, usize>) -> usize {
+        if let Some(&j) = memo.get(&i) { return j; }
+        let n = &c.nodes[i];
+        let kids: Vec<usize> = n.kids.iter().map(|&k| rec(k, c, b, memo)).collect();
+        let j = b.add(Node {
+            op: n.op, lit: n.lit.clone(), kids,
+            k: n.k, key: n.key, sel: n.sel, var: n.var,
+        });
+        memo.insert(i, j);
+        j
+    }
+    let mut b = Builder::new(true);
+    let mut memo = HashMap::new();
+    let root = rec(c.root, c, &mut b, &mut memo);
+    b.cause(root)
 }
