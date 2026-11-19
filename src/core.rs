@@ -719,7 +719,7 @@ impl Router {
         }
         (s, hm)
     }
-    
+
     pub fn update(
         &mut self,
         per: &Perception,
@@ -997,23 +997,34 @@ pub fn abduce(
     let mut best = empty(pops);
     let mut best_key: (f64, isize, isize) = (-1.0, -1, -1);
     let mut extra_keys: Vec<[u8; 256]> = Vec::new();
-
+    
     for chosen in &completes {
-        let chosen_set: HashSet<usize> = chosen.iter().copied().collect();
         let mut linkable: Vec<(usize, usize, [u8; 256])> = Vec::new();
         for (t, &idx) in chosen.iter().enumerate() {
-            if let Some(earl) = per.earlier.get(&idx) {
-                for &s in earl {
-                    if chosen_set.contains(&s) && per.items[s].j <= per.items[idx].i {
-                        if per.items[s].lit == per.items[idx].lit {
-                            continue;
-                        }
-                        if let Some(key) = per.key_between(s, idx) {
-                            linkable.push((t, s, key));
-                            extra_keys.push(key);
-                            break;
-                        }
-                    }
+            let it = &per.items[idx];
+            if it.kind != Op::Lit { continue; }
+
+            // (b) ne JAMAIS détruire une identité causale déjà acquise par dédup
+            let already_shared = chosen.iter().any(|&s| {
+                s != idx
+                    && per.items[s].kind == Op::Lit
+                    && per.items[s].lit == it.lit
+                    && per.items[s].j <= it.i
+            });
+            if already_shared { continue; }
+
+            // (a) partner cherché DANS le cover — plus dans une liste globale tronquée
+            let pat = (it.lit.len(), pattern(&it.lit));
+            for &s in chosen.iter() {
+                if s == idx { continue; }
+                let is = &per.items[s];
+                if is.kind != Op::Lit || is.j > it.i { continue; }
+                if is.lit == it.lit { continue; }
+                if (is.lit.len(), pattern(&is.lit)) != pat { continue; }
+                if let Some(key) = per.key_between(s, idx) {
+                    linkable.push((t, s, key));
+                    extra_keys.push(key);
+                    break;
                 }
             }
         }
