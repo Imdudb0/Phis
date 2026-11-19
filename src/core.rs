@@ -917,7 +917,7 @@ pub fn abduce(
     b: usize,
     scores: &[f64],
     cfg: &Cfg,
-    rng: &mut PyRandom,
+    _rng: &mut PyRandom,
     pops_budget: Option<usize>,
 ) -> Abduction {
     let empty = |pops| Abduction {
@@ -997,7 +997,7 @@ pub fn abduce(
     let mut best = empty(pops);
     let mut best_key: (f64, isize, isize) = (-1.0, -1, -1);
     let mut extra_keys: Vec<[u8; 256]> = Vec::new();
-    
+
     for chosen in &completes {
         let mut linkable: Vec<(usize, usize, [u8; 256])> = Vec::new();
         for (t, &idx) in chosen.iter().enumerate() {
@@ -1040,8 +1040,10 @@ pub fn abduce(
             if values(&c, None)[c.root].as_slice() != target {
                 continue;
             }
+            let sel_seed: u64 = 0x9E37_79B9_7F4A_7C15 ^ ((a as u64) << 32) ^ (b as u64);
+            let mut rng_sel = PyRandom::new(sel_seed);          // REMISE À ZÉRO par variante
             let extra_slice = &extra_keys[..extra_keys.len().min(3)];
-            let (ph, info) = phi(&c, target, rng, cfg.phi_n, extra_slice, 3);
+            let (ph, info) = phi(&c, target, &mut rng_sel, cfg.phi_n, extra_slice, 3);
             let nshared = info
                 .sources
                 .iter()
@@ -1065,7 +1067,8 @@ pub fn abduce(
 
     if let Some(ref cause) = best.cause {
         let extra_slice = &extra_keys[..extra_keys.len().min(3)];
-        let (ph, info) = phi(cause, target, rng, cfg.phi_n_final, extra_slice, 3);
+        let mut rng_fin = PyRandom::new(sel_seed ^ 0xFFFF_FFFF);
+        let (ph, info) = phi(cause, target, &mut rng_fin, cfg.phi_n_final, extra_slice, 3);
         best.phi = ph;
         best.info = Some(info);
     }
