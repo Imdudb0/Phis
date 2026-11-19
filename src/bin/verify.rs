@@ -143,7 +143,7 @@ fn main() -> ExitCode {
     let (router, manifest) = train_manifest(&cfg, 200, 1, None);
     save(&router, &cfg, "out/sharp.phis").expect("save failed");
     let (router, cfg) = load("out/sharp.phis").expect("load failed");
-    
+
     for (tag, names) in [("WORDS", WORDS), ("NONCE", NONCE)] {
         let (e, _) = fixture(names, false, 7, false, false);
         let mut p = Perception::new(e.clone(), &cfg);
@@ -374,6 +374,21 @@ fn main() -> ExitCode {
     check(&mut results, "A8b non-infériorité Φ (tolérance = bruit mesuré)", pt >= pu - floor, &format!("phi {pt:.3} vs {pu:.3} | plancher_bruit={floor:.3}"));
 
     check(&mut results, "A1bis sondes A7/A8 hors entraînement", !manifest.contains(&er), "");
+    
+    let cfg_ref = Cfg { completes: cfg.completes * 4, ..cfg.clone() };  
+    let (mut hit_t, mut hit_u) = (0usize, 0usize);
+    for s in 0..16u64 {
+        let (ee, _) = episode(&mut PyRandom::new(1000 + s), 60);
+        let pe = Perception::new(ee.clone(), &cfg);
+        let (st, _) = router.score(&pe);
+        let (su, _) = rand_router.score(&pe);
+        let at = abduce(&pe, 0, ee.len(), &st, &cfg,     &mut PyRandom::new(5), None);
+        let au = abduce(&pe, 0, ee.len(), &su, &cfg,     &mut PyRandom::new(5), None);
+        let ar = abduce(&pe, 0, ee.len(), &st, &cfg_ref, &mut PyRandom::new(5), Some(cfg.pops * 4));
+        hit_t += (at.phi >= ar.phi - 1e-9) as usize;
+        hit_u += (au.phi >= ar.phi - 1e-9) as usize;
+    }
+    check(&mut results, "A8c taux d'atteinte de l'optimum top-32", hit_t >= hit_u, &format!("{hit_t}/16 vs {hit_u}/16"));
 
     // ---- A13 : ablation — sans abduction, pas de réponse ----------------
     let (e3, _) = fixture(WORDS, false, 7, false, false);
