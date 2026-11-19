@@ -2,7 +2,7 @@
 name = "phisharp"
 version = "0.1.0"
 edition = "2024"
-description = "Modèle général de compréhension par abduction sur substrat connexionniste non-réciproque"
+description = "A general model of abduction-based understanding on a non-reciprocal connectionist substrate"
 
 [profile.release]
 opt-level = 3
