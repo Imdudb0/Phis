@@ -998,6 +998,26 @@ pub fn abduce(
     let mut best = empty(pops);
     let mut best_key: (f64, isize, isize) = (-1.0, -1, -1);
     let mut extra_keys: Vec<[u8; 256]> = Vec::new();
+    
+    {
+        let mut local: Vec<usize> = per.items.iter().enumerate()
+            .filter(|(_, it)| it.kind == Op::Lit && it.i >= a && it.j <= b)
+            .map(|(i, _)| i).collect();
+        local.sort_by_key(|&i| (per.items[i].i, per.items[i].j));
+        'outer: for (t, &idx) in local.iter().enumerate() {
+            for &s in &local[..t] {
+                if per.items[s].lit == per.items[idx].lit { continue; }
+                if per.items[s].lit.len() != per.items[idx].lit.len() { continue; }
+                if pattern(&per.items[s].lit) != pattern(&per.items[idx].lit) { continue; }
+                if let Some(k) = per.key_between(s, idx) {
+                    if !extra_keys.contains(&k) { extra_keys.push(k); }
+                    if extra_keys.len() == 3 { break 'outer; }
+                    break;
+                }
+            }
+        }
+    }
+    let extra_slice = &extra_keys[..];
 
     for chosen in &completes {
         let mut linkable: Vec<(usize, usize, [u8; 256])> = Vec::new();
@@ -1005,12 +1025,10 @@ pub fn abduce(
             let it = &per.items[idx];
             if it.kind != Op::Lit { continue; }
 
-            // (b) ne JAMAIS détruire une identité causale déjà acquise par dédup
             let already_shared = chosen.iter().any(|&s| {
                 s != idx
-                    && per.items[s].kind == Op::Lit
-                    && per.items[s].lit == it.lit
-                    && per.items[s].j <= it.i
+                && per.items[s].kind == Op::Lit
+                && per.items[s].lit == it.lit          // PLUS de condition de position
             });
             if already_shared { continue; }
 
@@ -1042,7 +1060,6 @@ pub fn abduce(
                 continue;
             }
             let mut rng_sel = PyRandom::new(sel_seed);          // REMISE À ZÉRO par variante
-            let extra_slice = &extra_keys[..extra_keys.len().min(3)];
             let (ph, info) = phi(&c, target, &mut rng_sel, cfg.phi_n, extra_slice, 3);
             let nshared = info
                 .sources
@@ -1066,7 +1083,6 @@ pub fn abduce(
     }
 
     if let Some(ref cause) = best.cause {
-        let extra_slice = &extra_keys[..extra_keys.len().min(3)];
         let mut rng_fin = PyRandom::new(sel_seed ^ 0xFFFF_FFFF);
         let (ph, info) = phi(cause, target, &mut rng_fin, cfg.phi_n_final, extra_slice, 3);
         best.phi = ph;
