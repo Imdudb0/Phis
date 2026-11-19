@@ -713,7 +713,6 @@ impl Router {
         let adv = (adv_raw / var.sqrt()).clamp(-3.0, 3.0);
         if used.is_empty() { return; }
 
-        self.baseline += 0.05 * adv;
         let m = used.len().max(1) as f64;
         let cols = self.d.min(12);
         let mut mean_hm = vec![0.0; self.h];
