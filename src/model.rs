@@ -209,7 +209,8 @@ fn col_partner_score(per: &Perception, col: usize) -> usize {
 
 pub fn understand(e: &[u8], router: &Router, cfg: &Cfg, seed: u64) -> (Vec<u8>, Report) {
     let mut rng = PyRandom::new(seed);
-    let per = Perception::new(e.to_vec(), cfg);
+    let mut per = Perception::new(e.to_vec(), cfg);
+    per.ensure_frames();
     let (scores, _hm) = router.score(&per);
 
     let mut causes: BTreeMap<(usize, usize), Abduction> = BTreeMap::new();
