@@ -28,10 +28,10 @@ jobs:
       - name: Run Phisharp
         run: |
           #cargo check
-          #cargo run --release --bin phisharp -- eval --model out/sharp.phis --episodes 50
+          cargo run --release --bin gen
           #cargo run --release --bin phisharp -- ask --model out/sharp.phis --file perceived.eff --json
           #cargo run --release --bin phisharp -- train --out out/sharp.phis --episodes 240 --seed 1
-          cargo run --release --bin verify
+          #cargo run --release --bin verify
         env:
           RUSTFLAGS: "-C target-cpu=native"
 
