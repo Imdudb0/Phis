@@ -1,7 +1,7 @@
 //! Perception plastique, contrôleur de routage, recherche abductive COMPLÈTE.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 
 use crate::algebra::{values, Builder, Cause, Node, IDENT, Op};
 use crate::phi::{phi, underdetermined, PhiInfo};
@@ -152,12 +152,34 @@ impl Perception {
         per.compute_features();
         per
     }
-
+    
     pub fn ensure_frames(&mut self) {
-        if !self.frames_ready {
-            self.compute_frames();
-            self.frames_ready = true;
+        if self.frames_ready { return; }
+        self.compute_frames();
+
+        // RAFFINEMENT : frontières de records/slots = coupes dures de la grille.
+        let mut cuts: BTreeSet<usize> = BTreeSet::new();
+        cuts.insert(0);
+        cuts.insert(self.n);
+        for &(a, b) in &self.records { cuts.insert(a); cuts.insert(b); }
+        for &(a, b, _, _) in &self.slots { cuts.insert(a); cuts.insert(b); }
+
+        let mut refined: Vec<(usize, usize)> = Vec::with_capacity(self.atoms.len());
+        for &(a, b) in &self.atoms {
+            let mut cur = a;
+            for &c in cuts.range((a + 1)..b) {
+                if c > cur { refined.push((cur, c)); cur = c; }
+            }
+            if cur < b { refined.push((cur, b)); }
         }
+
+        if refined != self.atoms {
+            self.atoms = refined;
+            self.compute_items();
+            self.compute_partners();
+            self.compute_features();
+        }
+        self.frames_ready = true;
     }
 
     fn plastic(&mut self) {
