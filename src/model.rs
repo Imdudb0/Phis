@@ -362,9 +362,9 @@ pub fn train_manifest(
     let cfg_ref = Cfg { completes: cfg.completes * 4, ..cfg.clone() };
 
     for ep in 0..episodes {
-        // SANS REMISE : l'unicité est construite, plus subie.
         let (e, _truth) = loop {
-            let (e, c) = episode(&mut rng_env, 60);
+            let (e, c) = if ep % 2 == 0 { episode_hard(&mut rng_env, 60) }
+                 else            { episode(&mut rng_env, 60) };
             if seen.insert(e.clone()) { break (e, c); }
             rejected += 1;
             assert!(rejected < 10_000, "espace d'épisodes épuisé");
