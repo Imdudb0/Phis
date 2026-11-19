@@ -113,3 +113,7 @@ fn fixture(
     out.extend_from_slice(b" is ?.\n");
     (out, bodies)
 }
+
+fn tok(rng: &mut PyRandom, pool: &[u8]) -> Vec<u8> {
+    vec![*rng.choice(pool), *rng.choice(pool)]
+}
