@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use phisharp::rng::PyRandom;
 
 pub const WORDS: [&str; 3] = ["ambiguity", "univocity", "redundancy"];
+pub const NONCE: [&str; 3] = ["brintok", "muvane", "selpic"];
 
 fn pools(hi: bool) -> Vec<Vec<u8>> {
     if hi {
