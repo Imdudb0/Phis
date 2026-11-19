@@ -103,6 +103,7 @@ pub struct Perception {
     pub fmat: Vec<[f64; 12]>,
     pub pf: Vec<[f64; 12]>,
     pub pb: Vec<[f64; 12]>,
+    frames_ready: bool
 }
 
 impl Perception {
@@ -141,15 +142,22 @@ impl Perception {
             fmat: Vec::new(),
             pf: Vec::new(),
             pb: Vec::new(),
+            frames_ready: false,
         };
         per.plastic();
         per.compute_counts();
         per.compute_atoms();
         per.compute_items();
         per.compute_partners();
-        per.compute_frames();
         per.compute_features();
         per
+    }
+
+    pub fn ensure_frames(&mut self) {
+        if !self.frames_ready {
+            self.compute_frames();
+            self.frames_ready = true;
+        }
     }
 
     fn plastic(&mut self) {
@@ -737,6 +745,60 @@ impl Router {
             }
         }
         false
+    }
+
+    /// Jacobien directionnel du graphe de routage : M[i, j] = d(score_i)/d(F_j) · F_j.
+    /// j prédécesseur de i => Wp ; j successeur de i => Wb.
+    pub fn influence(&self, per: &Perception) -> Vec<Vec<f64>> {
+        let (s, hm) = self.score(per);
+        let n = per.items.len();
+        let cols = self.d.min(12);
+
+        let mut wpi = vec![vec![0.0; cols]; n];
+        let mut wbi = vec![vec![0.0; cols]; n];
+        for i in 0..n {
+            let ds = s[i] * (1.0 - s[i]);
+            for k in 0..cols {
+                let mut acc_p = 0.0;
+                let mut acc_b = 0.0;
+                for c in 0..self.h {
+                    let g_ic = ds * (1.0 - hm[i][c] * hm[i][c]) * self.u[c];
+                    acc_p += self.wp[k][c] * g_ic;
+                    acc_b += self.wb[k][c] * g_ic;
+                }
+                wpi[i][k] = acc_p;
+                wbi[i][k] = acc_b;
+            }
+        }
+
+        let mut m = vec![vec![0.0; n]; n];
+        for i in 0..n {
+            if let Some(e_list) = per.earlier.get(&i) {
+                if !e_list.is_empty() {
+                    let denom = e_list.len() as f64;
+                    for &j in e_list {
+                        let mut dot = 0.0;
+                        for k in 0..cols {
+                            dot += per.fmat[j][k] * wpi[i][k];
+                        }
+                        m[i][j] = dot / denom;
+                    }
+                }
+            }
+            if let Some(l_list) = per.later.get(&i) {
+                if !l_list.is_empty() {
+                    let denom = l_list.len() as f64;
+                    for &j in l_list {
+                        let mut dot = 0.0;
+                        for k in 0..cols {
+                            dot += per.fmat[j][k] * wbi[i][k];
+                        }
+                        m[i][j] = dot / denom;
+                    }
+                }
+            }
+        }
+        m
     }
 }
 
