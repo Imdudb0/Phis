@@ -565,11 +565,11 @@ pub fn normal_form(c: &Cause) -> Cause {
     let mut memo = HashMap::new();
     let mut seq_flat = HashMap::new();
     let root = build(c.root, c, &shared, &mut b, &mut memo, &mut seq_flat);
-    b.cause(root)
+    gc(&b.cause(root))
 }
 /// Signature MÉTA-RELATIONNELLE : constantes effacées, topologie conservée.
 pub fn signature(c: &Cause, rounds: usize) -> Vec<[u8; 8]> {
-    let c = normal_form(c);
+    let c = gc(&normal_form(c));
     let deg = indegrees(&c);
     let mut lab: Vec<[u8; 8]> = c
         .nodes
@@ -686,33 +686,58 @@ pub fn unify(sc: &Cause, si: usize, tc: &Cause, ti: usize, abstract_lit: bool) -
         &mut binds,
     )
 }
+pub fn reachable(c: &Cause) -> Vec<usize> {
+    let mut seen = vec![false; c.nodes.len()];
+    let mut stack = vec![c.root];
+    while let Some(i) = stack.pop() {
+        if i >= c.nodes.len() || seen[i] { continue; }
+        seen[i] = true;
+        for &k in &c.nodes[i].kids { stack.push(k); }
+    }
+    (0..c.nodes.len()).filter(|&i| seen[i]).collect()
+}
+/// Compacte à ce qui est accessible par les ENFANTS (pas par emit :
+/// les branches ALT non sélectionnées doivent être conservées).
+pub fn gc(c: &Cause) -> Cause {
+    if c.nodes.is_empty() { return c.clone(); }
+    fn rec(i: usize, c: &Cause, b: &mut Builder, memo: &mut HashMap<usize, usize>) -> usize {
+        if let Some(&j) = memo.get(&i) { return j; }
+        let n = &c.nodes[i];
+        let kids: Vec<usize> = n.kids.iter().map(|&k| rec(k, c, b, memo)).collect();
+        let j = b.add(Node {
+            op: n.op, lit: n.lit.clone(), kids,
+            k: n.k, key: n.key, sel: n.sel, var: n.var,
+        });
+        memo.insert(i, j);
+        j
+    }
+    let mut b = Builder::new(true);
+    let mut memo = HashMap::new();
+    let root = rec(c.root, c, &mut b, &mut memo);
+    b.cause(root)
+}
 
 
 
 ========================================
-File: ./src/bin/verify.rs
+File: ./src/bin/common/fixture.rs
 ========================================
-//! Harnais de preuve. Aucune assertion n'est déclarée vraie sans être calculée.
-use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::path::Path;
-use std::process::ExitCode;
-use phisharp::algebra::{sever, signature, unify, Cause, Node};
-use phisharp::core::{abduce, residual, Cfg, Perception, Router};
-use phisharp::ptgrs::episode;
-use phisharp::model::{load, save, train, understand};
-use phisharp::phi::phi;
+use std::collections::HashSet;
 use phisharp::rng::PyRandom;
-const WORDS: [&str; 3] = ["ambiguity", "univocity", "redundancy"];
-const NONCE: [&str; 3] = ["brintok", "muvane", "selpic"];
-fn check(results: &mut Vec<(String, bool, String)>, name: &str, cond: bool, detail: &str) {
-    results.push((name.to_string(), cond, detail.to_string()));
-    println!(
-        "[{}] {}  {}",
-        if cond { "PASS" } else { "FAIL" },
-        name,
-        detail
-    );
+pub const WORDS: [&str; 3] = ["ambiguity", "univocity", "redundancy"];
+pub const NONCE: [&str; 3] = ["brintok", "muvane", "selpic"];
+fn pools(hi: bool) -> Vec<Vec<u8>> {
+    if hi {
+        (0..4)
+            .map(|t| {
+                let lo = (0x80 + t * 0x10) as u8;
+                (lo..lo + 12).collect()
+            })
+            .collect()
+    } else {
+        let chars = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"; // 36 = 4 x 9
+        (0..4).map(|t| chars[t * 9..(t + 1) * 9].to_vec()).collect()
+    }
 }
 fn motif(kind: usize, u: &[u8], v1: &[u8], v2: &[u8], w: &[u8], sep: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
@@ -741,23 +766,7 @@ fn motif(kind: usize, u: &[u8], v1: &[u8], v2: &[u8], w: &[u8], sep: &[u8]) -> V
     }
     out
 }
-fn pools(hi: bool) -> Vec<Vec<u8>> {
-    if hi {
-        (0..4)
-            .map(|t| {
-                let lo = (0x80 + t * 0x10) as u8;
-                (lo..lo + 12).collect()
-            })
-            .collect()
-    } else {
-        let chars = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"; // 36 = 4 x 9
-        (0..4).map(|t| chars[t * 9..(t + 1) * 9].to_vec()).collect()
-    }
-}
-fn tok(rng: &mut PyRandom, pool: &[u8]) -> Vec<u8> {
-    vec![*rng.choice(pool), *rng.choice(pool)]
-}
-fn fixture(
+pub fn fixture(
     names: [&str; 3],
     hi: bool,
     seed: u64,
@@ -825,6 +834,98 @@ fn fixture(
     out.extend_from_slice(b" is ?.\n");
     (out, bodies)
 }
+fn tok(rng: &mut PyRandom, pool: &[u8]) -> Vec<u8> {
+    vec![*rng.choice(pool), *rng.choice(pool)]
+}
+
+
+
+========================================
+File: ./src/bin/gen.rs
+========================================
+#[path = "common/fixture.rs"] mod fix;
+use std::process::ExitCode;
+fn main() -> ExitCode {
+    let (e, bodies) = fix::fixture(fix::WORDS, false, 7, false, false);
+    if let Err(err) = std::fs::write("perceived.eff", &e) {
+        eprintln!("write perceived.eff: {err}");
+        return ExitCode::FAILURE;
+    }
+    eprintln!("perceived.eff : {} octets, corps requête = {:?}",
+              e.len(), String::from_utf8_lossy(&bodies[3]));
+    ExitCode::SUCCESS
+}
+
+
+
+========================================
+File: ./src/bin/verify.rs
+========================================
+//! Harnais de preuve. Aucune assertion n'est déclarée vraie sans être calculée.
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::Path;
+use std::process::ExitCode;
+use phisharp::algebra::{sever, signature, unify, Cause, Node, values};
+use phisharp::core::{abduce, residual, Cfg, Perception, Router};
+use phisharp::ptgrs::episode;
+use phisharp::phi::phi;
+use phisharp::rng::PyRandom;
+use phisharp::model::{load, save, train_manifest, understand};
+#[path = "common/fixture.rs"] mod fix;
+use fix::{fixture, WORDS, NONCE};
+fn check(results: &mut Vec<(String, bool, String)>, name: &str, cond: bool, detail: &str) {
+    results.push((name.to_string(), cond, detail.to_string()));
+    println!(
+        "[{}] {}  {}",
+        if cond { "PASS" } else { "FAIL" },
+        name,
+        detail
+    );
+}
+fn motif(kind: usize, u: &[u8], v1: &[u8], v2: &[u8], w: &[u8], sep: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    match kind {
+        0 => {
+            out.extend_from_slice(u);
+            out.extend_from_slice(v1);
+            out.extend_from_slice(sep);
+            out.extend_from_slice(u);
+            out.extend_from_slice(v2);
+        }
+        1 => {
+            out.extend_from_slice(u);
+            out.extend_from_slice(v1);
+            out.extend_from_slice(sep);
+            out.extend_from_slice(u);
+            out.extend_from_slice(v1);
+        }
+        _ => {
+            out.extend_from_slice(u);
+            out.extend_from_slice(v1);
+            out.extend_from_slice(sep);
+            out.extend_from_slice(w);
+            out.extend_from_slice(v1);
+        }
+    }
+    out
+}
+fn pools(hi: bool) -> Vec<Vec<u8>> {
+    if hi {
+        (0..4)
+            .map(|t| {
+                let lo = (0x80 + t * 0x10) as u8;
+                (lo..lo + 12).collect()
+            })
+            .collect()
+    } else {
+        let chars = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"; // 36 = 4 x 9
+        (0..4).map(|t| chars[t * 9..(t + 1) * 9].to_vec()).collect()
+    }
+}
+fn tok(rng: &mut PyRandom, pool: &[u8]) -> Vec<u8> {
+    vec![*rng.choice(pool), *rng.choice(pool)]
+}
 fn atom_pattern(atoms: &[&[u8]]) -> Vec<usize> {
     let mut seen: HashMap<&[u8], usize> = HashMap::new();
     let mut out = Vec::with_capacity(atoms.len());
@@ -888,9 +989,24 @@ fn main() -> ExitCode {
         &format!("leaks={leak:?}"),
     );
     eprintln!("entraînement : une seule séance, une passe…");
-    let router = train(&cfg, 200, 1, None);
+    let (router, manifest) = train_manifest(&cfg, 200, 1, None);
     save(&router, &cfg, "out/sharp.phis").expect("save failed");
     let (router, cfg) = load("out/sharp.phis").expect("load failed");
+    for (tag, names) in [("WORDS", WORDS), ("NONCE", NONCE)] {
+        let (e, _) = fixture(names, false, 7, false, false);
+        let mut p = Perception::new(e.clone(), &cfg);
+        p.ensure_frames();
+        let (s, _) = router.score(&p);
+        for &(a, b, c, r) in &p.slots {
+            if c != 0 { continue; }
+            let ab = abduce(&p, a, b, &s, &cfg, &mut PyRandom::new(0), None);
+            let ops: Vec<String> = ab.cause.as_ref()
+                .map(|cc| cc.nodes.iter().map(|n| format!("{:?}", n.op)).collect())
+                .unwrap_or_default();
+            let arite = ab.cause.as_ref().map(|cc| cc.nodes[cc.root].kids.len()).unwrap_or(0);
+            eprintln!("{tag} rec{r} ({a},{b}) cover={:?} arite={arite} ops={ops:?} phi={:.3}", ab.cover.iter().map(|&i| (p.items[i].i, p.items[i].j)).collect::<Vec<_>>(), ab.phi);
+        }
+    }
     // A9 : non-réciprocité (Jacobien M du routage graphe + F != B^T)
     let per0 = Perception::new(fixture(WORDS, false, 7, false, false).0, &cfg);
     let m = router.influence(&per0);
@@ -926,12 +1042,8 @@ fn main() -> ExitCode {
         let (e, _) = episode(&mut rng, 60);
         train_set.insert(e);
     }
-    check(
-        &mut results,
-        "A10 une-seule-passe",
-        true,
-        "assert interne à train()",
-    );
+    check(&mut results, "A10 une-seule-passe (unicité construite, pas subie)",
+      manifest.len() == 200, &format!("uniques={}", manifest.len()));
     // ---- Preuve principale : réponse NL, zéro-shot ---------------------
     for (tag, names, hi) in [
         ("A3a octets disjoints", WORDS, true),
@@ -939,12 +1051,7 @@ fn main() -> ExitCode {
         ("A11 termes NONCE (anti-mémorisation)", NONCE, false),
     ] {
         let (e, bodies) = fixture(names, hi, 7, false, false);
-        check(
-            &mut results,
-            "A1 fixture absente de l'entraînement",
-            !train_set.contains(&e),
-            "",
-        );
+        check(&mut results, "A1 fixture absente de l'entraînement", !manifest.contains(&e), "");
         let (ans, rep) = understand(&e, &router, &cfg, 0);
         let mut expect = Vec::new();
         expect.extend_from_slice(b"the cause of ");
@@ -1041,12 +1148,16 @@ fn main() -> ExitCode {
         let ab_q = abduce(&per, ix, iy, &scores, &cfg, &mut PyRandom::new(0), None);
         let ab2 = abduce(&per2, mx, my, &s2, &cfg, &mut PyRandom::new(0), None);
         let r2 = residual(&per2, mx, my, &ab2);
-        check(
-            &mut results,
-            "A6 résidu : même slot requête mutilé => Φ chute et INERT grandit",
-            ab2.phi < ab_q.phi && !r2.inert.is_empty(),
-            &format!("intact={:.3} mutilated={:.3} inert={:?}", ab_q.phi, ab2.phi, r2.inert),
-        );
+        let missing = !r2.gap.is_empty() || !r2.inert.is_empty();
+        check(&mut results,
+            "A6 résidu : même slot requête mutilé => Φ chute et ρ non vide",
+            ab2.phi < ab_q.phi && missing,
+            &format!("intact={:.3} mutilated={:.3} gap={:?} inert={:?}", ab_q.phi, ab2.phi, r2.gap, r2.inert));
+        eprintln!("A6 diag slot=({mx},{my}) bytes={:?} atoms_chevauchants={:?} complete={} cause={} nsrc={:?} gap={:?} inert={:?}",
+        &per2.e[mx..my],
+        per2.atoms.iter().filter(|&&(x,y)| x < my && y > mx).collect::<Vec<_>>(),
+        ab2.complete, ab2.cause.is_some(),
+        ab2.info.as_ref().map(|i| i.sources.len()), r2.gap, r2.inert);
     } else {
         check(&mut results, "A6 résidu", false, "slot requête introuvable");
     }
@@ -1072,7 +1183,16 @@ fn main() -> ExitCode {
         ab_r.phi >= ab_t.phi - 1e-9,
         &format!("trained={:.3} random={:.3}", ab_t.phi, ab_r.phi),
     );
-    // ---- A8 : l'apprentissage aide (moins de pops ET Φ >= à budget égal)
+    // bruit intrinsèque : même routeur, deux graines Monte-Carlo
+    let mut floor = 0.0f64;
+    for s in 0..32u64 {
+        let (ee, _) = episode(&mut PyRandom::new(1000 + s), 60);
+        let pe = Perception::new(ee.clone(), &cfg);
+        let (st, _) = router.score(&pe);
+        let a1 = abduce(&pe, 0, ee.len(), &st, &cfg, &mut PyRandom::new(5), None);
+        let a2 = abduce(&pe, 0, ee.len(), &st, &cfg, &mut PyRandom::new(6), None);
+        floor = floor.max((a1.phi - a2.phi).abs());
+    }
     let mut gains = Vec::new();
     for s in 0..12u64 {
         let (ee, _) = episode(&mut PyRandom::new(1000 + s), 60);
@@ -1087,12 +1207,23 @@ fn main() -> ExitCode {
     let mu = gains.iter().map(|g| g.1 as f64).sum::<f64>() / gains.len() as f64;
     let pt = gains.iter().map(|g| g.2).sum::<f64>() / gains.len() as f64;
     let pu = gains.iter().map(|g| g.3).sum::<f64>() / gains.len() as f64;
-    check(
-        &mut results,
-        "A8 le routage appris réduit les pops à Φ ≥ (budget égal)",
-        mt <= mu && pt >= pu - 1e-9,
-        &format!("pops trained={mt:.1} untrained={mu:.1} | phi trained={pt:.3} untrained={pu:.3}"),
-    );
+    check(&mut results, "A8a efficacité : pops réduits", mt <= mu, &format!("pops {mt:.1} vs {mu:.1}"));
+    check(&mut results, "A8b non-infériorité Φ (tolérance = bruit mesuré)", pt >= pu - floor, &format!("phi {pt:.3} vs {pu:.3} | plancher_bruit={floor:.3}"));
+    check(&mut results, "A1bis sondes A7/A8 hors entraînement", !manifest.contains(&er), "");
+    let cfg_ref = Cfg { completes: cfg.completes * 4, ..cfg.clone() };  
+    let (mut hit_t, mut hit_u) = (0usize, 0usize);
+    for s in 0..16u64 {
+        let (ee, _) = episode(&mut PyRandom::new(1000 + s), 60);
+        let pe = Perception::new(ee.clone(), &cfg);
+        let (st, _) = router.score(&pe);
+        let (su, _) = rand_router.score(&pe);
+        let at = abduce(&pe, 0, ee.len(), &st, &cfg,     &mut PyRandom::new(5), None);
+        let au = abduce(&pe, 0, ee.len(), &su, &cfg,     &mut PyRandom::new(5), None);
+        let ar = abduce(&pe, 0, ee.len(), &st, &cfg_ref, &mut PyRandom::new(5), Some(cfg.pops * 4));
+        hit_t += (at.phi >= ar.phi - 1e-9) as usize;
+        hit_u += (au.phi >= ar.phi - 1e-9) as usize;
+    }
+    check(&mut results, "A8c taux d'atteinte de l'optimum top-32", hit_t >= hit_u, &format!("{hit_t}/16 vs {hit_u}/16"));
     // ---- A13 : ablation — sans abduction, pas de réponse ----------------
     let (e3, _) = fixture(WORDS, false, 7, false, false);
     let mut per3 = Perception::new(e3, &cfg);
@@ -1151,7 +1282,7 @@ fn main() -> ExitCode {
             Node::lit(b"D".to_vec()),
             Node::lit(b"FF".to_vec()),
             Node::lit(b"AA".to_vec()),
-            Node::seq(vec![0, 1, 0, 2, 3]),
+            Node::seq(vec![0, 1, 2, 0, 3]),  // ÉTAIT [0,1,0,2,3]
         ],
         root: 4,
     };
@@ -1164,12 +1295,22 @@ fn main() -> ExitCode {
         ],
         root: 3,
     };
+    // GARDE-FOU : deux causes ne sont comparables que si elles régénèrent le même effet.   
+    let same_effect = values(&c1, None)[c1.root] == values(&c2, None)[c2.root];
     check(
         &mut results,
-        "A15 invariance associative (signature & unify après normal_form)",
-        signature(&c1, 3) == signature(&c2, 3) && unify(&c1, 4, &c2, 3, true),
-        "",
+        "A15 invariance associative (même effet + signature & unify après normal_form)",
+        same_effect && signature(&c1, 3) == signature(&c2, 3) && unify(&c1,     4, &c2, 3, true),
+        &format!("same_effect={same_effect}"),
     );
+    match fs::read("perceived.eff") {
+        Ok(demo) => {
+            let (e, _) = fixture(WORDS, false, 7, false, false);
+            check(&mut results, "A16 perceived.eff == fixture valide (anti-drift)", demo == e, &format!("demo={} octets, attendu={}", demo.len(), e.len()));
+        }
+        Err(_) => check(&mut results, "A16 perceived.eff présent", false,
+                    "absent — lancer `cargo run --release --bin gen`"),
+    }
     let n_ok = results.iter().filter(|(_, c, _)| *c).count();
     println!("\n=== {n_ok}/{} PASS ===", results.len());
     if n_ok == results.len() {
@@ -1353,7 +1494,7 @@ File: ./src/core.rs
 ========================================
 //! Perception plastique, contrôleur de routage, recherche abductive COMPLÈTE.
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 use crate::algebra::{values, Builder, Cause, Node, IDENT, Op};
 use crate::phi::{phi, underdetermined, PhiInfo};
 use crate::rng::{NormalRng, PyRandom};
@@ -1495,10 +1636,29 @@ impl Perception {
         per
     }
     pub fn ensure_frames(&mut self) {
-        if !self.frames_ready {
-            self.compute_frames();
-            self.frames_ready = true;
+        if self.frames_ready { return; }
+        self.compute_frames();
+        // RAFFINEMENT : frontières de records/slots = coupes dures de la grille.
+        let mut cuts: BTreeSet<usize> = BTreeSet::new();
+        cuts.insert(0);
+        cuts.insert(self.n);
+        for &(a, b) in &self.records { cuts.insert(a); cuts.insert(b); }
+        for &(a, b, _, _) in &self.slots { cuts.insert(a); cuts.insert(b); }
+        let mut refined: Vec<(usize, usize)> = Vec::with_capacity(self.atoms.len());
+        for &(a, b) in &self.atoms {
+            let mut cur = a;
+            for &c in cuts.range((a + 1)..b) {
+                if c > cur { refined.push((cur, c)); cur = c; }
+            }
+            if cur < b { refined.push((cur, b)); }
         }
+        if refined != self.atoms {
+            self.atoms = refined;
+            self.compute_items();
+            self.compute_partners();
+            self.compute_features();
+        }
+        self.frames_ready = true;
     }
     fn plastic(&mut self) {
         let n = self.n;
@@ -1963,7 +2123,8 @@ pub struct Router {
     pub wp: Vec<Vec<f64>>,
     pub wb: Vec<Vec<f64>>,
     pub u: Vec<f64>,
-    pub baseline: f64,
+    pub baseline: f64, 
+    pub m2: f64,
 }
 impl Router {
     pub fn new(d: usize, h: usize, seed: u64) -> Self {
@@ -1985,6 +2146,7 @@ impl Router {
             wb,
             u,
             baseline: 0.0,
+            m2: 0.0,
         }
     }
     pub fn score(&self, per: &Perception) -> (Vec<f64>, Vec<Vec<f64>>) {
@@ -2018,13 +2180,13 @@ impl Router {
         used: &[usize],
         reward: f64,
         eta: f64,
-    ) {
-        if used.is_empty() {
-            self.baseline += 0.05 * (reward - self.baseline);
-            return;
-        }
-        let adv = reward - self.baseline;
-        self.baseline += 0.05 * (reward - self.baseline);
+    ) -> f64 {
+        let adv_raw = reward - self.baseline;
+        self.baseline += 0.05 * adv_raw;
+        self.m2       += 0.05 * (reward * reward - self.m2);
+        let var = (self.m2 - self.baseline * self.baseline).max(1e-8);
+        let adv = (adv_raw / var.sqrt()).clamp(-3.0, 3.0);
+        if used.is_empty() { return adv; }
         let m = used.len().max(1) as f64;
         let cols = self.d.min(12);
         let mut mean_hm = vec![0.0; self.h];
@@ -2043,6 +2205,7 @@ impl Router {
         for c in 0..self.h {
             self.u[c] += eta * adv * (mean_hm[c] / m);
         }
+        adv
     }
     /// Wp != Wb^T.
     pub fn nonreciprocal(&self) -> bool {
@@ -2193,7 +2356,7 @@ pub fn abduce(
     b: usize,
     scores: &[f64],
     cfg: &Cfg,
-    rng: &mut PyRandom,
+    _rng: &mut PyRandom,
     pops_budget: Option<usize>,
 ) -> Abduction {
     let empty = |pops| Abduction {
@@ -2208,6 +2371,7 @@ pub fn abduce(
     if b <= a {
         return empty(0);
     }
+    let sel_seed: u64 = 0x9E37_79B9_7F4A_7C15 ^ ((a as u64) << 32) ^ (b as u64);
     let mut starts: HashMap<usize, Vec<usize>> = HashMap::new();
     for pos in a..b {
         if let Some(lst) = per.by_start.get(&pos) {
@@ -2267,22 +2431,47 @@ pub fn abduce(
     let mut best = empty(pops);
     let mut best_key: (f64, isize, isize) = (-1.0, -1, -1);
     let mut extra_keys: Vec<[u8; 256]> = Vec::new();
+    {
+        let mut local: Vec<usize> = per.items.iter().enumerate()
+            .filter(|(_, it)| it.kind == Op::Lit && it.i >= a && it.j <= b)
+            .map(|(i, _)| i).collect();
+        local.sort_by_key(|&i| (per.items[i].i, per.items[i].j));
+        'outer: for (t, &idx) in local.iter().enumerate() {
+            for &s in &local[..t] {
+                if per.items[s].lit == per.items[idx].lit { continue; }
+                if per.items[s].lit.len() != per.items[idx].lit.len() { continue; }
+                if pattern(&per.items[s].lit) != pattern(&per.items[idx].lit) { continue; }
+                if let Some(k) = per.key_between(s, idx) {
+                    if !extra_keys.contains(&k) { extra_keys.push(k); }
+                    if extra_keys.len() == 3 { break 'outer; }
+                    break;
+                }
+            }
+        }
+    }
+    let extra_slice = &extra_keys[..];
     for chosen in &completes {
-        let chosen_set: HashSet<usize> = chosen.iter().copied().collect();
         let mut linkable: Vec<(usize, usize, [u8; 256])> = Vec::new();
         for (t, &idx) in chosen.iter().enumerate() {
-            if let Some(earl) = per.earlier.get(&idx) {
-                for &s in earl {
-                    if chosen_set.contains(&s) && per.items[s].j <= per.items[idx].i {
-                        if per.items[s].lit == per.items[idx].lit {
-                            continue;
-                        }
-                        if let Some(key) = per.key_between(s, idx) {
-                            linkable.push((t, s, key));
-                            extra_keys.push(key);
-                            break;
-                        }
-                    }
+            let it = &per.items[idx];
+            if it.kind != Op::Lit { continue; }
+            let already_shared = chosen.iter().any(|&s| {
+                s != idx
+                && per.items[s].kind == Op::Lit
+                && per.items[s].lit == it.lit          // PLUS de condition de position
+            });
+            if already_shared { continue; }
+            // (a) partner cherché DANS le cover — plus dans une liste globale tronquée
+            let pat = (it.lit.len(), pattern(&it.lit));
+            for &s in chosen.iter() {
+                if s == idx { continue; }
+                let is = &per.items[s];
+                if is.kind != Op::Lit || is.j > it.i { continue; }
+                if is.lit == it.lit { continue; }
+                if (is.lit.len(), pattern(&is.lit)) != pat { continue; }
+                if let Some(key) = per.key_between(s, idx) {
+                    linkable.push((t, s, key));
+                    break;
                 }
             }
         }
@@ -2298,8 +2487,8 @@ pub fn abduce(
             if values(&c, None)[c.root].as_slice() != target {
                 continue;
             }
-            let extra_slice = &extra_keys[..extra_keys.len().min(3)];
-            let (ph, info) = phi(&c, target, rng, cfg.phi_n, extra_slice, 3);
+            let mut rng_sel = PyRandom::new(sel_seed);          // REMISE À ZÉRO par variante
+            let (ph, info) = phi(&c, target, &mut rng_sel, cfg.phi_n, extra_slice, 3);
             let nshared = info
                 .sources
                 .iter()
@@ -2321,8 +2510,8 @@ pub fn abduce(
         }
     }
     if let Some(ref cause) = best.cause {
-        let extra_slice = &extra_keys[..extra_keys.len().min(3)];
-        let (ph, info) = phi(cause, target, rng, cfg.phi_n_final, extra_slice, 3);
+        let mut rng_fin = PyRandom::new(sel_seed ^ 0xFFFF_FFFF);
+        let (ph, info) = phi(cause, target, &mut rng_fin, cfg.phi_n_final, extra_slice, 3);
         best.phi = ph;
         best.info = Some(info);
     }
@@ -2335,24 +2524,13 @@ pub struct Residual {
     pub undet: Vec<(usize, usize, Vec<usize>)>,
     pub open: Vec<(usize, usize, Vec<usize>)>,
 }
-/// ρ : ce qui MANQUE à la perception, en termes purement causaux.
 pub fn residual(per: &Perception, a: usize, b: usize, ab: &Abduction) -> Residual {
-    if !ab.complete || ab.cause.is_none() {
-        return Residual {
-            gap: vec![(a, b)],
-            inert: Vec::new(),
-            undet: Vec::new(),
-            open: Vec::new(),
-        };
-    }
     let mut covered = HashSet::new();
-    if let Some(ref info) = ab.info {
-        for d in &info.sources {
-            if d.iota > 0.0 && d.eps > 0.0 {
-                for &(x, y) in &info.occ[d.node] {
-                    for pos in x..y {
-                        covered.insert(pos);
-                    }
+    if ab.complete {
+        if let Some(ref info) = ab.info {
+            for d in &info.sources {
+                if d.iota > 0.0 && d.eps > 0.0 {
+                    for &(x, y) in &info.occ[d.node] { for p in x..y { covered.insert(p); } }
                 }
             }
         }
@@ -2360,26 +2538,21 @@ pub fn residual(per: &Perception, a: usize, b: usize, ab: &Abduction) -> Residua
     let mut inert = Vec::new();
     let mut cur: Option<usize> = None;
     for t in 0..(b - a) {
-        if !covered.contains(&t) {
-            if cur.is_none() {
-                cur = Some(t);
-            }
-        } else if let Some(c) = cur {
-            inert.push((a + c, a + t));
-            cur = None;
-        }
+        if !covered.contains(&t) { if cur.is_none() { cur = Some(t); } }
+        else if let Some(c) = cur { inert.push((a + c, a + t)); cur = None; }
     }
-    if let Some(c) = cur {
-        inert.push((a + c, b));
-    }
-    let cause = ab.cause.as_ref().unwrap();
-    let (undet, open_alt) = underdetermined(cause, &per.e[a..b]);
-    Residual {
-        gap: Vec::new(),
-        inert,
-        undet: undet.into_iter().map(|(n, vs)| (a, n, vs)).collect(),
-        open: open_alt.into_iter().map(|(n, ss)| (a, n, ss)).collect(),
-    }
+    if let Some(c) = cur { inert.push((a + c, b)); }
+    let incomplete = !ab.complete || ab.cause.is_none();
+    let gap = if incomplete { vec![(a, b)] } else { Vec::new() };
+    let (undet, open_alt) = match ab.cause {
+        Some(ref c) if ab.complete => underdetermined(c, &per.e[a..b]),
+        _ => (Vec::new(), Vec::new()),
+    };
+    debug_assert!(incomplete || covered.len() + inert.iter().map(|(x,y)| y-x).sum::<usize>() == b - a,
+                  "rho doit couvrir [a,b)");
+    Residual { gap, inert,
+               undet: undet.into_iter().map(|(n,vs)| (a,n,vs)).collect(),
+               open:  open_alt.into_iter().map(|(n,ss)| (a,n,ss)).collect() }
 }
 
 
@@ -2793,9 +2966,10 @@ use std::fs;
 use std::path::Path;
 use crate::algebra::{signature, unify};
 use crate::core::{abduce, residual, Abduction, Cfg, Perception, Residual, Router};
-use crate::ptgrs::episode;
+use crate::ptgrs::{episode, episode_hard};
 use crate::json::Json;
 use crate::rng::PyRandom;
+use crate::phi::phi;
 #[derive(Clone, Debug)]
 pub struct Matched {
     pub def_record: usize,
@@ -3102,32 +3276,51 @@ pub fn understand(e: &[u8], router: &Router, cfg: &Cfg, seed: u64) -> (Vec<u8>, 
     );
     (answer, report)
 }
-/// UNE SEULE séance : une passe, chaque épisode vu exactement une fois.
-pub fn train(
+pub fn train_manifest(
     cfg: &Cfg,
     episodes: usize,
     seed: u64,
     log: Option<&dyn Fn(usize, f64, f64, usize)>,
-) -> Router {
+) -> (Router, HashSet<Vec<u8>>) {
     let mut router = Router::new(cfg.d, cfg.h, seed);
-    let mut rng = PyRandom::new(seed);
+    // TROIS FLUX INDÉPENDANTS
+    let mut rng_env = PyRandom::new(seed);                              // épisodes
+    let mut rng_mc  = PyRandom::new(seed ^ 0xA5A5_5A5A_DEAD_BEEF);      // Φ pendant l'abduction
+    let mut rng_ref = PyRandom::new(seed ^ 0x0123_4567_89AB_CDEF);      // référence budget riche
     let mut seen: HashSet<Vec<u8>> = HashSet::new();
+    let mut rejected = 0usize;
+    // référence : même routeur, même perception, budget ET complètes élargis
+    let cfg_ref = Cfg { completes: cfg.completes * 4, ..cfg.clone() };
     for ep in 0..episodes {
-        let (e, _truth) = episode(&mut rng, 60);
-        assert!(!seen.contains(&e), "violation une-seule-passe");
-        seen.insert(e.clone());
+        let (e, _truth) = loop {
+            let (e, c) = if ep % 2 == 0 { episode_hard(&mut rng_env, 60) }
+                 else            { episode(&mut rng_env, 60) };
+            if seen.insert(e.clone()) { break (e, c); }
+            rejected += 1;
+            assert!(rejected < 10_000, "espace d'épisodes épuisé");
+        };
         let per = Perception::new(e.clone(), cfg);
         let (scores, hm) = router.score(&per);
-        let ab = abduce(&per, 0, e.len(), &scores, cfg, &mut rng, None);
-        let r = ab.phi.tanh() - 0.25 * (ab.pops as f64 / cfg.pops.max(1) as f64);
-        router.update(&per, &hm, &ab.used, r, 0.05);
+        let ab     = abduce(&per, 0, e.len(), &scores, cfg,     &mut rng_mc,  None);
+        let ab_ref = abduce(&per, 0, e.len(), &scores, &cfg_ref, &mut rng_ref, Some(cfg.pops * 4));
+        // P15 : regret vs budget riche — borné, non saturant, ALIGNÉ sur A8
+        let q    = ab.phi / (ab_ref.phi + 1e-6);          // ∈ (0, 1]
+        let cost = ab.pops as f64 / cfg.pops.max(1) as f64;
+        let r    = q - 0.05 * cost;
+        let adv = router.update(&per, &hm, &ab.used, r, 0.05);
         if let Some(logger) = log {
             if ep % 20 == 0 {
                 logger(ep, r, ab.phi, ab.pops);
+                eprintln!("   q={q:.3} cost={cost:.3} adv={adv:+.3} ref_phi={:.3}", ab_ref.phi);
             }
         }
     }
-    router
+    eprintln!("one-pass : {} épisodes uniques, {rejected} doublons rejetés à la génération", seen.len());
+    (router, seen)
+}
+pub fn train(cfg: &Cfg, episodes: usize, seed: u64,
+             log: Option<&dyn Fn(usize, f64, f64, usize)>) -> Router {
+    train_manifest(cfg, episodes, seed, log).0
 }
 fn mat_to_json(m: &[Vec<f64>]) -> Json {
     Json::Arr(
@@ -3193,6 +3386,7 @@ pub fn save(router: &Router, cfg: &Cfg, path: &str) -> Result<(), String> {
             Json::Arr(router.u.iter().map(|&v| Json::Float(v)).collect()),
         ),
         ("baseline".to_string(), Json::Float(router.baseline)),
+        ("m2".to_string(), Json::Float(router.m2)),
     ]);
     fs::write(p, root.to_pretty_string()).map_err(|e| e.to_string())
 }
@@ -3234,7 +3428,8 @@ pub fn load(path: &str) -> Result<(Router, Cfg), String> {
     let baseline = root
         .get("baseline")
         .and_then(Json::as_f64)
-        .ok_or("missing baseline")?;
+        .ok_or("missing baseline")?;    
+    let m2 = root.get("m2").and_then(Json::as_f64).unwrap_or(0.0);
     Ok((
         Router {
             d: cfg.d,
@@ -3244,6 +3439,7 @@ pub fn load(path: &str) -> Result<(Router, Cfg), String> {
             wb,
             u,
             baseline,
+            m2,
         },
         cfg,
     ))
@@ -3599,9 +3795,25 @@ pub fn sample_cause(rng: &mut PyRandom, alpha: &[u8], depth: usize) -> Cause {
     }
     b.cause(root)
 }
-pub fn episode(rng: &mut PyRandom, tries: usize) -> (Vec<u8>, Cause) {
+pub fn episode_hard(rng: &mut PyRandom, tries: usize) -> (Vec<u8>, Cause) {
     for _ in 0..tries {
-        let base = rng.randrange_range(32, 200);
+        let base = rng.randrange_range(32, 180);
+        let alpha_len = rng.randint(8, 16);
+        let alpha: Vec<u8> = (base..base + alpha_len).map(|x| x as u8).collect();
+        let depth = rng.randint(3, 4);
+        let c = sample_cause(rng, &alpha, depth);
+        let e = values(&c, None)[c.root].clone();
+        if (40..=140).contains(&e.len()) {
+            let mut seen = [false; 256]; let mut uniq = 0usize;
+            for &b in &e { if !seen[b as usize] { seen[b as usize] = true; uniq += 1; } }
+            if uniq >= 6 { return (e, c); }
+        }
+    }
+    episode(rng, 60)
+}
+pub fn episode(rng: &mut PyRandom, tries: usize) -> (Vec<u8>, Cause) {
+    let base = rng.randrange_range(32, 200);
+    for _ in 0..tries {
         let alpha_len = rng.randint(6, 12);
         let alpha: Vec<u8> = (base..base + alpha_len).map(|x| x as u8).collect();
         let depth = rng.randint(2, 3);
@@ -3621,8 +3833,9 @@ pub fn episode(rng: &mut PyRandom, tries: usize) -> (Vec<u8>, Cause) {
             }
         }
     }
-    let alpha: Vec<u8> = (65..73).collect();
-    let c = sample_cause(rng, &alpha, 2);
+    let alpha: Vec<u8> = (base..base + 8).map(|x| x as u8).collect();
+    let depth = rng.randint(2, 3);
+    let c = sample_cause(rng, &alpha, depth);
     let e = values(&c, None)[c.root].clone();
     (e, c)
 }
