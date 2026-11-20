@@ -140,7 +140,7 @@ fn main() -> ExitCode {
     );
 
     eprintln!("entraînement : une seule séance, une passe…");
-    let (router, manifest) = train_manifest(&cfg, 200, 1, None);
+    let (router, manifest, tstats) = train_manifest_stats(&cfg, 200, 1, None);
     save(&router, &cfg, "out/sharp.phis").expect("save failed");
     let (router, cfg) = load("out/sharp.phis").expect("load failed");
 
@@ -374,7 +374,7 @@ fn main() -> ExitCode {
     check(&mut results, "A8b non-infériorité Φ (tolérance = bruit mesuré)", pt >= pu - floor, &format!("phi {pt:.3} vs {pu:.3} | plancher_bruit={floor:.3}"));
 
     check(&mut results, "A1bis sondes A7/A8 hors entraînement", !manifest.contains(&er), "");
-    
+
     let cfg_ref = Cfg { completes: cfg.completes * 4, ..cfg.clone() };  
     let (mut hit_t, mut hit_u) = (0usize, 0usize);
     for s in 0..16u64 {
@@ -389,6 +389,59 @@ fn main() -> ExitCode {
         hit_u += (au.phi >= ar.phi - 1e-9) as usize;
     }
     check(&mut results, "A8c taux d'atteinte de l'optimum top-32", hit_t >= hit_u, &format!("{hit_t}/16 vs {hit_u}/16"));
+    
+    
+// D1 : la sonde doit être non dégénérée, sinon A8b ne veut rien dire
+check(&mut results, "A8b-0 sonde de bruit non dégénérée", floor > 0.0, &format!("plancher={floor:.6}"));
+
+// P21 / P20
+check(&mut results, "A19 P21 q commensurable (aucun q>1)", tstats.q_gt_1 == 0,
+      &format!("q>1={}/{}", tstats.q_gt_1, tstats.solvable));
+check(&mut results, "A20 P20 régime atteint", tstats.solvable > 0
+      && (tstats.q_ge_999 as f64) < 0.5 * tstats.solvable as f64,
+      &format!("q≈1={}/{} level={}", tstats.q_ge_999, tstats.solvable, tstats.level));
+
+// P19 : le motif, pas le contexte — égalité AU BIT
+fn dump(cfg: &Cfg, router: &Router, names: [&str; 3])
+    -> Vec<(usize, Vec<u8>, Vec<String>, usize, u64)> {
+    let (e, _) = fixture(names, false, 7, false, false);
+    let mut p = Perception::new(e, cfg); p.ensure_frames();
+    let (s, _) = router.score(&p);
+    let mut rows = Vec::new();
+    for &(a, b, c, r) in &p.slots {
+        if c != 0 { continue; }
+        let ab = abduce(&p, a, b, &s, cfg, &mut PyRandom::new(0), None);
+        let ops: Vec<String> = ab.cause.as_ref()
+            .map(|cc| cc.nodes.iter().map(|n| format!("{:?}", n.op)).collect()).unwrap_or_default();
+        let ar = ab.cause.as_ref().map(|cc| cc.nodes[cc.root].kids.len()).unwrap_or(0);
+        rows.push((r, p.e[a..b].to_vec(), ops, ar, ab.phi.to_bits()));
+    }
+    rows
+}
+let dw = dump(&cfg, &router, WORDS);
+let dn = dump(&cfg, &router, NONCE);
+check(&mut results, "A17 P19 WORDS ≡ NONCE (corps, ops, arité, Φ au bit)", dw == dn,
+      &format!("{:?}", dw.iter().zip(&dn).map(|(x, y)| (x.0, x.3, y.3, x.4 == y.4)).collect::<Vec<_>>()));
+
+// A18 : invariance par bijection d'octets (anti-mémorisation forte)
+let (e0, _) = fixture(WORDS, false, 7, false, false);
+let sg = |b: u8| b ^ 0x20;
+let e1: Vec<u8> = e0.iter().map(|&b| sg(b)).collect();
+let (a0, r0) = understand(&e0, &router, &cfg, 0);
+let (a1, r1) = understand(&e1, &router, &cfg, 0);
+check(&mut results, "A18 invariance σ (réponse=σ(réponse), Φ identique)",
+      a1 == a0.iter().map(|&b| sg(b)).collect::<Vec<u8>>() && r0.phi == r1.phi && r0.rung == r1.rung, "");
+
+// A8c : n=64 + McNemar exact, et c'est une MESURE, pas un gate
+fn mcnemar_exact(b: usize, c: usize) -> f64 {
+    let n = b + c; if n == 0 { return 1.0; }
+    let k = b.min(c); let mut p = 0.5f64.powi(n as i32); let mut s = p;
+    for i in 0..k { p *= (n - i) as f64 / (i + 1) as f64; s += p; }
+    (2.0 * s).min(1.0)
+}
+// dans la boucle : let ht = …; let hu = …; if ht && !hu { bt += 1; } if hu && !ht { bu += 1; }
+println!("[MEAS] A8c {hit_t}/64 vs {hit_u}/64  discordants=({bt},{bu})  p={:.3}", mcnemar_exact(bt, bu));
+
 
     // ---- A13 : ablation — sans abduction, pas de réponse ----------------
     let (e3, _) = fixture(WORDS, false, 7, false, false);
