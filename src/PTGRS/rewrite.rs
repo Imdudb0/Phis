@@ -10,8 +10,8 @@
 //! with propensity λ; the next event time is Exp(Σλ); the channel is picked
 //! proportionally; the outcome is drawn from the rule's outcome probabilities.
 
-use crate::rng::Rng;
-use crate::term::{Graph, NodeId, SymId};
+use super::rng::Rng;
+use super::term::{Graph, NodeId, SymId};
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 pub type Sub = Vec<Option<NodeId>>;
