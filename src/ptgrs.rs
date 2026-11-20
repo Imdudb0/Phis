@@ -64,6 +64,22 @@ pub fn sample_cause(rng: &mut PyRandom, alpha: &[u8], depth: usize) -> Cause {
     b.cause(root)
 }
 
+pub fn episode_harder(rng: &mut PyRandom, tries: usize, level: usize) -> (Vec<u8>, Cause) {
+    let lv = level.min(3);
+    for _ in 0..tries {
+        let base = rng.randrange_range(32, 160);
+        let alpha: Vec<u8> = (base..base + rng.randint(10, 18)).map(|x| x as u8).collect();
+        let c = sample_cause(rng, &alpha, 4 + lv);
+        let e = values(&c, None)[c.root].clone();
+        if (60..=140 + 60 * lv).contains(&e.len()) {
+            let mut seen = [false; 256]; let mut uniq = 0;
+            for &b in &e { if !seen[b as usize] { seen[b as usize] = true; uniq += 1; } }
+            if uniq >= 8 { return (e, c); }
+        }
+    }
+    episode_hard(rng, 60)
+}
+
 pub fn episode_hard(rng: &mut PyRandom, tries: usize) -> (Vec<u8>, Cause) {
     for _ in 0..tries {
         let base = rng.randrange_range(32, 180);
