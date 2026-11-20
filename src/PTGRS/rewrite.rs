@@ -11,7 +11,7 @@
 //! proportionally; the outcome is drawn from the rule's outcome probabilities.
 
 use super::rng::Rng;
-use super::term::{Graph, NodeId, SymId};
+use super::term::{Graph, NodeId, SymId, Kind};
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 pub type Sub = Vec<Option<NodeId>>;
@@ -248,7 +248,6 @@ pub fn slice_trace(steps: &[Step], targets: &[NodeId]) -> (Vec<usize>, BTreeSet<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::term::Kind;
 
     #[test]
     fn chain_rule_fires_slices_and_replays() {
