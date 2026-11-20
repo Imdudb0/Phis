@@ -391,14 +391,21 @@ impl Perception {
         if a_bs.len() != b_bs.len() || a_bs.is_empty() { return None; }
         let mut m: HashMap<u8, u8> = HashMap::new();
         for (&x, &y) in a_bs.iter().zip(b_bs.iter()) {
-            if let Some(&prev) = m.get(&x) { if prev != y { return None; } }
+            if let Some(&p) = m.get(&x) { if p != y { return None; } }
             m.insert(x, y);
         }
-        if m.values().collect::<HashSet<_>>().len() != m.len() { return None; }
-        // la convention est LOCALE au couple d'items : aucune complétion sur A(E).
+        let used: HashSet<u8> = m.values().copied().collect();
+        if used.len() != m.len() { return None; }
+        // alphabet LOCAL, ordre de première apparition (jamais l'ordre des valeurs d'octets)
+        let mut dom: Vec<u8> = Vec::new();
+        for &b in a_bs.iter().chain(b_bs.iter()) { if !dom.contains(&b) { dom.push(b); } }
+        let rd: Vec<u8> = dom.iter().copied().filter(|x| !m.contains_key(x)).collect();
+        let rc: Vec<u8> = dom.iter().copied().filter(|y| !used.contains(y)).collect();
+        if rd.len() != rc.len() { return None; }
+        for (x, y) in rd.into_iter().zip(rc.into_iter()) { m.insert(x, y); }
         let mut key = IDENT;
         for (x, y) in m { key[x as usize] = y; }
-        Some(key)
+        Some(key)   // permutation de `dom`, identité ailleurs ⇒ inversible
     }
 
     fn shared_pieces(&self, recs: &[&[u8]]) -> (Vec<Vec<u8>>, usize) {
@@ -908,7 +915,7 @@ pub fn abduce(
     pops_budget: Option<usize>,
 ) -> Abduction {
     let empty = |pops| Abduction { cause:None, phi:0.0, info:None, pops, used:vec![], cover:vec![], complete:false, reach:0.0, eps:0.0 };
-    
+
     if b <= a {
         return empty(0);
     }
@@ -972,7 +979,7 @@ pub fn abduce(
             }
         }
     }
-    
+
     let target = &per.e[a..b];
     let canon: Vec<u8> = pattern(target).iter().map(|&r| r as u8).collect();
     let base = u64::from_le_bytes(hash8(&canon));
