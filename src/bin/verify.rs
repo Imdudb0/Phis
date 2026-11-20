@@ -514,6 +514,68 @@ check(&mut results, "A18 invariance σ (réponse=σ(réponse), Φ identique)",
         &format!("same_effect={same_effect}"),
     );
 
+// A21 : isole D4 — Φ doit être une FONCTION, au bit
+{
+    let (e, _) = fixture(WORDS, false, 7, false, false);
+    let mut p = Perception::new(e, &cfg); p.ensure_frames();
+    let (s, _) = router.score(&p);
+    let ab = abduce(&p, p.slots[0].0, p.slots[0].1, &s, &cfg, &mut PyRandom::new(0), None);
+    let c = ab.cause.as_ref().unwrap();
+    let t = &p.e[p.slots[0].0..p.slots[0].1];
+    let (p1, _) = phi(c, t, &mut PyRandom::new(11), 64, &[], 3);
+    let (p2, _) = phi(c, t, &mut PyRandom::new(11), 64, &[], 3);
+    check(&mut results, "A21 Φ déterministe au bit (même entrée, deux appels)",
+          p1.to_bits() == p2.to_bits(), &format!("{:016x} vs {:016x}", p1.to_bits(), p2.to_bits()));
+}
+
+// A19 : monotonie du pipeline (vrai falsificateur de commensurabilité)
+check(&mut results, "A19 P21 reach monotone en budget", tstats.q_gt_1 == 0,
+      &format!("violations={}/{}", tstats.q_gt_1, tstats.solvable));
+
+// A20 : régime, sur épisodes faisables par construction
+check(&mut results, "A20 P20 régime atteint",
+      tstats.solvable == tstats.episodes
+      && (tstats.q_ge_999 as f64) < 0.5 * tstats.solvable as f64,
+      &format!("faisables={}/{} q≈1={} rejetés={} level={}",
+               tstats.solvable, tstats.episodes, tstats.q_ge_999, tstats.rejected, tstats.level));
+
+// A22 : MESURE — l'espace d'hypothèses manque-t-il ? (pas un gate)
+println!("[MEAS] A22 espace : Φ(vérité)>reach sur {}/{} épisodes ; rejetés={}",
+         tstats.space_gap, tstats.solvable, tstats.rejected);
+
+// A8c : tolérance = résolution mesurée, n=128, McNemar exact
+fn mcnemar_exact(b: usize, c: usize) -> f64 {
+    let n = b + c; if n == 0 { return 1.0; }
+    let k = b.min(c); let mut p = 0.5f64.powi(n as i32); let mut s = p;
+    for i in 0..k { p *= (n - i) as f64 / (i + 1) as f64; s += p; }
+    (2.0 * s).min(1.0)
+}
+let (mut hit_t, mut hit_u, mut bt, mut bu) = (0usize, 0usize, 0usize, 0usize);
+for s in 0..128u64 {
+    let (ee, _) = episode(&mut PyRandom::new(1000 + s), 60);
+    let pe = Perception::new(ee.clone(), &cfg);
+    let (st_, _) = router.score(&pe);
+    let (su, _) = rand_router.score(&pe);
+    let at = abduce(&pe, 0, ee.len(), &st_, &cfg,     &mut PyRandom::new(5), None);
+    let au = abduce(&pe, 0, ee.len(), &su,  &cfg,     &mut PyRandom::new(5), None);
+    let ar = abduce(&pe, 0, ee.len(), &st_, &cfg_ref, &mut PyRandom::new(5), Some(cfg.pops*4));
+    let tol = at.eps.max(au.eps).max(ar.eps);
+    let ht = at.reach >= ar.reach - tol;
+    let hu = au.reach >= ar.reach - tol;
+    hit_t += ht as usize; hit_u += hu as usize;
+    if ht && !hu { bt += 1; } if hu && !ht { bu += 1; }
+}
+println!("[MEAS] A8c {hit_t}/128 vs {hit_u}/128  discordants=({bt},{bu})  p={:.4}",
+         mcnemar_exact(bt, bu));
+check(&mut results, "A8c non-infériorité du taux d'atteinte (n=128, tol=eps)",
+      mcnemar_exact(bt, bu) >= 0.05 || bt >= bu, &format!("{hit_t} vs {hit_u}"));
+
+// A23 : le drapeau --seed doit être opérant
+let (e0, _) = fixture(WORDS, false, 7, false, false);
+let (_, r0) = understand(&e0, &router, &cfg, 0);
+let (_, r1) = understand(&e0, &router, &cfg, 1);
+check(&mut results, "A23 --seed consommé (Φ varie avec la graine)", r0.phi != r1.phi, "");
+
     match fs::read("perceived.eff") {
         Ok(demo) => {
             let (e, _) = fixture(WORDS, false, 7, false, false);
