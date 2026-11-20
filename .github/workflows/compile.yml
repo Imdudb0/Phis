@@ -1,0 +1,57 @@
+name: Run Phis
+
+on:
+  workflow_dispatch
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  OPENBLAS_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+  OMP_NUM_THREADS: "1"
+  RAYON_NUM_THREADS: "4"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: cargo build --release --bins
+        env:
+          RUSTFLAGS: "-C target-cpu=native"
+
+      - name: Run Phisharp
+        run: |
+          #cargo check
+          cargo run --release
+          #cargo run --release --bin ask -- --model out/sharp.phis --file perceived.eff
+          #cargo run --release --bin phisharp -- train --steps 800 --batch 4 --nodes 16 --dim 16 --max-search 8 --out out/sharp.phis
+        env:
+          RUSTFLAGS: "-C target-cpu=native"
+
+      #- name: Run test
+        #run: |
+          #cargo test 
+#--workspace
+          #cargo clippy --workspace --all-targets
+
+      - name: Debug - Show files and Git status
+        if: always()
+        run: |
+          echo "=== Files in directories ==="
+          ls -la out/ || echo "Directory out/ not found!"
+          echo "=== Git Status (including ignored) ==="
+          git status --ignored
+
+      - name: Commit and Push changes
+        if: always()
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "Résultats simulation: ${{ github.run_number }}"
+          file_pattern: 'out/'
+          add_options: '-f'
