@@ -248,7 +248,7 @@ pub fn slice_trace(steps: &[Step], targets: &[NodeId]) -> (Vec<usize>, BTreeSet<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::term::Kind;
+    use super::term::Kind;
 
     #[test]
     fn chain_rule_fires_slices_and_replays() {
