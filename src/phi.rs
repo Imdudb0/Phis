@@ -111,12 +111,13 @@ pub fn state_spaces(c: &Cause, _extra_keys: &[[u8; 256]]) -> Vec<(usize, Vec<Int
 
 fn entropy<T: Eq + Hash>(counts: &HashMap<T, usize>, n: usize) -> f64 {
     let nf = n as f64;
+    // P22 : l'ordre d'itération de HashMap est randomisé PAR INSTANCE.
+    // entropy ne dépend que du MULTISET des comptes : on le canonicalise.
+    let mut cs: Vec<usize> = counts.values().copied().collect();
+    cs.sort_unstable();
     let mut h = 0.0;
-    for &c in counts.values() {
-        if c > 0 {
-            let p = c as f64 / nf;
-            h -= p * p.log2();
-        }
+    for c in cs {
+        if c > 0 { let p = c as f64 / nf; h -= p * p.log2(); }
     }
     h
 }
