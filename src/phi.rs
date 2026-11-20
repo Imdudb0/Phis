@@ -1,6 +1,6 @@
 //! Φ-lite : puissance cause-effet intégrée, interventionnelle, partitionnée.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashMap};
 use std::hash::Hash;
 
 use crate::algebra::{emit, values, Cause, Intervention, Op, IDENT};
@@ -180,8 +180,9 @@ pub fn phi(
         samples.push(emit(c, Some(&do_map)));
     }
 
-    let mut total = 0.0;
     let mut details = Vec::new();
+    let mut total_groups: BTreeMap<Vec<(usize, usize)>, (f64, f64)> = BTreeMap::new();
+
     for (u, spans) in occ0.iter().enumerate() {
         if spans.len() < 2 {
             continue;
@@ -234,7 +235,9 @@ pub fn phi(
             null += mi(&sh, n);
         }
         let iota = (raw - null / (nnull.max(1) as f64)).max(0.0);
-        total += eps * iota;
+        let g = total_groups.entry(spans.clone()).or_insert((0.0, 0.0));
+        g.0 = g.0.max(eps);      // même purview ⇒ un seul mécanisme
+        g.1 = g.1.max(iota);     // mêmes colonnes ⇒ même iota (max = déterministe)
         details.push(SourceDetail {
             node: u,
             occ: spans.len(),
@@ -242,6 +245,8 @@ pub fn phi(
             iota,
         });
     }
+    
+    let total: f64 = total_groups.values().map(|(e, i)| e * i).sum();
 
     (
         total,
@@ -288,4 +293,116 @@ pub fn underdetermined(
         }
     }
     (undet, open_alt)
+}
+
+/// Occurrences + clé composée T de la racine vers chaque occurrence.
+fn emit_proj(c: &Cause, do_map: Option<&HashMap<usize, Intervention>>)
+    -> (Vec<u8>, Vec<Vec<(usize, usize)>>, Vec<Vec<[u8; 256]>>)
+{
+    let v = values(c, do_map);
+    let mut occ = vec![Vec::new(); c.nodes.len()];
+    let mut tr  = vec![Vec::new(); c.nodes.len()];
+    fn compose(a: &[u8; 256], b: &[u8; 256]) -> [u8; 256] {
+        let mut o = IDENT;
+        for i in 0..256 { o[i] = a[b[i] as usize]; }
+        o
+    }
+    fn inv(k: &[u8; 256]) -> [u8; 256] {
+        let mut o = IDENT;
+        for i in 0..256 { o[k[i] as usize] = i as u8; }
+        o
+    }
+    fn walk(i: usize, start: usize, t: [u8; 256], nodes: &[Node], v: &[Vec<u8>],
+            do_map: Option<&HashMap<usize, Intervention>>,
+            occ: &mut [Vec<(usize, usize)>], tr: &mut [Vec<[u8; 256]>]) {
+        occ[i].push((start, start + v[i].len()));
+        tr[i].push(t);
+        let n = &nodes[i];
+        let iv = do_map.and_then(|m| m.get(&i));
+        match n.op {
+            Op::Seq => {
+                let order: Vec<usize> = match iv {
+                    Some(Intervention::Order(o)) => o.iter().map(|&p| n.kids[p]).collect(),
+                    _ => n.kids.clone(),
+                };
+                let mut cur = start;
+                for k in order { walk(k, cur, t, nodes, v, do_map, occ, tr); cur += v[k].len(); }
+            }
+            Op::Rep => {
+                let kk = match iv { Some(Intervention::Count(c)) => *c, _ => n.k };
+                let mut cur = start;
+                for _ in 0..kk { walk(n.kids[0], cur, t, nodes, v, do_map, occ, tr); cur += v[n.kids[0]].len(); }
+            }
+            Op::Alt => if !n.kids.is_empty() {
+                let s = match iv { Some(Intervention::Sel(s)) => *s, _ => n.sel } % n.kids.len();
+                walk(n.kids[s], start, t, nodes, v, do_map, occ, tr);
+            },
+            Op::Rec => {
+                let key = match iv { Some(Intervention::Key(k)) => *k, _ => n.key };
+                walk(n.kids[0], start, compose(&t, &key), nodes, v, do_map, occ, tr);
+            }
+            _ => {}
+        }
+    }
+    if !c.nodes.is_empty() { walk(c.root, 0, IDENT, &c.nodes, &v, do_map, &mut occ, &mut tr); }
+    (v.get(c.root).cloned().unwrap_or_default(), occ, tr)
+}
+
+/// Φ en coordonnées de cause : v_o = T_o^{-1}(out[o]).
+/// Une clé Rec est une CONVENTION : tirée en arrière, elle s'annule.
+pub fn phi_pi(c: &Cause, e: &[u8], rng: &mut PyRandom, n: usize, nnull: usize) -> f64 {
+    let (out0, occ0, tr0) = emit_proj(c, None);
+    if out0.as_slice() != e { return 0.0; }
+    let sp = state_spaces(c, &[]);
+    let sp_map: HashMap<usize, &[Intervention]> = sp.iter().map(|(i, v)| (*i, v.as_slice())).collect();
+    let mut samples = Vec::with_capacity(n);
+    for _ in 0..n {
+        let mut do_map = HashMap::with_capacity(sp.len());
+        for (i, vs) in &sp { let p = rng.randrange(vs.len()); do_map.insert(*i, vs[p].clone()); }
+        samples.push(emit_proj(c, Some(&do_map)));
+    }
+    let mut groups: BTreeMap<Vec<(usize, usize)>, (f64, f64)> = BTreeMap::new();
+    for (u, spans) in occ0.iter().enumerate() {
+        if spans.len() < 2 { continue; }
+        let eps = match sp_map.get(&u) {
+            Some(vs) => {
+                let mut ch = 0;
+                for s in *vs {
+                    let mut d = HashMap::with_capacity(1); d.insert(u, s.clone());
+                    // pouvoir causal EN COORDONNÉES DE CAUSE, pas en octets
+                    let (o, oc, tr) = emit_proj(c, Some(&d));
+                    let base = pull(&out0, &occ0[u], &tr0[u]);
+                    if oc[u].len() != spans.len() || pull(&o, &oc[u], &tr[u]) != base { ch += 1; }
+                }
+                ch as f64 / vs.len() as f64
+            }
+            None => 0.0,
+        };
+        if eps == 0.0 { continue; }
+        let mut cols: Vec<Vec<Option<Vec<u8>>>> = vec![Vec::with_capacity(n); spans.len()];
+        for (o, oc, tr) in &samples {
+            if oc[u].len() != spans.len() { for col in &mut cols { col.push(None); } continue; }
+            let pv = pull(o, &oc[u], &tr[u]);
+            for (t, val) in pv.into_iter().enumerate() { cols[t].push(Some(val)); }
+        }
+        let raw = mi(&cols, n);
+        let mut null = 0.0;
+        for _ in 0..nnull {
+            let mut sh = cols.clone();
+            for col in &mut sh { rng.shuffle(col); }
+            null += mi(&sh, n);
+        }
+        let iota = (raw - null / nnull.max(1) as f64).max(0.0);
+        let g = groups.entry(spans.clone()).or_insert((0.0, 0.0));
+        g.0 = g.0.max(eps); g.1 = g.1.max(iota);
+    }
+    groups.values().map(|(e, i)| e * i).sum()
+}
+
+fn pull(out: &[u8], spans: &[(usize, usize)], tr: &[[u8; 256]]) -> Vec<Vec<u8>> {
+    spans.iter().zip(tr.iter()).map(|(&(a, b), t)| {
+        let mut iv = IDENT;
+        for i in 0..256 { iv[t[i] as usize] = i as u8; }
+        out[a..b].iter().map(|&x| iv[x as usize]).collect()
+    }).collect()
 }
