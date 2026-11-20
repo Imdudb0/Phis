@@ -3,7 +3,7 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 
-use crate::algebra::{values, Builder, Cause, Node, IDENT, Op};
+use crate::algebra::{values, Builder, Cause, Node, IDENT, Op, hash8};
 use crate::phi::{phi, underdetermined, PhiInfo};
 use crate::rng::{NormalRng, PyRandom};
 
@@ -917,7 +917,7 @@ pub fn abduce(
     b: usize,
     scores: &[f64],
     cfg: &Cfg,
-    _rng: &mut PyRandom,
+    rng: &mut PyRandom,
     pops_budget: Option<usize>,
 ) -> Abduction {
     let empty = |pops| Abduction {
