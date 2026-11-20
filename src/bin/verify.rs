@@ -10,7 +10,7 @@ use phisharp::core::{abduce, residual, Cfg, Perception, Router};
 use phisharp::ptgrs::episode;
 use phisharp::phi::phi;
 use phisharp::rng::PyRandom;
-use phisharp::model::{load, save, train_manifest, understand};
+use phisharp::model::{load, save, train_manifest, train_manifest_stats, understand};
 
 #[path = "common/fixture.rs"] mod fix;
 use fix::{fixture, WORDS, NONCE};
@@ -431,17 +431,6 @@ let (a0, r0) = understand(&e0, &router, &cfg, 0);
 let (a1, r1) = understand(&e1, &router, &cfg, 0);
 check(&mut results, "A18 invariance σ (réponse=σ(réponse), Φ identique)",
       a1 == a0.iter().map(|&b| sg(b)).collect::<Vec<u8>>() && r0.phi == r1.phi && r0.rung == r1.rung, "");
-
-// A8c : n=64 + McNemar exact, et c'est une MESURE, pas un gate
-fn mcnemar_exact(b: usize, c: usize) -> f64 {
-    let n = b + c; if n == 0 { return 1.0; }
-    let k = b.min(c); let mut p = 0.5f64.powi(n as i32); let mut s = p;
-    for i in 0..k { p *= (n - i) as f64 / (i + 1) as f64; s += p; }
-    (2.0 * s).min(1.0)
-}
-// dans la boucle : let ht = …; let hu = …; if ht && !hu { bt += 1; } if hu && !ht { bu += 1; }
-println!("[MEAS] A8c {hit_t}/64 vs {hit_u}/64  discordants=({bt},{bu})  p={:.3}", mcnemar_exact(bt, bu));
-
 
     // ---- A13 : ablation — sans abduction, pas de réponse ----------------
     let (e3, _) = fixture(WORDS, false, 7, false, false);
