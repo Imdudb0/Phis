@@ -342,55 +342,68 @@ pub fn understand(e: &[u8], router: &Router, cfg: &Cfg, seed: u64) -> (Vec<u8>, 
     (answer, report)
 }
 
-pub fn train_manifest(
-    cfg: &Cfg,
-    episodes: usize,
-    seed: u64,
-    log: Option<&dyn Fn(usize, f64, f64, usize)>,
-) -> (Router, HashSet<Vec<u8>>) {
+#[derive(Clone, Debug, Default)]
+pub struct TrainStats { pub episodes: usize, pub solvable: usize,
+                        pub q_ge_999: usize, pub q_gt_1: usize, pub level: usize }
+
+pub fn train_manifest(cfg: &Cfg, episodes: usize, seed: u64,
+                      log: Option<&dyn Fn(usize, f64, f64, usize)>) -> (Router, HashSet<Vec<u8>>) {
+    let (r, s, _) = train_manifest_stats(cfg, episodes, seed, log); (r, s)
+}
+
+pub fn train_manifest_stats(cfg: &Cfg, episodes: usize, seed: u64,
+                            log: Option<&dyn Fn(usize, f64, f64, usize)>)
+    -> (Router, HashSet<Vec<u8>>, TrainStats)
+{
     let mut router = Router::new(cfg.d, cfg.h, seed);
-
-    // TROIS FLUX INDÉPENDANTS
-    let mut rng_env = PyRandom::new(seed);                              // épisodes
-    let mut rng_mc  = PyRandom::new(seed ^ 0xA5A5_5A5A_DEAD_BEEF);      // Φ pendant l'abduction
-    let mut rng_ref = PyRandom::new(seed ^ 0x0123_4567_89AB_CDEF);      // référence budget riche
-
+    let mut rng_env = PyRandom::new(seed);
     let mut seen: HashSet<Vec<u8>> = HashSet::new();
-    let mut rejected = 0usize;
-
-    // référence : même routeur, même perception, budget ET complètes élargis
     let cfg_ref = Cfg { completes: cfg.completes * 4, ..cfg.clone() };
+    let mut st = TrainStats { episodes, ..Default::default() };
+    let mut window: Vec<Option<f64>> = Vec::new();
 
     for ep in 0..episodes {
         let (e, _truth) = loop {
-            let (e, c) = if ep % 2 == 0 { episode_hard(&mut rng_env, 60) }
-                 else            { episode(&mut rng_env, 60) };
+            let (e, c) = match st.level {
+                0 => if ep % 2 == 0 { episode_hard(&mut rng_env, 60) } else { episode(&mut rng_env, 60) },
+                1 => episode_hard(&mut rng_env, 60),
+                l => episode_harder(&mut rng_env, 60, l - 1),
+            };
             if seen.insert(e.clone()) { break (e, c); }
-            rejected += 1;
-            assert!(rejected < 10_000, "espace d'épisodes épuisé");
         };
-
         let per = Perception::new(e.clone(), cfg);
         let (scores, hm) = router.score(&per);
-        let ab     = abduce(&per, 0, e.len(), &scores, cfg,     &mut rng_mc,  None);
-        let ab_ref = abduce(&per, 0, e.len(), &scores, &cfg_ref, &mut rng_ref, Some(cfg.pops * 4));
-
-        // P15 : regret vs budget riche — borné, non saturant, ALIGNÉ sur A8
-        let q    = ab.phi / (ab_ref.phi + 1e-6);          // ∈ (0, 1]
+        // P21 : MÊME graine MC pour les deux budgets ⇒ q apparié, plus de q>1
+        let mc = seed ^ (ep as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let ab     = abduce(&per, 0, e.len(), &scores, cfg,      &mut PyRandom::new(mc), None);
+        let ab_ref = abduce(&per, 0, e.len(), &scores, &cfg_ref, &mut PyRandom::new(mc), Some(cfg.pops * 4));
         let cost = ab.pops as f64 / cfg.pops.max(1) as f64;
-        let r    = q - 0.05 * cost;
-
-        let adv = router.update(&per, &hm, &ab.used, r, 0.05);
-
-        if let Some(logger) = log {
-            if ep % 20 == 0 {
-                logger(ep, r, ab.phi, ab.pops);
-                eprintln!("   q={q:.3} cost={cost:.3} adv={adv:+.3} ref_phi={:.3}", ab_ref.phi);
-            }
+        let (q, r, signal) = if ab_ref.phi <= 1e-9 {
+            (0.0, 0.0, false)                       // infaisable : AUCUN signal, pas une punition
+        } else {
+            let q_raw = ab.phi / ab_ref.phi;
+            if q_raw > 1.0 + 1e-9 { st.q_gt_1 += 1; }
+            let q = q_raw.min(1.0);
+            (q, q - 0.05 * cost, true)
+        };
+        let adv = if signal {
+            st.solvable += 1;
+            if q >= 0.999 { st.q_ge_999 += 1; }
+            router.update(&per, &hm, &ab.used, r, 0.05)
+        } else { 0.0 };
+        window.push(if signal { Some(q) } else { None });
+        if window.len() >= 40 {
+            let ok: Vec<f64> = window.iter().filter_map(|x| *x).collect();
+            let sat = ok.iter().filter(|&&q| q >= 0.999).count() as f64 / ok.len().max(1) as f64;
+            if ok.len() < 20 { st.level = st.level.saturating_sub(1); }   // infaisable : redescendre
+            else if sat > 0.5 { st.level += 1; }                          // P20 : régime non atteint
+            eprintln!("P20 level={} faisables={}/40 q≈1={:.0}%", st.level, ok.len(), 100.0 * sat);
+            window.clear();
         }
+        if let Some(l) = log { if ep % 20 == 0 { l(ep, r, ab.phi, ab.pops);
+            eprintln!("   q={q:.3} cost={cost:.3} adv={adv:+.3} ref={:.3} signal={signal}", ab_ref.phi); } }
     }
-    eprintln!("one-pass : {} épisodes uniques, {rejected} doublons rejetés à la génération", seen.len());
-    (router, seen)
+    (router, seen, st)
 }
 
 pub fn train(cfg: &Cfg, episodes: usize, seed: u64,
