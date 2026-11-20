@@ -7,10 +7,11 @@
 //! in layer 0 and no rule writes layer 0, so a hidden cause can only enter a
 //! run through the initial state, which means it has to be abduced.
 
-use crate::rewrite::{Rule, State};
-use crate::rng::Rng;
-use crate::term::{Graph, Kind, NodeId, SymId};
-use crate::util::round;
+use super::rewrite::{Rule, State};
+use super::rng::Rng;
+use super::term::{Graph, Kind, NodeId, SymId};
+use super::util::round;
+
 use std::collections::{HashMap, HashSet};
 
 // ------------------------------------------------------------------ lexicon
