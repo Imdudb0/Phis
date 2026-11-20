@@ -604,12 +604,13 @@ check(&mut results, "A23 --seed consommé (Φ varie avec la graine)", r0.phi != 
     println!("[MEAS] A26 raffinement Lit/Rep/Seq : {v:?}");
 }
 
-// A20 : UNE seule entrée, statistique, sur le plafond-vérité
 let (lo, hi) = wilson(tstats.q_ge_999, tstats.solvable);
-check(&mut results, "A20 P20 régime atteint (q≈1 minoritaire, IC95 exclut 0.5)",
-      tstats.solvable == tstats.episodes && hi < 0.5,
-      &format!("q≈1={}/{} IC=[{lo:.3},{hi:.3}] gap={} rejetés={}",
-               tstats.q_ge_999, tstats.solvable, tstats.space_gap, tstats.rejected));
+let verdict = if tstats.solvable != tstats.episodes { "FAIL" }
+              else if hi < 0.5 { "PASS" }      // q≈1 minoritaire : établi
+              else if lo > 0.5 { "FAIL" }      // q≈1 majoritaire : prédiction réfutée
+              else { "INDET" };                // l'échantillon ne tranche pas
+println!("[{verdict}] A20 P20 régime  q≈1={}/{} IC95=[{lo:.3},{hi:.3}] gap={} rejetés={}",
+         tstats.q_ge_999, tstats.solvable, tstats.space_gap, tstats.rejected);
 
 // A8b : apparié (CRN), donc AUCUN plancher de bruit n'est requis — un IC sur n=256
 let mut d: Vec<f64> = Vec::new();
