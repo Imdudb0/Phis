@@ -25,6 +25,22 @@ fn check(results: &mut Vec<(String, bool, String)>, name: &str, cond: bool, deta
     );
 }
 
+/// Intervalle de confiance de Wilson (score) à 95 %.
+/// n = 0 => (0,1) : indéterminé, jamais NaN (A20 doit alors échouer, pas paniquer).
+fn wilson(k: usize, n: usize) -> (f64, f64) {
+    const Z: f64 = 1.959_963_984_540_054;
+    if n == 0 {
+        return (0.0, 1.0);
+    }
+    let nf = n as f64;
+    let p = k.min(n) as f64 / nf;
+    let z2 = Z * Z;
+    let den = 1.0 + z2 / nf;
+    let center = (p + z2 / (2.0 * nf)) / den;
+    let half = Z * (p * (1.0 - p) / nf + z2 / (4.0 * nf * nf)).sqrt() / den;
+    ((center - half).max(0.0), (center + half).min(1.0))
+}
+
 fn motif(kind: usize, u: &[u8], v1: &[u8], v2: &[u8], w: &[u8], sep: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     match kind {
