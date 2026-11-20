@@ -5,3 +5,4 @@ pub mod rewrite;
 pub mod world;
 pub mod abduce;
 pub mod armor;
+pub mod codec;
