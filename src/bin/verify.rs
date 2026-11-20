@@ -389,17 +389,10 @@ fn main() -> ExitCode {
         hit_u += (au.phi >= ar.phi - 1e-9) as usize;
     }
     check(&mut results, "A8c taux d'atteinte de l'optimum top-32", hit_t >= hit_u, &format!("{hit_t}/16 vs {hit_u}/16"));
-    
-    
+
+
 // D1 : la sonde doit être non dégénérée, sinon A8b ne veut rien dire
 check(&mut results, "A8b-0 sonde de bruit non dégénérée", floor > 0.0, &format!("plancher={floor:.6}"));
-
-// P21 / P20
-check(&mut results, "A19 P21 q commensurable (aucun q>1)", tstats.q_gt_1 == 0,
-      &format!("q>1={}/{}", tstats.q_gt_1, tstats.solvable));
-check(&mut results, "A20 P20 régime atteint", tstats.solvable > 0
-      && (tstats.q_ge_999 as f64) < 0.5 * tstats.solvable as f64,
-      &format!("q≈1={}/{} level={}", tstats.q_ge_999, tstats.solvable, tstats.level));
 
 // P19 : le motif, pas le contexte — égalité AU BIT
 fn dump(cfg: &Cfg, router: &Router, names: [&str; 3])
@@ -532,13 +525,6 @@ check(&mut results, "A18 invariance σ (réponse=σ(réponse), Φ identique)",
 check(&mut results, "A19 P21 reach monotone en budget", tstats.q_gt_1 == 0,
       &format!("violations={}/{}", tstats.q_gt_1, tstats.solvable));
 
-// A20 : régime, sur épisodes faisables par construction
-check(&mut results, "A20 P20 régime atteint",
-      tstats.solvable == tstats.episodes
-      && (tstats.q_ge_999 as f64) < 0.5 * tstats.solvable as f64,
-      &format!("faisables={}/{} q≈1={} rejetés={} level={}",
-               tstats.solvable, tstats.episodes, tstats.q_ge_999, tstats.rejected, tstats.level));
-
 // A22 : MESURE — l'espace d'hypothèses manque-t-il ? (pas un gate)
 println!("[MEAS] A22 espace : Φ(vérité)>reach sur {}/{} épisodes ; rejetés={}",
          tstats.space_gap, tstats.solvable, tstats.rejected);
@@ -575,6 +561,54 @@ let (e0, _) = fixture(WORDS, false, 7, false, false);
 let (_, r0) = understand(&e0, &router, &cfg, 0);
 let (_, r1) = understand(&e0, &router, &cfg, 1);
 check(&mut results, "A23 --seed consommé (Φ varie avec la graine)", r0.phi != r1.phi, "");
+
+    // A25 : LE falsificateur de π. Une couche de codec ne doit rien changer.
+{
+    let mut k = IDENT; k[b'C' as usize] = b'A'; k[b'D' as usize] = b'B';
+    let c  = Cause { nodes: vec![Node::lit(b"AB".to_vec()), Node::rep(0, 2)], root: 1 };
+    let cp = Cause { nodes: vec![Node::lit(b"CD".to_vec()), Node::rec(0, k), Node::rep(1, 2)], root: 2 };
+    let e = b"ABAB";
+    let f  = phi(&c,  e, &mut PyRandom::new(5), 48, &[], 3).0;
+    let fp = phi(&cp, e, &mut PyRandom::new(5), 48, &[], 3).0;
+    let g  = phi_pi(&c,  e, &mut PyRandom::new(5), 48, 3);
+    let gp = phi_pi(&cp, e, &mut PyRandom::new(5), 48, 3);
+    println!("[MEAS] A25 codec : Φ {f:.4}->{fp:.4} (×{:.2})   Φ_pi {g:.4}->{gp:.4} (×{:.2})", fp/f, gp/g);
+    check(&mut results, "A25 π : Φ invariante par couche de codec", (gp - g).abs() <= 1e-9, "");
+}
+
+// A26 : MESURE — Φ récompense-t-elle le découpage fin ?
+{
+    let e = b"ABAB";
+    let a = Cause { nodes: vec![Node::lit(e.to_vec())], root: 0 };
+    let b = Cause { nodes: vec![Node::lit(b"AB".to_vec()), Node::rep(0,2)], root: 1 };
+    let c = Cause { nodes: vec![Node::lit(b"A".to_vec()), Node::lit(b"B".to_vec()),
+                                Node::seq(vec![0,1,0,1])], root: 2 };
+    let v: Vec<f64> = [&a,&b,&c].iter()
+        .map(|x| phi(x, e, &mut PyRandom::new(5), 48, &[], 3).0).collect();
+    println!("[MEAS] A26 raffinement Lit/Rep/Seq : {v:?}");
+}
+
+// A20 : UNE seule entrée, statistique, sur le plafond-vérité
+let (lo, hi) = wilson(tstats.q_ge_999, tstats.solvable);
+check(&mut results, "A20 P20 régime atteint (q≈1 minoritaire, IC95 exclut 0.5)",
+      tstats.solvable == tstats.episodes && hi < 0.5,
+      &format!("q≈1={}/{} IC=[{lo:.3},{hi:.3}] gap={} rejetés={}",
+               tstats.q_ge_999, tstats.solvable, tstats.space_gap, tstats.rejected));
+
+// A8b : apparié (CRN), donc AUCUN plancher de bruit n'est requis — un IC sur n=256
+let mut d: Vec<f64> = Vec::new();
+for s in 0..256u64 {
+    let (ee, _) = episode(&mut PyRandom::new(1000 + s), 60);
+    let pe = Perception::new(ee.clone(), &cfg);
+    let (st_, _) = router.score(&pe); let (su, _) = rand_router.score(&pe);
+    let at = abduce(&pe, 0, ee.len(), &st_, &cfg, &mut PyRandom::new(5), None);
+    let au = abduce(&pe, 0, ee.len(), &su,  &cfg, &mut PyRandom::new(5), None);
+    d.push(at.reach - au.reach);
+}
+let m = d.iter().sum::<f64>() / d.len() as f64;
+let sd = (d.iter().map(|x| (x-m).powi(2)).sum::<f64>() / (d.len()-1) as f64).sqrt();
+let h = 1.96 * sd / (d.len() as f64).sqrt();
+println!("[MEAS] A8b ΔΦ apparié = {m:+.4}  IC95=[{:+.4},{:+.4}]  (plancher MC inutile en CRN)", m-h, m+h);
 
     match fs::read("perceived.eff") {
         Ok(demo) => {
