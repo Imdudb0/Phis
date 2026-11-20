@@ -342,7 +342,6 @@ pub fn understand(e: &[u8], router: &Router, cfg: &Cfg, seed: u64) -> (Vec<u8>, 
     (answer, report)
 }
 
-// src/model.rs
 #[derive(Clone, Debug, Default)]
 pub struct TrainStats {
     pub episodes: usize, pub solvable: usize, pub q_ge_999: usize,
@@ -396,13 +395,22 @@ pub fn train_manifest_stats(cfg: &Cfg, episodes: usize, seed: u64,
 
         let ab = abduce(&per, 0, e.len(), &scores, cfg, &mut PyRandom::new(mc), None);
         if ab.reach > ab_ref.reach + 1e-12 { st.q_gt_1 += 1; }
-        let opt = ab.reach.max(ab_ref.reach);
+        
+let (pt, _) = phi(&truth, &e, &mut PyRandom::new(mc), cfg.phi_n, &[], 3);
+let opt = ab.reach.max(ab_ref.reach).max(pt);       // plafond NON saturant
+if ab.reach > ab_ref.reach + 1e-12 { st.q_gt_1 += 1; }   // A19 inchangé
+let q = if opt > 1e-9 { ab.reach / opt } else { 0.0 };   // ∈[0,1] par construction
+let cost = ab.pops as f64 / cfg.pops.max(1) as f64;
+let r = q - 0.05 * cost;
+//if pt > ab_ref.reach + ab_ref.eps { st.space_gap += 1; }
+        
+        /*let opt = ab.reach.max(ab_ref.reach);
         let q = ab.reach / opt;                       // ∈ [0,1] par monotonie, pas par clamp
         let cost = ab.pops as f64 / cfg.pops.max(1) as f64;
-        let r = q - 0.05 * cost;
+        let r = q - 0.05 * cost;*/
         st.solvable += 1;
         if q >= 0.999 { st.q_ge_999 += 1; }
-        let (pt, _) = phi(&truth, &e, &mut PyRandom::new(mc), cfg.phi_n, &[], 3);
+        //let (pt, _) = phi(&truth, &e, &mut PyRandom::new(mc), cfg.phi_n, &[], 3);
         if pt > ab_ref.reach + ab_ref.eps { st.space_gap += 1; }
         let adv = router.update(&per, &hm, &ab.used, r, 0.05);
 
