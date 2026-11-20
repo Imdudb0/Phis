@@ -5,10 +5,10 @@ use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
 
-use phisharp::algebra::{sever, signature, unify, Cause, Node, values};
+use phisharp::algebra::{sever, signature, unify, Cause, Node, values, IDENT};
 use phisharp::core::{abduce, residual, Cfg, Perception, Router};
 use phisharp::ptgrs::episode;
-use phisharp::phi::phi;
+use phisharp::phi::{phi, phi_pi};
 use phisharp::rng::PyRandom;
 use phisharp::model::{load, save, train_manifest, train_manifest_stats, understand};
 
