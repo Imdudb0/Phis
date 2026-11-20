@@ -34,9 +34,9 @@ jobs:
         env:
           RUSTFLAGS: "-C target-cpu=native"
 
-      #- name: Run test
-        #run: |
-          #cargo test 
+      - name: Run test
+        run: |
+          cargo test 
 #--workspace
           #cargo clippy --workspace --all-targets
 
