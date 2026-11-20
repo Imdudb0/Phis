@@ -1,9 +1,9 @@
 //! Φ-lite : puissance cause-effet intégrée, interventionnelle, partitionnée.
 
-use std::collections::{BTreeSet, HashMap, HashMap};
+use std::collections::{BTreeSet, BTreeMap, HashMap};
 use std::hash::Hash;
 
-use crate::algebra::{emit, values, Cause, Intervention, Op, IDENT};
+use crate::algebra::{emit, values, Cause, Intervention, Op, IDENT, Node};
 use crate::rng::PyRandom;
 
 #[derive(Clone, Debug)]
