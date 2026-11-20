@@ -6,7 +6,7 @@
 //! * `Stage` is a reversible byte filter. A pipeline applies its stages in order
 //!   before armoring and undoes them in reverse order after de-armoring.
 
-use crate::rng::Rng;
+use super::rng::Rng;
 
 /// Cap on the size of any decoded buffer; a guard against hostile input.
 pub const LIMIT: usize = 64 << 20;
