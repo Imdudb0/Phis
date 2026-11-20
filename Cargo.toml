@@ -12,10 +12,6 @@ path = "src/lib.rs"
 name = "phisharp"
 path = "src/main.rs"
 
-[[bin]]
-name = "verify"
-path = "src/bin/verify.rs"
-
 [profile.release]
 opt-level = 3
 lto = "thin"
