@@ -993,31 +993,14 @@ pub fn abduce(
             }
         }
     }
-
+    
     let target = &per.e[a..b];
-    let mut best = empty(pops);
-    let mut best_key: (f64, isize, isize) = (-1.0, -1, -1);
-    let mut extra_keys: Vec<[u8; 256]> = Vec::new();
+    let base = u64::from_le_bytes(hash8(target));
+    let jitter = ((rng.genrand_uint32() as u64) << 32) | rng.genrand_uint32() as u64;
+    let sel_seed = base ^ jitter;
 
-    {
-        let mut local: Vec<usize> = per.items.iter().enumerate()
-            .filter(|(_, it)| it.kind == Op::Lit && it.i >= a && it.j <= b)
-            .map(|(i, _)| i).collect();
-        local.sort_by_key(|&i| (per.items[i].i, per.items[i].j));
-        'outer: for (t, &idx) in local.iter().enumerate() {
-            for &s in &local[..t] {
-                if per.items[s].lit == per.items[idx].lit { continue; }
-                if per.items[s].lit.len() != per.items[idx].lit.len() { continue; }
-                if pattern(&per.items[s].lit) != pattern(&per.items[idx].lit) { continue; }
-                if let Some(k) = per.key_between(s, idx) {
-                    if !extra_keys.contains(&k) { extra_keys.push(k); }
-                    if extra_keys.len() == 3 { break 'outer; }
-                    break;
-                }
-            }
-        }
-    }
-    let extra_slice = &extra_keys[..];
+    struct Cand { c: Cause, chosen: Vec<usize>, key: (f64, isize, isize) }
+    let mut cands: Vec<Cand> = Vec::new();
 
     for chosen in &completes {
         let mut linkable: Vec<(usize, usize, [u8; 256])> = Vec::new();
@@ -1048,46 +1031,42 @@ pub fn abduce(
         }
         linkable.truncate(cfg.lift_cap);
         for mask in 0usize..(1usize << linkable.len()) {
-            let links: Vec<(usize, usize, [u8; 256])> = linkable
-                .iter()
-                .enumerate()
+            let links: Vec<(usize, usize, [u8; 256])> = linkable.iter().enumerate()
                 .filter(|&(t, _)| ((mask >> t) & 1) != 0)
-                .map(|(_, &item)| item)
-                .collect();
+                .map(|(_, &item)| item).collect();
             let c = build_variant(per, chosen, &links);
-            if values(&c, None)[c.root].as_slice() != target {
-                continue;
-            }
-            let mut rng_sel = PyRandom::new(sel_seed);          // REMISE À ZÉRO par variante
-            let (ph, info) = phi(&c, target, &mut rng_sel, cfg.phi_n, extra_slice, 3);
-            let nshared = info
-                .sources
-                .iter()
-                .filter(|d| d.iota > 0.0 && d.eps > 0.0)
-                .count() as isize;
-            let key_t = (ph, nshared, c.nodes.len() as isize);
-            if key_cmp(key_t, best_key) == Ordering::Greater {
-                best_key = key_t;
-                best = Abduction {
-                    cause: Some(c),
-                    phi: ph,
-                    info: Some(info),
-                    pops,
-                    used: chosen.clone(),
-                    cover: chosen.clone(),
-                    complete: true,
-                };
-            }
+            if values(&c, None)[c.root].as_slice() != target { continue; }
+            let (ph, info) = phi(&c, target, &mut PyRandom::new(sel_seed), cfg.phi_n, &[], 3);
+            let nsh = info.sources.iter().filter(|d| d.iota > 0.0 && d.eps > 0.0).count() as isize;
+            let nn = c.nodes.len() as isize;
+            cands.push(Cand { c, chosen: chosen.clone(), key: (ph, nsh, nn) });
         }
     }
+    cands.sort_by(|x, y| key_cmp(y.key, x.key));
+    cands.truncate(3);                       // finalistes, plus un seul gagnant élu sur 12 tirages
 
-    if let Some(ref cause) = best.cause {
-        let mut rng_fin = PyRandom::new(sel_seed ^ 0xFFFF_FFFF);
-        let (ph, info) = phi(cause, target, &mut rng_fin, cfg.phi_n_final, extra_slice, 3);
-        best.phi = ph;
-        best.info = Some(info);
+    let mut scored: Vec<(f64, isize, isize, Cause, Vec<usize>, PhiInfo)> = Vec::new();
+    let mut eps_phi = 0.0f64;
+    for cand in cands {
+        let (p1, i1) = phi(&cand.c, target, &mut PyRandom::new(sel_seed ^ 0xFFFF_FFFF), cfg.phi_n_final, &[], 3);
+        let (p2, _)  = phi(&cand.c, target, &mut PyRandom::new(sel_seed ^ 0x0F0F_0F0F), cfg.phi_n_final, &[], 3);
+        eps_phi = eps_phi.max(0.5 * (p1 - p2).abs());          // résolution AUTO-mesurée
+        let nsh = i1.sources.iter().filter(|d| d.iota > 0.0 && d.eps > 0.0).count() as isize;
+        scored.push((0.5 * (p1 + p2), nsh, cand.c.nodes.len() as isize, cand.c, cand.chosen, i1));
     }
 
+    let top = scored.iter().map(|s| s.0).fold(f64::NEG_INFINITY, f64::max);
+    let mut best = empty(pops);
+    let mut best_rank: (isize, isize, f64) = (-1, -1, -1.0);
+    for (ph, nsh, nn, c, chosen, info) in scored {
+        if ph < top - eps_phi { continue; }        // indiscernables à la résolution près
+        let rank = (nsh, nn, ph);                  // explication maximale (pas MDL)
+        if rank > best_rank {
+            best_rank = rank;
+            best = Abduction { cause: Some(c), phi: ph, info: Some(info), pops,
+                               used: chosen.clone(), cover: chosen, complete: true };
+        }
+    }
     best
 }
 
