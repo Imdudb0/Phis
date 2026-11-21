@@ -17,7 +17,7 @@
 //!   float64. Read-only extra: float32. `bin` and `ext` types are errors.
 
 use super::MAX_DEPTH;
-use super::value::Value;
+use crate::PTGRS::value::Value;
 
 // ------------------------------------------------------------------ cursor
 
