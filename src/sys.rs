@@ -731,4 +731,168 @@ fn best_system(
     }
 }
 
-/// Cx(s_t): the disjoint complexes of `state`,
+/// Cx(s_t): the disjoint complexes of `state`, at the grain tau* that maximises phi_s of the
+/// major complex, found by recursive exclusion (at most `cfg.max_cx`, by decreasing phi_s).
+/// Empty when nothing is irreducible.
+pub fn find_complexes(cx: &mut Ctx<'_>, state: &[u16], cfg: &SharpCfg) -> Found {
+    let n = cx.n;
+    let gm = cfg.grain_max.max(1);
+    let all: Vec<usize> = (0..n).collect();
+    let mut caches: Vec<SysCache> = (0..=gm).map(|_| HashMap::new()).collect();
+    let mut tau_star = 1usize;
+    let mut first: Option<(Vec<usize>, SysPhi)> = None;
+    for tau in 1..=gm {
+        if let Some(c) = best_system(cx, state, tau, cfg, &mut caches[tau], &all) {
+            let better = match &first {
+                None => true,
+                Some(f) => c.1.phi > f.1.phi * (1.0 + REL_TOL),
+            };
+            if better {
+                tau_star = tau;
+                first = Some(c);
+            }
+        }
+    }
+    let mut chosen: Vec<(Vec<usize>, SysPhi)> = Vec::new();
+    if let Some(f) = first {
+        let mut remaining: Vec<usize> = all.iter().copied().filter(|j| !f.0.contains(j)).collect();
+        chosen.push(f);
+        while chosen.len() < cfg.max_cx.max(1) && remaining.len() >= 2 {
+            match best_system(cx, state, tau_star, cfg, &mut caches[tau_star], &remaining) {
+                Some(c) => {
+                    remaining.retain(|j| !c.0.contains(j));
+                    chosen.push(c);
+                }
+                None => break,
+            }
+        }
+    }
+    let systems: Vec<System> = chosen
+        .into_iter()
+        .map(|(k, sp)| {
+            let (a, b) = split_mask(&k, sp.src);
+            System { nodes: k, phi_s: sp.phi, cut_src: a, cut_dst: b, exact: sp.exact }
+        })
+        .collect();
+    Found { tau: tau_star, systems }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::Hyper;
+    use crate::percept::Percept;
+
+    fn sig(x: f64) -> f64 {
+        1.0 / (1.0 + (-x).exp())
+    }
+
+    /// Node 0 is a perception node anchored to E[0]; node 1 is latent.
+    /// w01 is the connection 0 -> 1, w10 is 1 -> 0 (set directly).
+    fn two_node(w01: f64, w10: f64, hold: f64) -> Model {
+        let mut rng = Rng::new(1);
+        let mut m = Model::random(1, 1, Hyper::default(), &mut rng);
+        m.w = vec![0.0, w01, w10, 0.0];
+        m.hold = hold;
+        m.beta = 1.0;
+        m
+    }
+
+    #[test]
+    fn max_flow_finds_the_min_cut() {
+        // 0 -> 1 (3), 1 -> 2 (2), 0 -> 2 (1)
+        let cap = [0.0, 3.0, 1.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0];
+        let (f, mask) = max_flow(&cap, 3, 0, 2);
+        assert!((f - 3.0).abs() < 1e-12);
+        assert_eq!(mask, 0b011);
+    }
+
+    #[test]
+    fn ascent_is_a_lower_bound_of_the_enumeration() {
+        let p = vec![vec![0.5, 0.3, 0.2], vec![0.4, 0.4, 0.2], vec![0.6, 0.3, 0.1]];
+        let r = vec![vec![0.3, -0.5, 0.2], vec![-0.2, 0.4, 0.1], vec![0.1, -0.3, 0.6]];
+        let vals = vec![vec![0u16, 1, 2]; 3];
+        let exact = max_prod_abs(&p, &r, &vals, 1000);
+        let asc = max_prod_abs(&p, &r, &vals, 0);
+        assert!(asc > 0.0);
+        assert!(asc <= exact + 1e-12);
+    }
+
+    #[test]
+    fn phi_s_of_two_nodes_matches_closed_form() {
+        let (w01, w10, hold) = (1.0f64, -0.5f64, 2.0f64);
+        let m = two_node(w01, w10, hold);
+        let e = Percept::from_bytes(b"ab");
+        let mut cx = Ctx::new(&m, &e, 0);
+        let cfg = SharpCfg::from_model(&m);
+        let sp = system_phi(&mut cx, &[0, 0], 1, &cfg, &[0, 1]);
+        let p1 = sig(w01);
+        let p0 = sig(hold + w10);
+        // cut 0 -> 1: node 1 loses node 0, its marginal becomes exactly uniform
+        let v1 = p0 * (p1 * (2.0 * p1).log2().abs()).max((1.0 - p1) * (2.0 * (1.0 - p1)).log2().abs());
+        // cut 1 -> 0: node 0 (anchored: evaluated at E) loses node 1
+        let q0 = 0.5 * (sig(hold + w10) + sig(hold - w10));
+        let v2 = p1.max(1.0 - p1) * p0 * (p0 / q0).log2().abs();
+        let want = v1.min(v2);
+        assert!((sp.phi - want).abs() < 1e-9, "{} vs {}", sp.phi, want);
+        assert_eq!(sp.src, if v2 < v1 { 0b10 } else { 0b01 });
+        assert!(sp.exact);
+        let (a, b) = split_mask(&[0, 1], sp.src);
+        assert_eq!(a.len() + b.len(), 2);
+    }
+
+    #[test]
+    fn feedforward_graph_has_zero_phi_s() {
+        let m = two_node(1.0, 0.0, 2.0);
+        let e = Percept::from_bytes(b"ab");
+        let mut cx = Ctx::new(&m, &e, 0);
+        let cfg = SharpCfg::from_model(&m);
+        let sp = system_phi(&mut cx, &[0, 0], 1, &cfg, &[0, 1]);
+        assert_eq!(sp.phi, 0.0);
+    }
+
+    #[test]
+    fn sampled_cuts_never_underestimate_the_exhaustive_minimum() {
+        let mut rng = Rng::new(17);
+        let m = Model::random(3, 3, Hyper::default(), &mut rng);
+        let e = Percept::from_bytes(b"abcabc");
+        let mut cx = Ctx::new(&m, &e, 0);
+        let st = cx.initial_state();
+        let k: Vec<usize> = (0..6).collect();
+        let mut ce = SharpCfg::from_model(&m);
+        ce.exh_cuts = 62;
+        let mut ca = ce.clone();
+        ca.exh_cuts = 0;
+        let ex = system_phi(&mut cx, &st, 1, &ce, &k);
+        let ap = system_phi(&mut cx, &st, 1, &ca, &k);
+        assert!(ex.exact && !ap.exact);
+        assert!(ap.phi >= ex.phi - 1e-12, "approx {} < exact {}", ap.phi, ex.phi);
+    }
+
+    #[test]
+    fn two_decoupled_pairs_are_two_complexes() {
+        let mut rng = Rng::new(3);
+        let mut m = Model::random(2, 2, Hyper::default(), &mut rng);
+        // 0 <-> 1 and 2 <-> 3, nothing between the pairs (w[i*4+j] is i -> j)
+        m.w = vec![
+            0.0, 1.5, 0.0, 0.0,
+            -1.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 1.2,
+            0.0, 0.0, -1.4, 0.0,
+        ];
+        m.hold = 2.0;
+        m.beta = 1.0;
+        let e = Percept::from_bytes(b"abab");
+        let mut cx = Ctx::new(&m, &e, 0);
+        let mut cfg = SharpCfg::from_model(&m);
+        cfg.grain_max = 1;
+        let f = find_complexes(&mut cx, &[0, 1, 0, 1], &cfg);
+        assert_eq!(f.tau, 1);
+        assert_eq!(f.systems.len(), 2);
+        let mut ns: Vec<Vec<usize>> = f.systems.iter().map(|s| s.nodes.clone()).collect();
+        ns.sort();
+        assert_eq!(ns, vec![vec![0, 1], vec![2, 3]]);
+        assert!(f.systems.iter().all(|s| s.phi_s > 0.0));
+        assert!(f.systems[0].phi_s >= f.systems[1].phi_s);
+    }
+}
