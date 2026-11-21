@@ -9,8 +9,3 @@ pub mod resid;
 pub mod sharp;
 pub mod render;
 pub mod ptgrs;
-pub mod render;
-pub mod resid;
-pub mod sharp;
-pub mod sim;
-pub mod sys;
