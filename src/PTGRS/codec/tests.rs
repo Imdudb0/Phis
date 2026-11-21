@@ -8,8 +8,8 @@
 //!   are refused, and noise never panics.
 
 use super::{bin, text, Format, MAX_DEPTH};
-use crate::rng::Rng;
-use crate::value::{random_value, Value};
+use crate::PTGRS::rng::Rng;
+use crate::PTGRS::value::{random_value, Value};
 
 // ------------------------------------------------------------------ helpers
 
