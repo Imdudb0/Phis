@@ -16,6 +16,7 @@ use std::io::{self, Read, Write};
 use phisharp::PTGRS::util::mix;
 use phisharp::PTGRS::value::{random_value, Value};
 use phisharp::PTGRS::world::Params;
+use phisharp::PTGRS::render;
 
 // ------------------------------------------------------------------ constants
 
