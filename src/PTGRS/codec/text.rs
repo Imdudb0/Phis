@@ -12,7 +12,7 @@
 //!   `(map ("k" v) ..)`.
 
 use super::MAX_DEPTH;
-use crate::value::Value;
+use super::value::Value;
 
 /// `indent` is the number of spaces per level; 0 gives the compact form.
 pub fn json_encode(v: &Value, indent: usize) -> String {
