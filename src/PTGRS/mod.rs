@@ -8,3 +8,4 @@ pub mod armor;
 pub mod codec;
 pub mod value;
 pub mod render;
+pub mod pipeline;
