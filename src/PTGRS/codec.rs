@@ -20,7 +20,7 @@
 //! submodules: `text` (JSON, S-expressions) and `bin` (bencode, CBOR, MessagePack).
 
 mod bin;
-//mod text;
+mod text;
 #[cfg(test)]
 mod tests;
 
