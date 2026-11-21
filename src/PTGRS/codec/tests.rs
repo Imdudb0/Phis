@@ -308,7 +308,7 @@ fn msgpack_matches_the_specification() {
     kat(f, &tree, &hex("9301920203920405"));
     kat(f, &Value::obj(), &hex("80"));
     let ab = Value::obj().with("a", 1).with("b", Value::seq([2, 3]));
-    kat(f, &ab, &hex("82a16101a1629203"));
+    kat(f, &ab, &hex("82 a1 61 01 a1 62 92 02 03"));
     let mixed = Value::List(vec![Value::from("a"), Value::obj().with("b", "c")]);
     kat(f, &mixed, &hex("92a16181a162a163"));
 
