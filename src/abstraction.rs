@@ -1,58 +1,73 @@
 use crate::graph::*;
-use crate::dynamics::{Assembly, Link};
+use crate::dynamics::{Assembly, SearchResult};
 
-// Signature = rôle causal + flux dirigés + influence inter-assemblées. Pas le contenu.
-pub fn signatures(g: &Graph, asms: &[Assembly], rng: &mut Rng, budget: &mut Budget) -> Vec<Vec<f32>> {
-    let gain = vec![1.0f32; N]; let zero = zero_state();
-    let mut out = Vec::new();
-    for a in asms {
-        let mut x = zero_state();
-        for i in 0..N_WS { x[WS0 + i] = a.ws[i]; }
-        for _ in 0..4 { x = step_full(g, &x, &zero, &gain, 0.0, rng, budget, None); }
-        let mut sig = Vec::new();
-        for k in 0..N_C { sig.push(norm(&x[C0 + k])); }
-        for (s, t) in [(0usize, N_BYTE), (WS0, C0), (C0, G0), (G0, A0), (A0, N)] {
-            let m: f32 = (s..t).map(|i| norm(&x[i])).sum::<f32>() / (t - s) as f32;
-            sig.push(m);
-        }
-        for b in asms {
-            let mut d = 0.0; let mut na = 0.0; let mut nb = 0.0;
-            for i in 0..N_WS {
-                let u = x[WS0 + i][0]; let v = b.ws[i][0];
-                d += u * v; na += u * u; nb += v * v;
-            }
-            sig.push(d / (na.sqrt() * nb.sqrt() + 1e-6));
-        }
-        out.push(sig);
-    }
-    out
+#[derive(Clone)]
+pub struct Link { pub a: usize, pub b: usize, pub score: f32, pub shared: bool }
+
+pub struct Answer {
+    pub top_head: Option<usize>, pub bound_def: Option<usize>, pub projected: Option<usize>,
+    pub phrase: String, pub no_shared: bool,
 }
 
-fn words(e: &[u8], span: (usize, usize)) -> Vec<Vec<u8>> {
-    let mut out = Vec::new(); let mut cur = Vec::new();
-    for &b in &e[span.0..span.1] {
-        if b.is_ascii_alphanumeric() { cur.push(b); }
-        else if !cur.is_empty() { out.push(std::mem::take(&mut cur)); }
+fn role(b: &[Vec<f32>], i: usize) -> Vec<f32> {
+    let n = b.len();
+    let mut r = Vec::with_capacity(2 * n);
+    for j in 0..n { r.push(b[i][j]); }
+    for j in 0..n { r.push(b[j][i]); }
+    r
+}
+fn overlap(a: &[Vec<u8>], b: &[Vec<u8>]) -> bool { a.iter().any(|w| b.contains(w)) }
+
+fn core_phrase(e: &[u8], span: (usize, usize)) -> String {
+    let s = &e[span.0..span.1];
+    let mut end = s.len();
+    let bytes = s;
+    let pats: [&[u8]; 4] = [b" who", b" which", b" that", b","];
+    for p in pats {
+        if let Some(pos) = bytes.windows(p.len()).position(|w| w == p) { end = end.min(pos); }
     }
-    if !cur.is_empty() { out.push(cur); }
-    out
+    String::from_utf8_lossy(&s[..end]).trim().to_string()
 }
 
-// Critère majeur: lien entre assemblées SANS mots communs.
-pub fn project(g: &Graph, asms: &mut [Assembly], e: &[u8], rng: &mut Rng, budget: &mut Budget) -> Vec<Link> {
-    let sigs = signatures(g, asms, rng, budget);
-    for (a, s) in asms.iter_mut().zip(sigs.into_iter()) { a.sig = s; }
+// Projection référentielle: rôles causaux (pas le contenu), lien ∅ = critère majeur.
+pub fn project(res: &SearchResult, e: &[u8]) -> (Vec<Link>, Answer) {
+    let n = res.assemblies.len();
+    let b = &res.b; let drv = &res.drive;
     let mut links = Vec::new();
-    for i in 0..asms.len() {
-        for j in i + 1..asms.len() {
-            let score = cosine(&asms[i].sig, &asms[j].sig);
-            if score > 0.7 {
-                let wa = words(e, asms[i].span); let wb = words(e, asms[j].span);
-                let shared = wa.iter().any(|w| wb.contains(w));
-                links.push(Link { a: i, b: j, score, shared });
-            }
+    for i in 0..n { for j in i + 1..n {
+        if drv[i] < 0.05 && drv[j] < 0.05 { continue; }
+        let score = cosine(&role(b, i), &role(b, j));
+        if score > 0.6 {
+            let shared = overlap(&res.assemblies[i].words, &res.assemblies[j].words);
+            links.push(Link { a: i, b: j, score, shared });
         }
-    }
-    links.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
-    links
+    }}
+    links.sort_by(|a, c| c.score.partial_cmp(&a.score).unwrap());
+
+    let probe_words = &res.assemblies[res.probe].words;
+    let top_head = (0..n).filter(|&i| res.assemblies[i].kind == 1 && b[res.probe][i] > 0.0)
+        .max_by(|&a, &c| drv[c].partial_cmp(&drv[a]).unwrap());
+    let bound_def = top_head.and_then(|h|
+        (0..n).filter(|&i| res.assemblies[i].head == Some(h))
+            .max_by(|&a, &c| drv[c].partial_cmp(&drv[a]).unwrap()));
+    let projected = bound_def.and_then(|d|
+        (0..n).filter(|&i| res.assemblies[i].kind == 1
+            && !overlap(&res.assemblies[i].words, probe_words)
+            && (b[d][i] > 0.0 || crate::dynamics::words_of(e, res.assemblies[d].span.0, res.assemblies[d].span.1)
+                .iter().any(|w| res.assemblies[i].words.contains(w))))
+            .max_by(|&a, &c| drv[c].partial_cmp(&drv[a]).unwrap()));
+
+    let phrase = match bound_def {
+        Some(d) => core_phrase(e, res.assemblies[d].span),
+        None => String::from_utf8_lossy(&e[res.assemblies[res.probe].span.0..res.assemblies[res.probe].span.1]).into_owned(),
+    };
+    let no_shared = match projected {
+        Some(p) => !overlap(&res.assemblies[p].words, probe_words),
+        None => false,
+    };
+    (links, Answer { top_head, bound_def, projected, phrase, no_shared })
+}
+
+pub fn span_text(e: &[u8], a: &Assembly) -> String {
+    String::from_utf8_lossy(&e[a.span.0..a.span.1]).trim().to_string()
 }
