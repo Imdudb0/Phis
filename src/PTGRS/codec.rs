@@ -24,8 +24,8 @@ mod text;
 #[cfg(test)]
 mod tests;
 
-use super::rng::Rng;
-use super::value::Value;
+use crate::PTGRS::rng::Rng;
+use crate::PTGRS::value::Value;
 
 /// Deepest nesting (`Value::depth()`) that encoders accept and decoders allow.
 pub const MAX_DEPTH: usize = 128;
