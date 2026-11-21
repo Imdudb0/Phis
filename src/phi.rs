@@ -13,29 +13,19 @@ fn flat_cosine(a: &[Vec<f32>], b: &[Vec<f32>]) -> f32 {
     }}
     d / (na.sqrt() * nb.sqrt() + 1e-9)
 }
-fn lesion(b: &[Vec<f32>], h: usize) -> Vec<Vec<f32>> {
-    let mut bl = b.to_vec();
-    for j in 0..bl.len() { bl[h][j] = 0.0; bl[j][h] = 0.0; }
-    bl
-}
 
 // φ_sharp: puissance cause-effet intégrée, relative à E (structure régénérée).
+// intégration = irréductibilité aux parts indépendantes: whole vs propagation hub->hub coupée.
 pub fn compute(b: &[Vec<f32>], t: &[Vec<f32>], drv: &[f32], probe: usize, n: usize,
                budget: &mut Budget) -> (f32, f32, f32, f32) {
     if n == 0 { return (0.0, 0.0, 0.0, 0.0); }
     let fid = flat_cosine(b, t).clamp(0.0, 1.0);
     let base = sum_norm(drv);
-    let mut hubs: Vec<usize> = (0..n).collect();
-    hubs.sort_by(|&a, &c| drv[c].partial_cmp(&drv[a]).unwrap());
-    hubs.truncate(8);
-    let mut integ = f32::INFINITY;
-    for h in hubs {
-        let ah = sum_norm(&drive(&lesion(b, h), probe, n));
-        let d = tv(&base, &ah);
-        if d < integ { integ = d; }
-        budget.ops += (n * n * 3) as u64;
-    }
-    if !integ.is_finite() { integ = 0.0; }
+    let mut bi = vec![vec![0.0; n]; n];
+    for j in 0..n { bi[probe][j] = b[probe][j]; }   // parts indépendantes: seul le probe drive
+    let ind = sum_norm(&drive(&bi, probe, n));
+    let integ = tv(&base, &ind);
+    budget.ops += (n * n * 6) as u64;
     let spec = (1.0 - entropy_bits(&base) / (n as f32).log2().max(1.0)).clamp(0.0, 1.0);
     let phi = (fid * integ * spec).clamp(0.0, 1.0);
     (fid, integ, spec, phi)
@@ -60,7 +50,9 @@ pub fn responsibility(b: &[Vec<f32>], drv: &[f32], probe: usize, n: usize) -> Ve
     hubs.truncate(8);
     let mut resp = vec![0.0f32; n];
     for h in hubs {
-        let ah = sum_norm(&drive(&lesion(b, h), probe, n));
+        let mut bl = b.to_vec();
+        for j in 0..n { bl[h][j] = 0.0; bl[j][h] = 0.0; }
+        let ah = sum_norm(&drive(&bl, probe, n));
         for i in 0..n { resp[i] += (base[i] - ah[i]).max(0.0); }
     }
     resp
