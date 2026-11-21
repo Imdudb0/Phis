@@ -49,32 +49,48 @@ fn apply(tg: &mut Tg, rule: usize, rng: &mut Rng) {
     }
 }
 
-fn render(tg: &Tg, n: usize, base: u8, out: &mut Vec<u8>, spans: &mut Vec<(usize, usize)>, depth: usize) {
+// token = préfixe + lettre: "xxA".."xxP" / "yyA".."yyP".
+// Disjoints MÊME minuscules (xxa != yya), longueur 3 -> survivent au filtre mots.
+fn render(tg: &Tg, n: usize, prefix: &[u8], out: &mut Vec<u8>, spans: &mut Vec<(usize, usize)>, depth: usize) {
     if depth > 24 { return; }
     let start = out.len();
-    out.push(base + tg.labels[n]);
+    out.extend_from_slice(prefix);
+    out.push(b'A' + tg.labels[n]);
     if !tg.children[n].is_empty() {
         out.push(b' '); out.push(b'(');
-        for &c in &tg.children[n] { out.push(b' '); render(tg, c, base, out, spans, depth + 1); }
+        for &c in &tg.children[n] { out.push(b' '); render(tg, c, prefix, out, spans, depth + 1); }
         out.push(b' '); out.push(b')');
     }
     spans[n] = (start, out.len());
 }
 
-// Deux rendus du MÊME squelette, vocabulaires disjoints: instance | définition ?
 pub fn generate(rng: &mut Rng, depth: usize) -> (Vec<u8>, Cause) {
     let mut tg = Tg { labels: vec![0], children: vec![Vec::new()] };
     let mut rules = Vec::new();
     for _ in 0..depth { let r = pick_rule(rng); apply(&mut tg, r, rng); rules.push(r); }
     let mut skeleton = Vec::new();
     for (i, ch) in tg.children.iter().enumerate() { for &c in ch { skeleton.push((i, c)); } }
+
+    let roots = tg.roots();
     let mut a = Vec::new(); let mut spans_a = vec![(0usize, 0usize); tg.labels.len()];
-    for r in tg.roots() { render(&tg, r, b'A', &mut a, &mut spans_a, 0); }
+    for &r in &roots { render(&tg, r, b"xx", &mut a, &mut spans_a, 0); }
     let mut b = Vec::new(); let mut spans_b = vec![(0usize, 0usize); tg.labels.len()];
-    for r in tg.roots() { render(&tg, r, b'a', &mut b, &mut spans_b, 0); }
-    let off = a.len() + 3;
-    let mut e = a; e.extend_from_slice(b" | "); e.extend_from_slice(&b); e.extend_from_slice(b" ?");
+    for &r in &roots { render(&tg, r, b"yy", &mut b, &mut spans_b, 0); }
+
+    // question = bloc séparé sondant la racine (vocabulaire instance)
+    let root_label = tg.labels[roots[0]];
+    let question = format!("xx{} ?", (b'A' + root_label) as char);
+
+    let off_b = a.len() + 3;
+    let mut e = a;
+    e.extend_from_slice(b" | ");
+    e.extend_from_slice(&b);
+    e.extend_from_slice(b"\n\n");
+    let off_q = e.len();
+    e.extend_from_slice(question.as_bytes());
+
     let mut spans = spans_a;
-    for (s, t) in spans_b { spans.push((s + off, t + off)); }
+    for (s, t) in spans_b { spans.push((s + off_b, t + off_b)); }
+    spans.push((off_q, off_q + question.len()));
     (e, Cause { depth, rules, skeleton, spans })
 }
