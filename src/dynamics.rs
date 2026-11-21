@@ -135,7 +135,8 @@ fn fill_ws(g: &Graph, e: &[u8], asms: &mut [Assembly], rng: &mut Rng, budget: &m
     }
 }
 
-// Recherche abductive: la cause CROÎT depuis la perception pour régénérer la structure de E.
+// Recherche abductive: la cause CROÎT pour expliquer E (meilleure = fidélité max).
+// phi MESURE la cause découverte; il n'est pas le critère de croissance.
 pub fn search(g: &Graph, e: &[u8], max_steps: usize, budget: &mut Budget, rng: &mut Rng,
               explore_gain: f32, mut elig: Option<&mut Elig>) -> SearchResult {
     let mut assemblies = form_assemblies(e);
@@ -147,18 +148,19 @@ pub fn search(g: &Graph, e: &[u8], max_steps: usize, budget: &mut Budget, rng: &
     let mut b = vec![vec![0.0; n]; n];
     for j in 0..n { if t[probe][j] > 0.0 { b[probe][j] = t[probe][j]; } }
     let mut drv = drive(&b, probe, n);
-    let mut best_phi = -1.0f32;
+    let mut best_fid = -1.0f32;
     let mut best_b = b.clone(); let mut best_drv = drv.clone();
-    let mut best = (0.0f32, 0.0f32, 0.0f32);
+    let mut best = (0.0f32, 0.0f32, 0.0f32, 0.0f32); // fid, integ, spec, phi au meilleur fid
     let mut phi_ema = 0.0f32; let mut stall = 0usize; let mut steps = 0usize;
-    let mut threshold = 0.02f32;
+    let mut threshold = 0.005f32;
 
     for step in 0..max_steps {
         if budget.ops >= budget.max || n == 0 { break; }
         steps = step + 1;
         let (fid, integ, spec, phi) = crate::phi::compute(&b, &t, &drv, probe, n, budget);
-        if phi > best_phi {
-            best_phi = phi; best_b = b.clone(); best_drv = drv.clone(); best = (fid, integ, spec);
+        if fid > best_fid {
+            best_fid = fid; best_b = b.clone(); best_drv = drv.clone();
+            best = (fid, integ, spec, phi);
         }
         let reward = phi - phi_ema;
         phi_ema = 0.8 * phi_ema + 0.2 * phi;
@@ -171,7 +173,6 @@ pub fn search(g: &Graph, e: &[u8], max_steps: usize, budget: &mut Budget, rng: &
                 for k in 0..D * D { el.0[ei][k] += o[k] * r; }
             }
         }
-        // plasticité rapide intrinsèque sur la cause (marche à l'inférence, zéro-shot)
         for i in 0..n { for j in 0..n {
             if b[i][j] > 0.0 {
                 b[i][j] = (b[i][j] + 0.05 * reward * drv[i] * drv[j]).clamp(0.0, 1.0);
@@ -179,7 +180,7 @@ pub fn search(g: &Graph, e: &[u8], max_steps: usize, budget: &mut Budget, rng: &
         }}
         // abduction créative: lier la structure manquante la plus atteignable (résidu)
         let mut reach = vec![0.0f32; n];
-        for i in 0..n { if drv[i] > 0.05 {
+        for i in 0..n { if drv[i] > 0.03 {
             for j in 0..n { reach[j] = reach[j].max(t[i][j] * drv[i]); }
         }}
         let mut pick = None; let mut bv = threshold;
@@ -190,16 +191,16 @@ pub fn search(g: &Graph, e: &[u8], max_steps: usize, budget: &mut Budget, rng: &
             }
         }}
         match pick {
-            Some((i, j)) => { b[i][j] = t[i][j]; stall = 0; threshold = 0.02; }
-            None => { stall += 1; threshold *= 0.5 / explore_gain.max(0.3); }
+            Some((i, j)) => { b[i][j] = t[i][j]; stall = 0; threshold = 0.005; }
+            None => { stall += 1; threshold *= 0.6 / explore_gain.max(0.3); }
         }
         drv = drive(&b, probe, n);
-        if stall > 3 { break; }
+        if stall > 6 { break; }
     }
     let residual = crate::phi::residual(&best_b, &t, &best_drv);
     SearchResult {
         assemblies, b: best_b, drive: best_drv, probe,
-        fidelity: best.0, phi: best_phi.max(0.0), integration: best.1, specificity: best.2,
+        fidelity: best.0, phi: best.3, integration: best.1, specificity: best.2,
         residual, steps, ops: budget.ops,
     }
 }
