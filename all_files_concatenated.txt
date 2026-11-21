@@ -1951,6 +1951,525 @@ pub fn show_abs(a: &Abs) -> String {
     }
     s
 }
+use crate::resid::MASS_EPS;
+use crate::sharp::Analysis;
+use std::collections::{BTreeMap, HashSet};
+use std::ops::Range;
+fn key(p: usize, q: usize) -> (usize, usize) {
+    if p < q { (p, q) } else { (q, p) }
+}
+fn find(par: &mut [usize], mut x: usize) -> usize {
+    while par[x] != x {
+        par[x] = par[par[x]];
+        x = par[x];
+    }
+    x
+}
+fn canon_by<T: Copy + Eq + std::hash::Hash>(xs: &[T]) -> Vec<u16> {
+    let mut seen: HashMap<T, u16> = HashMap::new();
+    let mut out: Vec<u16> = Vec::with_capacity(xs.len());
+    for &x in xs {
+        let next = seen.len() as u16;
+        out.push(*seen.entry(x).or_insert(next));
+    }
+    out
+}
+pub fn canon(raw: &[u8]) -> Vec<u16> {
+    canon_by(raw)
+}
+fn pat_hash(h: u64, p: &Pat) -> u64 {
+    match p {
+        Pat::Var(v) => mix3(h, 1, *v as u64),
+        Pat::App(s, ks) => {
+            let mut x = mix3(h, 2, *s as u64);
+            for k in ks {
+                x = pat_hash(x, k);
+            }
+            mix(x, 3)
+        }
+    }
+}
+pub fn schema_hash(sig: &Sig, rules: &[Rule]) -> u64 {
+    let mut h = mix(TAG_SCHEMA, sig.n() as u64);
+    for &a in &sig.arity {
+        h = mix(h, a as u64 + 1);
+    }
+    for r in rules {
+        h = pat_hash(h, &r.lhs);
+        h = pat_hash(h, &r.rhs);
+        h = mix(h, r.nv as u64 + 1);
+    }
+    h
+}
+impl Abs {
+    pub fn encode(&self, perm: &[u8; 256]) -> Vec<u8> {
+        self.cells.iter().map(|c| perm[c.sym as usize]).collect()
+    }
+    pub fn canon(&self) -> Vec<u16> {
+        let s: Vec<u16> = self.cells.iter().map(|c| c.sym).collect();
+        canon_by(&s)
+    }
+    pub fn schema(&self) -> u64 {
+        schema_hash(&self.sig, &self.rules)
+    }
+    pub fn lines(&self) -> Vec<Range<usize>> {
+        self.blocks.iter().map(|b| b.start..b.end).collect()
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Group {
+    pub kind: Kind,
+    pub pos: Vec<usize>,
+}
+impl Group {
+    pub fn w(&self) -> f64 {
+        self.kind.weight()
+    }
+    pub fn ties(&self) -> usize {
+        self.pos.len() * self.pos.len().saturating_sub(1) / 2
+    }
+}
+pub fn groups(links: &[Link], n: usize) -> Vec<Group> {
+    let mut out: Vec<Group> = Vec::new();
+    for kind in Kind::ALL {
+        let mut par: Vec<usize> = (0..n).collect();
+        let mut used = vec![false; n];
+        for l in links {
+            if l.kind != kind || l.to >= n || l.from >= n {
+                continue;
+            }
+            let (x, y) = (find(&mut par, l.from), find(&mut par, l.to));
+            if x != y {
+                par[x.max(y)] = x.min(y);
+            }
+            used[l.from] = true;
+            used[l.to] = true;
+        }
+        let mut by_root: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        for p in 0..n {
+            if used[p] {
+                let r = find(&mut par, p);
+                by_root.entry(r).or_default().push(p);
+            }
+        }
+        let mut gs: Vec<Group> = by_root
+            .into_values()
+            .filter(|v| v.len() >= 2)
+            .map(|pos| Group { kind, pos })
+            .collect();
+        gs.sort_by(|x, y| x.pos.cmp(&y.pos));
+        out.extend(gs);
+    }
+    out
+}
+fn firsts(a: &Abs) -> BTreeMap<u32, usize> {
+    let mut m: BTreeMap<u32, usize> = BTreeMap::new();
+    for (p, c) in a.cells.iter().enumerate() {
+        if c.ent != NONE && (c.ent >> 24) != CL_FMT {
+            m.entry(c.ent).or_insert(p);
+        }
+    }
+    m
+}
+fn schema_ties(a: &Abs, b: &Abs, off: usize) -> Vec<Group> {
+    let (fa, fb) = (firsts(a), firsts(b));
+    let mut out: Vec<Group> = Vec::new();
+    for (k, &p) in &fa {
+        if let Some(&q) = fb.get(k) {
+            out.push(Group { kind: Kind::Schema, pos: vec![p, off + q] });
+        }
+    }
+    out
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Cause {
+    pub groups: Vec<Group>,
+    pub len: usize,
+    pub schema: u64,
+    pub parts: usize,
+    pub deriv: usize,
+}
+impl Cause {
+    pub fn new(groups: Vec<Group>, len: usize) -> Cause {
+        Cause { groups, len, schema: 0, parts: 1, deriv: 0 }
+    }
+    pub fn of(a: &Abs) -> Cause {
+        Cause {
+            groups: groups(&a.links, a.cells.len()),
+            len: a.cells.len(),
+            schema: a.schema(),
+            parts: 1,
+            deriv: a.deriv,
+        }
+    }
+    pub fn of_pair(a: &Abs, b: &Abs, off: usize) -> Cause {
+        let mut gs = groups(&a.links, a.cells.len());
+        for g in groups(&b.links, b.cells.len()) {
+            let pos: Vec<usize> = g.pos.iter().map(|&p| p + off).collect();
+            gs.push(Group { kind: g.kind, pos });
+        }
+        gs.extend(schema_ties(a, b, off));
+        Cause {
+            groups: gs,
+            len: off + b.cells.len(),
+            schema: a.schema(),
+            parts: 2,
+            deriv: a.deriv + b.deriv,
+        }
+    }
+    pub fn weight(&self) -> f64 {
+        self.groups.iter().map(|g| g.w()).sum()
+    }
+    pub fn ties(&self) -> usize {
+        self.groups.iter().map(|g| g.ties()).sum()
+    }
+    pub fn count(&self, k: Kind) -> usize {
+        self.groups.iter().filter(|g| g.kind == k).count()
+    }
+    pub fn touching(&self, seg: &Range<usize>) -> f64 {
+        let (mut hit, mut all) = (0.0f64, 0.0f64);
+        for g in &self.groups {
+            all += g.w();
+            if g.pos.iter().any(|p| seg.contains(p)) {
+                hit += g.w();
+            }
+        }
+        if all > 0.0 { hit / all } else { 0.0 }
+    }
+    pub fn summary(&self) -> String {
+        let mut s = format!(
+            "cause: {} group(s), {} tie(s), weight {:.2}, {} part(s), derivation {}",
+            self.groups.len(),
+            self.ties(),
+            self.weight(),
+            self.parts,
+            self.deriv
+        );
+        for k in Kind::ALL {
+            s.push_str(&format!("  {} {}", k.name(), self.count(k)));
+        }
+        s
+    }
+}
+#[derive(Clone, Debug, Default)]
+pub struct Cover {
+    pub local: HashSet<(usize, usize)>,
+    pub cross: HashSet<(usize, usize)>,
+    pub spans: Vec<(usize, usize)>,
+}
+impl Cover {
+    pub fn feed(&mut self, foot: &[Vec<usize>], live: &[bool], rels: &[Vec<usize>]) {
+        for (i, f) in foot.iter().enumerate() {
+            if !live.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            for x in 0..f.len() {
+                for y in (x + 1)..f.len() {
+                    self.local.insert(key(f[x], f[y]));
+                }
+            }
+        }
+        for r in rels {
+            for x in 0..r.len() {
+                for y in (x + 1)..r.len() {
+                    let (a, b) = (r[x], r[y]);
+                    if a == b {
+                        continue;
+                    }
+                    if let (Some(fa), Some(fb)) = (foot.get(a), foot.get(b)) {
+                        for &p in fa {
+                            for &q in fb {
+                                if p != q {
+                                    self.cross.insert(key(p, q));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    pub fn of(an: &Analysis) -> Cover {
+        let mut cv = Cover::default();
+        for fr in &an.frames {
+            cv.spans.push((fr.start, fr.len));
+            for c in &fr.st.complexes {
+                let live: Vec<bool> = c.dists.iter().map(|d| d.is_distinction()).collect();
+                let rels: Vec<Vec<usize>> = c.rels.iter().map(|r| r.members.clone()).collect();
+                cv.feed(&c.foot, &live, &rels);
+            }
+        }
+        cv
+    }
+    pub fn reach(&self, p: usize, q: usize) -> bool {
+        self.spans.is_empty()
+            || self.spans.iter().any(|&(s, l)| p >= s && p < s + l && q >= s && q < s + l)
+    }
+}
+#[derive(Clone, Debug, Default)]
+pub struct Inclusion {
+    pub score: f64,
+    pub local: f64,
+    pub cross: f64,
+    pub reach: f64,
+    pub groups: usize,
+    pub hit: usize,
+    pub kind: [f64; 5],
+}
+impl Inclusion {
+    pub fn measure(cause: &Cause, an: &Analysis) -> Inclusion {
+        Inclusion::against(cause, &Cover::of(an))
+    }
+    pub fn against(cause: &Cause, cv: &Cover) -> Inclusion {
+        let mut inc = Inclusion::default();
+        let (mut w, mut lo, mut cr, mut rc) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        let mut ks = [0.0f64; 5];
+        let mut kn = [0usize; 5];
+        for g in &cause.groups {
+            let t = g.ties();
+            if t == 0 {
+                continue;
+            }
+            let (mut nl, mut nc, mut nr) = (0usize, 0usize, 0usize);
+            for x in 0..g.pos.len() {
+                for y in (x + 1)..g.pos.len() {
+                    let (p, q) = (g.pos[x], g.pos[y]);
+                    if cv.reach(p, q) {
+                        nr += 1;
+                    }
+                    let tie = key(p, q);
+                    if cv.local.contains(&tie) {
+                        nl += 1;
+                    } else if cv.cross.contains(&tie) {
+                        nc += 1;
+                    }
+                }
+            }
+            let (tf, wg) = (t as f64, g.w());
+            w += wg;
+            lo += wg * nl as f64 / tf;
+            cr += wg * nc as f64 / tf;
+            rc += wg * nr as f64 / tf;
+            let kk = g.kind as usize;
+            ks[kk] += (nl + nc) as f64 / tf;
+            kn[kk] += 1;
+            inc.groups += 1;
+            if nl + nc > 0 {
+                inc.hit += 1;
+            }
+        }
+        if w > 0.0 {
+            inc.local = lo / w;
+            inc.cross = cr / w;
+            inc.score = (lo + cr) / w;
+            inc.reach = rc / w;
+        }
+        for kk in 0..5 {
+            if kn[kk] > 0 {
+                inc.kind[kk] = ks[kk] / kn[kk] as f64;
+            }
+        }
+        inc
+    }
+    pub fn rel(&self) -> f64 {
+        if self.reach > 1e-12 { (self.score / self.reach).clamp(0.0, 1.0) } else { 0.0 }
+    }
+    pub fn line(&self) -> String {
+        format!(
+            "inclusion {:.4} (local {:.4} cross {:.4})  reach {:.4}  rel {:.4}  groups {} hit {}",
+            self.score, self.local, self.cross, self.reach, self.rel(), self.groups, self.hit
+        )
+    }
+}
+#[derive(Clone, Debug)]
+pub struct Part {
+    pub abs: Abs,
+    pub perm: [u8; 256],
+    pub start: usize,
+}
+#[derive(Clone, Debug)]
+pub struct Draw {
+    pub parts: Vec<Part>,
+    pub e: Percept,
+    pub cause: Cause,
+}
+impl Draw {
+    pub fn first(&self) -> &Abs {
+        &self.parts[0].abs
+    }
+    pub fn blocks(&self) -> Vec<Range<usize>> {
+        let mut v: Vec<Range<usize>> = Vec::new();
+        for p in &self.parts {
+            for b in &p.abs.blocks {
+                v.push(p.start + b.start..p.start + b.end);
+            }
+        }
+        v
+    }
+    pub fn masked(&self, rng: &mut Rng, seg: Range<usize>, fill: Fill) -> Masked {
+        mask(rng, &self.e, seg, fill)
+    }
+    pub fn included(&self, an: &Analysis) -> Inclusion {
+        Inclusion::measure(&self.cause, an)
+    }
+    pub fn show(&self) -> String {
+        let mut s = String::new();
+        for (i, p) in self.parts.iter().enumerate() {
+            s.push_str(&format!(
+                "part {} @{}: schema {:016x}, {} cell(s), derivation {} step(s)\n",
+                i,
+                p.start,
+                p.abs.schema(),
+                p.abs.cells.len(),
+                p.abs.deriv
+            ));
+            s.push_str(&show_abs(&p.abs));
+        }
+        s.push_str(&self.cause.summary());
+        s.push('\n');
+        s
+    }
+}
+pub fn draw(rng: &mut Rng, cfg: &Cfg) -> Draw {
+    let abs = sample(rng, cfg);
+    let perm = random_renaming(rng);
+    let raw = abs.encode(&perm);
+    let e = Percept::from_bytes(&raw);
+    let cause = Cause::of(&abs);
+    Draw { parts: vec![Part { abs, perm, start: 0 }], e, cause }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Layout {
+    Joint,
+    Apart,
+}
+impl Layout {
+    pub fn cfg(self, base: &Cfg, np: usize) -> Cfg {
+        match self {
+            Layout::Joint => base.clone().fit((np / 2).max(8), false),
+            Layout::Apart => base.clone().fit(np, true),
+        }
+    }
+}
+fn again(rng: &mut Rng, cfg: &Cfg, like: &Abs) -> Option<Abs> {
+    for _ in 0..cfg.tries.max(1) {
+        let mut g = Graph::default();
+        let root = sample_query(rng, &like.sig, &like.rules, cfg, &mut g);
+        if let Some(b) = finish(rng, cfg, like.sig.clone(), like.rules.clone(), like.style, g, root, true) {
+            return Some(b);
+        }
+    }
+    None
+}
+pub fn pair(rng: &mut Rng, base: &Cfg, np: usize, layout: Layout) -> Option<Draw> {
+    let c = layout.cfg(base, np);
+    for _ in 0..base.tries.max(1) {
+        let a = sample(rng, &c);
+        let b = match again(rng, &c, &a) {
+            Some(b) => b,
+            None => continue,
+        };
+        if a.canon() == b.canon() {
+            continue;
+        }
+        let (la, lb) = (a.cells.len(), b.cells.len());
+        if layout == Layout::Joint && la + lb > np {
+            continue;
+        }
+        let p = random_renaming(rng);
+        let n = a.sig.n();
+        let mut q = [0u8; 256];
+        for k in 0..256usize {
+            q[k] = p[(k + n) % 256];
+        }
+        let mut raw = a.encode(&p);
+        raw.extend(b.encode(&q));
+        let cause = Cause::of_pair(&a, &b, la);
+        let e = Percept::from_bytes(&raw);
+        let parts = vec![Part { abs: a, perm: p, start: 0 }, Part { abs: b, perm: q, start: la }];
+        return Some(Draw { parts, e, cause });
+    }
+    None
+}
+pub fn shuffled(rng: &mut Rng, e: &Percept) -> Percept {
+    let mut raw = e.raw.clone();
+    rng.shuffle(&mut raw);
+    Percept::from_bytes(&raw)
+}
+pub fn iid(rng: &mut Rng, len: usize, a: usize) -> Percept {
+    let a = a.clamp(1, 256);
+    let mut pool: Vec<u8> = (0..=255u8).collect();
+    rng.shuffle(&mut pool);
+    pool.truncate(a);
+    let mut raw: Vec<u8> = Vec::with_capacity(len);
+    for i in 0..len {
+        let b = if i < a { pool[i] } else { pool[rng.below(a)] };
+        raw.push(b);
+    }
+    rng.shuffle(&mut raw);
+    Percept::from_bytes(&raw)
+}
+pub fn iid_like(rng: &mut Rng, e: &Percept) -> Percept {
+    iid(rng, e.len(), e.a)
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fill {
+    Noise,
+    Fresh,
+    Byte(u8),
+}
+#[derive(Clone, Debug)]
+pub struct Masked {
+    pub e: Percept,
+    pub seg: Range<usize>,
+    pub fill: Fill,
+}
+impl Masked {
+    pub fn hidden(&self, cause: &Cause) -> f64 {
+        cause.touching(&self.seg)
+    }
+    pub fn localization(&self, by_pos: &[f64]) -> Localization {
+        localization(by_pos, &self.seg)
+    }
+}
+pub fn mask(rng: &mut Rng, e: &Percept, seg: Range<usize>, fill: Fill) -> Masked {
+    let n = e.len();
+    let lo = seg.start.min(n);
+    let hi = seg.end.min(n).max(lo);
+    let fresh = (0..=255u8).find(|b| !e.alphabet.contains(b)).unwrap_or(0);
+    let mut raw = e.raw.clone();
+    for p in lo..hi {
+        raw[p] = match fill {
+            Fill::Noise if e.a >= 2 => {
+                let o = e.codes[p] as usize;
+                let c = rng.below(e.a - 1);
+                e.alphabet[if c >= o { c + 1 } else { c }]
+            }
+            Fill::Noise => e.alphabet[0],
+            Fill::Fresh => fresh,
+            Fill::Byte(b) => b,
+        };
+    }
+    Masked { e: Percept::from_bytes(&raw), seg: lo..hi, fill }
+}
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Localization {
+    pub inside: f64,
+    pub total: f64,
+    pub share: f64,
+    pub lift: f64,
+}
+pub fn localization(by_pos: &[f64], seg: &Range<usize>) -> Localization {
+    let n = by_pos.len();
+    let lo = seg.start.min(n);
+    let hi = seg.end.min(n).max(lo);
+    let total: f64 = by_pos.iter().sum();
+    let inside: f64 = by_pos[lo..hi].iter().sum();
+    let share = if total > MASS_EPS { inside / total } else { 0.0 };
+    let frac = if n > 0 { (hi - lo) as f64 / n as f64 } else { 0.0 };
+    let lift = if frac > 0.0 { share / frac } else { 0.0 };
+    Localization { inside, total, share, lift }
+}
 
 
 
