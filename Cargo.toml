@@ -4,10 +4,6 @@ version = "0.1.0"
 edition = "2024"
 description = "A general model of abduction-based understanding on a non-reciprocal connectionist substrate"
 
-[lib]
-name = "phisharp"
-path = "src/lib.rs"
-
 [[bin]]
 name = "phisharp"
 path = "src/main.rs"
