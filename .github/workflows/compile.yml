@@ -28,7 +28,7 @@ jobs:
       - name: Run Phisharp
         run: |
           #cargo check
-          cargo run --release -- train --out out/sharp.phis --samples 48 --seed 7
+          cargo run --release -- emit --out perceived.eff --seed 3 --depth 6
           #cargo run --release --bin ask -- --model out/sharp.phis --file perceived.eff
           #cargo run --release --bin phisharp -- train --steps 800 --batch 4 --nodes 16 --dim 16 --max-search 8 --out out/sharp.phis
         env:
