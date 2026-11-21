@@ -7,3 +7,4 @@ pub mod sys;
 pub mod rel;
 pub mod resid;
 pub mod sharp;
+pub mod render;
