@@ -30,7 +30,7 @@ pub fn json_decode(s: &str) -> Result<Value, String> {
 
 pub fn sexp_encode(v: &Value) -> String {
     let mut out = String::new();
-    sexp_write(v, &mut out);0pp
+    sexp_write(v, &mut out);
     out
 }
 
