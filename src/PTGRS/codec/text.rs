@@ -12,7 +12,7 @@
 //!   `(map ("k" v) ..)`.
 
 use super::MAX_DEPTH;
-use super::value::Value;
+use crate::PTGRS::value::Value;
 
 /// `indent` is the number of spaces per level; 0 gives the compact form.
 pub fn json_encode(v: &Value, indent: usize) -> String {
@@ -30,7 +30,7 @@ pub fn json_decode(s: &str) -> Result<Value, String> {
 
 pub fn sexp_encode(v: &Value) -> String {
     let mut out = String::new();
-    sexp_write(v, &mut out);
+    sexp_write(v, &mut out);0pp
     out
 }
 
