@@ -153,8 +153,9 @@ pub fn search(g: &Graph, e: &[u8], max_steps: usize, budget: &mut Budget, rng: &
     let mut best = (0.0f32, 0.0f32, 0.0f32, 0.0f32); // fid, integ, spec, phi au meilleur fid
     let mut phi_ema = 0.0f32; let mut stall = 0usize; let mut steps = 0usize;
     let mut threshold = 0.005f32;
-
-    for step in 0..max_steps {
+    
+    let effective_steps = max_steps.max(8 * n).min(2048);
+    for step in 0..effective_steps { 
         if budget.ops >= budget.max || n == 0 { break; }
         steps = step + 1;
         let (fid, integ, spec, phi) = crate::phi::compute(&b, &t, &drv, probe, n, budget);
