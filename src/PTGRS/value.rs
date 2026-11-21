@@ -4,7 +4,7 @@
 //! insertion order, floats are finite and survive bit for bit, strings are UTF-8.
 //! So `decode(encode(v))` is the identity for every format and every pipeline.
 
-use crate::rng::Rng;
+use super::rng::Rng;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value {
