@@ -3,6 +3,5 @@ pub mod percept;
 pub mod model;
 pub mod sim;
 pub mod sys;
-pub mod resid;
 pub mod sharp;
 pub mod ptgrs;
