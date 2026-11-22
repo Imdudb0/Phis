@@ -871,4 +871,725 @@ impl Tape {
     }
 }
 
-fn main() {}
+// ═══════════════ SUITE de src/main.rs (à coller après `impl Tape { … }`) ═══════════════
+
+// ───────────────────────── Modèle ─────────────────────────
+const D: usize = 48; // largeur
+const NH: usize = 4; // têtes (D/NH = 12, pair pour RoPE)
+const NL: usize = 3; // couches
+const FF: usize = 128; // largeur du MLP
+const PL: usize = 8; // tenseurs par couche : g1 wq wk wv wo g2 w1 w2
+const NT: usize = 3 + NL * PL; // emb + couches + gain final + tête (≈ 68 k paramètres)
+
+type Seq = (Vec<usize>, usize); // (tokens, longueur du prompt)
+
+struct Model {
+    w: Vec<Vec<f32>>,
+    shp: Vec<(usize, usize)>,
+}
+
+impl Model {
+    fn new(rng: &mut Rng) -> Model {
+        let mut shp = vec![(VOCAB, D)];
+        for _ in 0..NL {
+            shp.extend_from_slice(&[(1, D), (D, D), (D, D), (D, D), (D, D), (1, D), (D, FF), (FF, D)]);
+        }
+        shp.push((1, D));
+        shp.push((D, VOCAB));
+        let resid = 1.0 / ((2 * NL) as f32).sqrt();
+        let mut w: Vec<Vec<f32>> = Vec::with_capacity(NT);
+        for (i, &(r, c)) in shp.iter().enumerate() {
+            let sd = if r == 1 {
+                0.0
+            } else if i == 0 {
+                0.1
+            } else if i == NT - 1 {
+                0.05
+            } else {
+                let base = 1.0 / (r as f32).sqrt();
+                if matches!((i - 1) % PL, 4 | 7) { base * resid } else { base }
+            };
+            w.push((0..r * c).map(|_| if r == 1 { 1.0 } else { sd * rng.normal() }).collect());
+        }
+        Model { w, shp }
+    }
+
+    fn count(&self) -> usize {
+        self.w.iter().map(|v| v.len()).sum()
+    }
+
+    /// Nouvelle bande d'autodiff : ses NT premiers nœuds sont les paramètres (copiés).
+    fn tape(&self) -> Tape {
+        let mut tp = Tape::new();
+        for (v, &(r, c)) in self.w.iter().zip(self.shp.iter()) {
+            tp.leaf(v.clone(), r, c);
+        }
+        tp
+    }
+}
+
+/// Passe avant causale ; renvoie le nœud des logits (T × VOCAB).
+fn forward(tp: &mut Tape, toks: &[usize]) -> usize {
+    let mut x = tp.embed(0, toks);
+    for l in 0..NL {
+        let b = 1 + l * PL;
+        let h = tp.rms(x, b);
+        let q = tp.matmul(h, b + 1);
+        let k = tp.matmul(h, b + 2);
+        let v = tp.matmul(h, b + 3);
+        let q = tp.rope(q, NH);
+        let k = tp.rope(k, NH);
+        let a = tp.attn(q, k, v, NH);
+        let o = tp.matmul(a, b + 4);
+        x = tp.add(x, o);
+        let h = tp.rms(x, b + 5);
+        let u = tp.matmul(h, b + 6);
+        let u = tp.silu(u);
+        let o = tp.matmul(u, b + 7);
+        x = tp.add(x, o);
+    }
+    let h = tp.rms(x, NT - 2);
+    tp.matmul(h, NT - 1)
+}
+
+/// Perte = scale × Σ NLL sur les tokens de la cause (+ END). Avec `acc` : rétropropage et accumule.
+fn seq_run(m: &Model, toks: &[usize], plen: usize, scale: f32, acc: Option<&mut Vec<Vec<f32>>>) -> f32 {
+    let n = toks.len() - 1;
+    let mut tp = m.tape();
+    let lg = forward(&mut tp, &toks[..n]);
+    let mask: Vec<bool> = (0..n).map(|i| i + 1 >= plen).collect();
+    let loss = tp.xent(lg, toks[1..].to_vec(), mask, scale);
+    let val = tp.val[loss][0];
+    if let Some(a) = acc {
+        tp.backward(loss);
+        for (dst, src) in a.iter_mut().zip(tp.grad.iter()) {
+            for (x, y) in dst.iter_mut().zip(src.iter()) {
+                *x += *y;
+            }
+        }
+    }
+    val
+}
+
+// ───────────────────────── Entraînement parallèle ─────────────────────────
+fn worker(m: &Model, seqs: &[Seq], scale: f32) -> (f32, Vec<Vec<f32>>) {
+    let mut acc: Vec<Vec<f32>> = m.w.iter().map(|v| vec![0.0f32; v.len()]).collect();
+    let mut loss = 0.0f32;
+    for (t, p) in seqs {
+        loss += seq_run(m, t, *p, scale, Some(&mut acc));
+    }
+    (loss, acc)
+}
+
+/// Un lot réparti sur `nthreads` threads ; renvoie (perte moyenne par token cible, gradients sommés).
+fn train_step(m: &Model, batch: &[Seq], nthreads: usize) -> (f32, Vec<Vec<f32>>) {
+    let ntgt: usize = batch.iter().map(|(t, p)| t.len() - *p).sum();
+    let scale = 1.0 / ntgt as f32;
+    let per = ((batch.len() + nthreads - 1) / nthreads).max(1);
+    let mut loss = 0.0f32;
+    let mut grads: Vec<Vec<f32>> = m.w.iter().map(|v| vec![0.0f32; v.len()]).collect();
+    std::thread::scope(|sc| {
+        let mut hs = Vec::new();
+        for ch in batch.chunks(per) {
+            hs.push(sc.spawn(move || worker(m, ch, scale)));
+        }
+        for h in hs {
+            let (l, g) = h.join().expect("thread d'entraînement");
+            loss += l;
+            for (a, b) in grads.iter_mut().zip(g.iter()) {
+                for (x, y) in a.iter_mut().zip(b.iter()) {
+                    *x += *y;
+                }
+            }
+        }
+    });
+    (loss, grads)
+}
+
+fn make_batch(rng: &mut Rng, size: usize, maxlv: usize) -> Vec<Seq> {
+    (0..size)
+        .map(|_| {
+            let lv = 1 + rng.below(maxlv);
+            let e = make_episode(rng, lv);
+            (e.toks, e.plen)
+        })
+        .collect()
+}
+
+struct Adam {
+    m: Vec<Vec<f32>>,
+    v: Vec<Vec<f32>>,
+    t: i32,
+}
+
+impl Adam {
+    fn new(w: &[Vec<f32>]) -> Adam {
+        let z = || w.iter().map(|x| vec![0.0f32; x.len()]).collect::<Vec<_>>();
+        Adam { m: z(), v: z(), t: 0 }
+    }
+
+    /// AdamW (décroissance découplée, sauf sur les gains RMSNorm).
+    fn step(&mut self, w: &mut [Vec<f32>], g: &[Vec<f32>], shp: &[(usize, usize)], lr: f32, wd: f32) {
+        self.t += 1;
+        let (b1, b2) = (0.9f32, 0.98f32);
+        let (c1, c2) = (1.0 - b1.powi(self.t), 1.0 - b2.powi(self.t));
+        for i in 0..w.len() {
+            let dec = if shp[i].0 == 1 { 0.0 } else { wd };
+            for j in 0..w[i].len() {
+                let gj = g[i][j];
+                self.m[i][j] = b1 * self.m[i][j] + (1.0 - b1) * gj;
+                self.v[i][j] = b2 * self.v[i][j] + (1.0 - b2) * gj * gj;
+                let upd = (self.m[i][j] / c1) / ((self.v[i][j] / c2).sqrt() + 1e-8);
+                w[i][j] -= lr * (upd + dec * w[i][j]);
+            }
+        }
+    }
+}
+
+/// Échauffement linéaire puis cosinus jusqu'à 10 % du taux de base.
+fn lr_at(step: usize, total: usize, base: f32) -> f32 {
+    let warm = (total / 20).clamp(10, 200);
+    if step < warm {
+        return base * (step + 1) as f32 / warm as f32;
+    }
+    let pr = (step - warm) as f32 / total.saturating_sub(warm).max(1) as f32;
+    base * (0.1 + 0.45 * (1.0 + (PI * pr).cos()))
+}
+
+// ───────────────────────── Inférence incrémentale (cache K/V) ─────────────────────────
+#[derive(Clone)]
+struct Cache {
+    k: Vec<Vec<f32>>,
+    v: Vec<Vec<f32>>,
+    len: usize,
+}
+
+impl Cache {
+    fn new() -> Cache {
+        Cache { k: vec![Vec::new(); NL], v: vec![Vec::new(); NL], len: 0 }
+    }
+}
+
+fn rms_row(x: &[f32], g: &[f32]) -> Vec<f32> {
+    let r = (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32 + 1e-5).sqrt();
+    x.iter().zip(g).map(|(a, b)| a * b / r).collect()
+}
+
+fn rope_row(x: &mut [f32], pos: usize) {
+    let dh = D / NH;
+    let half = dh / 2;
+    for h in 0..NH {
+        for c in 0..half {
+            let freq = 10000f32.powf(-(c as f32) / half as f32);
+            let (s, co) = (pos as f32 * freq).sin_cos();
+            let (a, b) = (x[h * dh + c], x[h * dh + half + c]);
+            x[h * dh + c] = a * co - b * s;
+            x[h * dh + half + c] = a * s + b * co;
+        }
+    }
+}
+
+/// Consomme un token, met à jour le cache, renvoie les logits du token suivant.
+fn infer_step(m: &Model, ca: &mut Cache, tok: usize) -> Vec<f32> {
+    let pos = ca.len;
+    let dh = D / NH;
+    let sc = 1.0 / (dh as f32).sqrt();
+    let mut x = m.w[0][tok * D..(tok + 1) * D].to_vec();
+    for l in 0..NL {
+        let b = 1 + l * PL;
+        let h = rms_row(&x, &m.w[b]);
+        let mut q = mm(&h, &m.w[b + 1], 1, D, D);
+        let mut k = mm(&h, &m.w[b + 2], 1, D, D);
+        let v = mm(&h, &m.w[b + 3], 1, D, D);
+        rope_row(&mut q, pos);
+        rope_row(&mut k, pos);
+        ca.k[l].extend_from_slice(&k);
+        ca.v[l].extend_from_slice(&v);
+        let mut a = vec![0.0f32; D];
+        for hd in 0..NH {
+            let o = hd * dh;
+            let mut p = vec![0.0f32; pos + 1];
+            let mut mx = f32::NEG_INFINITY;
+            for j in 0..=pos {
+                let kj = &ca.k[l][j * D + o..j * D + o + dh];
+                let s = q[o..o + dh].iter().zip(kj).map(|(u, w)| u * w).sum::<f32>() * sc;
+                p[j] = s;
+                mx = mx.max(s);
+            }
+            let mut z = 0.0f32;
+            for j in 0..=pos {
+                p[j] = (p[j] - mx).exp();
+                z += p[j];
+            }
+            for j in 0..=pos {
+                let wgt = p[j] / z;
+                for c in 0..dh {
+                    a[o + c] += wgt * ca.v[l][j * D + o + c];
+                }
+            }
+        }
+        let ao = mm(&a, &m.w[b + 4], 1, D, D);
+        for i in 0..D {
+            x[i] += ao[i];
+        }
+        let h2 = rms_row(&x, &m.w[b + 5]);
+        let mut u = mm(&h2, &m.w[b + 6], 1, D, FF);
+        for z in u.iter_mut() {
+            *z /= 1.0 + (-*z).exp();
+        }
+        let dn = mm(&u, &m.w[b + 7], 1, FF, D);
+        for i in 0..D {
+            x[i] += dn[i];
+        }
+    }
+    ca.len += 1;
+    let h = rms_row(&x, &m.w[NT - 2]);
+    mm(&h, &m.w[NT - 1], 1, D, VOCAB)
+}
+
+fn prefill(m: &Model, prompt: &[usize]) -> (Cache, Vec<f32>) {
+    let mut ca = Cache::new();
+    let mut lg = Vec::new();
+    for &t in prompt {
+        lg = infer_step(m, &mut ca, t);
+    }
+    (ca, lg)
+}
+
+// ───────────────────────── Décodage contraint par grammaire ─────────────────────────
+/// terme := SYM | SYM '(' terme^arité ')'. Taille d'arbre bornée par HMAX (comme les vraies causes).
+struct Gram {
+    stack: Vec<usize>, // enfants restant à commencer, par compound ouvert
+    nodes: usize,
+    lp: bool,
+    done: bool,
+}
+
+impl Gram {
+    fn new() -> Gram {
+        Gram { stack: Vec::new(), nodes: 0, lp: false, done: false }
+    }
+
+    fn need(&self) -> usize {
+        self.stack.iter().sum::<usize>() + if self.nodes == 0 { 1 } else { 0 }
+    }
+
+    fn allowed(&self, sig: &Sig) -> Vec<usize> {
+        if self.done {
+            return vec![T_END];
+        }
+        if self.lp {
+            return vec![T_LP];
+        }
+        if self.stack.last() == Some(&0) {
+            return vec![T_RP];
+        }
+        let need = self.need();
+        sig.syms
+            .iter()
+            .filter(|&&s| sig.arity[s] == 0 || self.nodes + need + sig.arity[s] <= HMAX)
+            .map(|&s| T_SYM + s)
+            .collect()
+    }
+
+    fn push(&mut self, tok: usize, sig: &Sig) {
+        if tok == T_LP {
+            self.lp = false;
+        } else if tok == T_RP {
+            self.stack.pop();
+            if self.stack.is_empty() {
+                self.done = true;
+            }
+        } else if tok >= T_SYM {
+            let a = sig.arity[tok - T_SYM];
+            self.nodes += 1;
+            if let Some(top) = self.stack.last_mut() {
+                *top -= 1;
+            }
+            if a > 0 {
+                self.stack.push(a);
+                self.lp = true;
+            } else if self.stack.is_empty() {
+                self.done = true;
+            }
+        }
+    }
+}
+
+fn pick(lg: &[f32], allowed: &[usize], temp: f32, uniform: bool, rng: &mut Rng) -> usize {
+    if allowed.len() == 1 {
+        return allowed[0];
+    }
+    if uniform {
+        return allowed[rng.below(allowed.len())];
+    }
+    if temp <= 0.0 {
+        let mut best = allowed[0];
+        for &t in allowed {
+            if lg[t] > lg[best] {
+                best = t;
+            }
+        }
+        return best;
+    }
+    let mx = allowed.iter().map(|&t| lg[t]).fold(f32::NEG_INFINITY, f32::max);
+    let ws: Vec<f32> = allowed.iter().map(|&t| ((lg[t] - mx) / temp).exp()).collect();
+    let mut u = rng.unif() * ws.iter().sum::<f32>();
+    for (i, w) in ws.iter().enumerate() {
+        if u < *w {
+            return allowed[i];
+        }
+        u -= *w;
+    }
+    allowed[allowed.len() - 1]
+}
+
+/// temp = 0 : glouton ; temp = 1 : échantillon du postérieur appris ; `uniform` : référence sans réseau.
+fn decode(m: &Model, base: &Cache, first: &[f32], sig: &Sig, temp: f32, uniform: bool, rng: &mut Rng) -> Vec<usize> {
+    let mut ca = base.clone();
+    let mut lg = first.to_vec();
+    let mut g = Gram::new();
+    let mut out = Vec::new();
+    for _ in 0..MAXH {
+        let tok = pick(&lg, &g.allowed(sig), temp, uniform, rng);
+        out.push(tok);
+        if tok == T_END {
+            break;
+        }
+        g.push(tok, sig);
+        if !uniform {
+            lg = infer_step(m, &mut ca, tok);
+        }
+    }
+    out
+}
+
+fn parse(ar: &mut Arena, sig: &Sig, t: &[usize], pos: &mut usize) -> Option<Id> {
+    let tk = *t.get(*pos)?;
+    if tk < T_SYM || tk >= T_SYM + NS || !sig.has[tk - T_SYM] {
+        return None;
+    }
+    let s = tk - T_SYM;
+    *pos += 1;
+    let mut kids = Vec::new();
+    if sig.arity[s] > 0 {
+        if t.get(*pos) != Some(&T_LP) {
+            return None;
+        }
+        *pos += 1;
+        for _ in 0..sig.arity[s] {
+            kids.push(parse(ar, sig, t, pos)?);
+        }
+        if t.get(*pos) != Some(&T_RP) {
+            return None;
+        }
+        *pos += 1;
+    }
+    Some(ar.mk(s, kids))
+}
+
+fn parse_cause(ar: &mut Arena, sig: &Sig, out: &[usize]) -> Option<Id> {
+    let mut pos = 0;
+    let id = parse(ar, sig, out, &mut pos)?;
+    if out.get(pos) == Some(&T_END) { Some(id) } else { None }
+}
+
+// ───────────────────────── Vérificateur exact ─────────────────────────
+/// P(obs | cause) = 1/kmax · Σ_{k=1..kmax} P(X_k = obs | X_0 = cause), en propageant la loi de la chaîne
+/// de Markov du PTGRS (états = racines du graphe hash-consé ; redex uniforme ; issue selon les probas
+/// de la règle). Même rejet de taille (OMAX) que le générateur ; les états bloqués perdent leur masse.
+fn likelihood(ar: &mut Arena, rules: &[Rule], h: Id, o: Id, kmax: usize) -> f64 {
+    let mut cur: HashMap<Id, f64> = HashMap::new();
+    cur.insert(h, 1.0);
+    let mut total = 0.0f64;
+    for _ in 0..kmax {
+        let mut nxt: HashMap<Id, f64> = HashMap::new();
+        for (&s, &p) in cur.iter() {
+            let rx = ar.redexes(s, rules);
+            if rx.is_empty() {
+                continue;
+            }
+            let pr = p / rx.len() as f64;
+            for (node, ri, b) in rx {
+                for (q, rhs) in &rules[ri].outs {
+                    let rep = ar.inst(rhs, &b);
+                    let n = ar.replace(s, node, rep, &mut HashMap::new());
+                    if ar.size(n) <= OMAX {
+                        *nxt.entry(n).or_insert(0.0) += pr * *q as f64;
+                    }
+                }
+            }
+        }
+        total += nxt.get(&o).copied().unwrap_or(0.0);
+        cur = nxt;
+    }
+    total / kmax as f64
+}
+
+// ───────────────────────── Évaluation ─────────────────────────
+#[derive(Default)]
+struct Stats {
+    n: usize,
+    nll: f64,
+    ntok: usize,
+    g_valid: usize,
+    g_exact: usize,
+    s_valid: usize,
+    s_any: usize,
+    u_valid: usize,
+    u_any: usize,
+}
+
+impl Stats {
+    fn add(&mut self, o: &Stats) {
+        self.n += o.n;
+        self.nll += o.nll;
+        self.ntok += o.ntok;
+        self.g_valid += o.g_valid;
+        self.g_exact += o.g_exact;
+        self.s_valid += o.s_valid;
+        self.s_any += o.s_any;
+        self.u_valid += o.u_valid;
+        self.u_any += o.u_any;
+    }
+}
+
+fn pct(a: usize, b: usize) -> f64 {
+    100.0 * a as f64 / b.max(1) as f64
+}
+
+/// « Valide » = la cause proposée explique l'observation avec probabilité > 0 en ≤ LMAX pas.
+fn eval_chunk(m: &Model, eps: &mut [Episode], k: usize, seed: u64) -> Stats {
+    let mut st = Stats::default();
+    let mut rng = Rng::new(seed);
+    for ep in eps.iter_mut() {
+        st.n += 1;
+        st.nll += seq_run(m, &ep.toks, ep.plen, 1.0, None) as f64;
+        st.ntok += ep.toks.len() - ep.plen;
+        let (base, first) = prefill(m, &ep.toks[..ep.plen]);
+        let out = decode(m, &base, &first, &ep.sig, 0.0, false, &mut rng);
+        if let Some(id) = parse_cause(&mut ep.ar, &ep.sig, &out) {
+            if id == ep.h {
+                st.g_exact += 1;
+            }
+            if likelihood(&mut ep.ar, &ep.rules, id, ep.o, LMAX) > 0.0 {
+                st.g_valid += 1;
+            }
+        }
+        for uni in [false, true] {
+            let mut any = false;
+            for _ in 0..k {
+                let out = decode(m, &base, &first, &ep.sig, 1.0, uni, &mut rng);
+                let ok = match parse_cause(&mut ep.ar, &ep.sig, &out) {
+                    Some(id) => likelihood(&mut ep.ar, &ep.rules, id, ep.o, LMAX) > 0.0,
+                    None => false,
+                };
+                any |= ok;
+                if uni {
+                    st.u_valid += ok as usize;
+                } else {
+                    st.s_valid += ok as usize;
+                }
+            }
+            if uni {
+                st.u_any += any as usize;
+            } else {
+                st.s_any += any as usize;
+            }
+        }
+    }
+    st
+}
+
+fn evaluate(m: &Model, n: usize, k: usize, nthreads: usize, seed: u64) {
+    for level in 1..=LMAX {
+        let mut rng = Rng::new(seed ^ (level as u64).wrapping_mul(7919));
+        let mut eps: Vec<Episode> = (0..n).map(|_| make_episode(&mut rng, level)).collect();
+        let per = ((n + nthreads - 1) / nthreads).max(1);
+        let mut st = Stats::default();
+        std::thread::scope(|sc| {
+            let mut hs = Vec::new();
+            for (i, ch) in eps.chunks_mut(per).enumerate() {
+                let sd = seed.wrapping_add(1 + i as u64 + 97 * level as u64);
+                hs.push(sc.spawn(move || eval_chunk(m, ch, k, sd)));
+            }
+            for h in hs {
+                st.add(&h.join().expect("thread d'évaluation"));
+            }
+        });
+        println!(
+            "  niv {level} │ NLL/tok {:.3} │ glouton : {:.0}% valide, {:.0}% exact │ échantillons : {:.0}% valides, ≥1 sur {k} : {:.0}% │ uniforme : {:.0}% valides, ≥1 sur {k} : {:.0}%",
+            st.nll / st.ntok.max(1) as f64,
+            pct(st.g_valid, st.n), pct(st.g_exact, st.n),
+            pct(st.s_valid, st.n * k), pct(st.s_any, st.n),
+            pct(st.u_valid, st.n * k), pct(st.u_any, st.n)
+        );
+    }
+}
+
+// ───────────────────────── Vérifications numériques ─────────────────────────
+/// Écart max entre les logits de la passe complète (autodiff) et ceux du chemin incrémental (cache K/V).
+fn consistency(m: &Model, toks: &[usize]) -> f32 {
+    let n = toks.len() - 1;
+    let mut tp = m.tape();
+    let lg = forward(&mut tp, &toks[..n]);
+    let mut ca = Cache::new();
+    let mut worst = 0.0f32;
+    for i in 0..n {
+        let row = infer_step(m, &mut ca, toks[i]);
+        for c in 0..VOCAB {
+            worst = worst.max((row[c] - tp.val[lg][i * VOCAB + c]).abs());
+        }
+    }
+    worst
+}
+
+fn grad_check(seed: u64) {
+    let mut rng = Rng::new(seed);
+    let mut m = Model::new(&mut rng);
+    let ep = make_episode(&mut rng, 2);
+    let ntgt = ep.toks.len() - ep.plen;
+    let scale = 1.0 / ntgt as f32;
+    println!("check : {} paramètres, séquence de {} tokens ({} cibles)", m.count(), ep.toks.len(), ntgt);
+    let mut acc: Vec<Vec<f32>> = m.w.iter().map(|v| vec![0.0f32; v.len()]).collect();
+    let l0 = seq_run(&m, &ep.toks, ep.plen, scale, Some(&mut acc));
+    println!("perte initiale {:.3} (loi uniforme : {:.3})", l0, (VOCAB as f32).ln());
+    let eps = 2e-2f32;
+    let (mut bad, mut tot, mut worst) = (0usize, 0usize, 0.0f32);
+    for i in 0..m.w.len() {
+        let mut idx = vec![0usize]; // plus gros gradient + 3 indices au hasard
+        for j in 0..acc[i].len() {
+            if acc[i][j].abs() > acc[i][idx[0]].abs() {
+                idx[0] = j;
+            }
+        }
+        for _ in 0..3 {
+            idx.push(rng.below(acc[i].len()));
+        }
+        for &j in &idx {
+            let o = m.w[i][j];
+            m.w[i][j] = o + eps;
+            let lp = seq_run(&m, &ep.toks, ep.plen, scale, None);
+            m.w[i][j] = o - eps;
+            let lm = seq_run(&m, &ep.toks, ep.plen, scale, None);
+            m.w[i][j] = o;
+            let num = (lp - lm) / (2.0 * eps);
+            let ana = acc[i][j];
+            let ratio = (num - ana).abs() / (3e-3 + 0.05 * num.abs().max(ana.abs()));
+            worst = worst.max(ratio);
+            tot += 1;
+            if ratio > 1.0 {
+                bad += 1;
+                println!("  ✗ tenseur {i} idx {j} : analytique {ana:.5} vs numérique {num:.5}");
+            }
+        }
+    }
+    println!("différences finies : {bad}/{tot} hors tolérance (pire ratio {worst:.2}, < 1 attendu)");
+    let diff = consistency(&m, &ep.toks);
+    println!("cache K/V vs passe complète : écart max des logits {diff:.2e}");
+    println!("{}", if bad == 0 && diff < 1e-3 { "OK" } else { "ATTENTION : voir ci-dessus" });
+}
+
+// ───────────────────────── Démo qualitative ─────────────────────────
+fn demo(m: &Model, seed: u64, k: usize) {
+    let mut rng = Rng::new(seed ^ 0xDE30);
+    let mut ep = make_episode(&mut rng, 3);
+    println!("— Exemple (niveau 3) —");
+    let sg: Vec<String> = ep.sig.syms.iter().map(|&s| format!("s{}/{}", s, ep.sig.arity[s])).collect();
+    println!("signature   : {}", sg.join(" "));
+    for r in &ep.rules {
+        let outs: Vec<String> = r.outs.iter().map(|(p, rhs)| format!("{:.2}:{}", p, show_pat(rhs))).collect();
+        println!("règle       : {} -> {}", show_pat(&r.lhs), outs.join(" | "));
+    }
+    let truth = likelihood(&mut ep.ar, &ep.rules, ep.h, ep.o, ep.kmax);
+    println!("observation : {}", ep.ar.show(ep.o));
+    println!("cause vraie : {}   (P(obs|cause) = {:.4}, ≤ {} pas)", ep.ar.show(ep.h), truth, ep.kmax);
+    let (base, first) = prefill(m, &ep.toks[..ep.plen]);
+    for i in 0..=k {
+        let temp = if i == 0 { 0.0 } else { 1.0 };
+        let out = decode(m, &base, &first, &ep.sig, temp, false, &mut rng);
+        match parse_cause(&mut ep.ar, &ep.sig, &out) {
+            Some(id) => {
+                let l = likelihood(&mut ep.ar, &ep.rules, id, ep.o, LMAX);
+                let tag = if i == 0 { "glouton    " } else { "échantillon" };
+                println!("{} : {}   P(obs|cause) = {:.4}", tag, ep.ar.show(id), l);
+            }
+            None => println!("(cause mal formée)"),
+        }
+    }
+}
+
+// ───────────────────────── main ─────────────────────────
+fn arg<T: std::str::FromStr>(kv: &HashMap<String, String>, key: &str, def: T) -> T {
+    kv.get(key).and_then(|v| v.parse().ok()).unwrap_or(def)
+}
+
+fn default_threads() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+}
+
+fn main() {
+    let mut kv: HashMap<String, String> = HashMap::new();
+    for a in env::args().skip(1) {
+        if let Some((k, v)) = a.split_once('=') {
+            kv.insert(k.to_string(), v.to_string());
+        }
+    }
+    let seed: u64 = arg(&kv, "seed", 1);
+    let threads: usize = arg::<usize>(&kv, "threads", default_threads()).max(1);
+    if arg::<u32>(&kv, "check", 0) == 1 {
+        grad_check(seed);
+        return;
+    }
+    let steps: usize = arg(&kv, "steps", 4000);
+    let bs: usize = arg(&kv, "batch", 32);
+    let lr: f32 = arg(&kv, "lr", 2e-3);
+    let wd: f32 = arg(&kv, "wd", 0.01);
+    let clip: f32 = arg(&kv, "clip", 1.0);
+    let log_every: usize = arg::<usize>(&kv, "log", 50).max(1);
+    let eval_every: usize = arg(&kv, "eval_every", 1000);
+    let eval_n: usize = arg(&kv, "eval_n", 32);
+    let ks: usize = arg(&kv, "k", 8);
+    let curriculum: u32 = arg(&kv, "curriculum", 1);
+
+    let mut rng = Rng::new(seed);
+    let mut m = Model::new(&mut rng);
+    let mut adam = Adam::new(&m.w);
+    println!(
+        "PTGRS-Abducer : {} paramètres | {} threads | lot {} | {} pas | lr {:.1e}",
+        m.count(), threads, bs, steps, lr
+    );
+    let t0 = std::time::Instant::now();
+    let ramp = (steps * 3 / 5).max(1); // curriculum : un niveau de plus tous les ~15 % du budget
+    for step in 0..steps {
+        let maxlv = if curriculum == 1 { (1 + step * LMAX / ramp).min(LMAX) } else { LMAX };
+        let batch = make_batch(&mut rng, bs, maxlv);
+        let (loss, mut g) = train_step(&m, &batch, threads);
+        let gn = g.iter().map(|v| v.iter().map(|x| x * x).sum::<f32>()).sum::<f32>().sqrt();
+        if !loss.is_finite() || !gn.is_finite() {
+            eprintln!("divergence au pas {step} (perte {loss}) : essayez un lr plus petit");
+            return;
+        }
+        if gn > clip {
+            for v in g.iter_mut() {
+                for x in v.iter_mut() {
+                    *x *= clip / gn;
+                }
+            }
+        }
+        let lr_t = lr_at(step, steps, lr);
+        adam.step(&mut m.w, &g, &m.shp, lr_t, wd);
+        if step == 0 || (step + 1) % log_every == 0 {
+            println!(
+                "pas {:>5}/{} │ niv≤{} │ perte {:.4} │ ‖g‖ {:.2} │ lr {:.1e} │ {:.0}s",
+                step + 1, steps, maxlv, loss, gn, lr_t, t0.elapsed().as_secs_f32()
+            );
+        }
+        if eval_every > 0 && (step + 1) % eval_every == 0 && step + 1 < steps {
+            evaluate(&m, eval_n, ks, threads, seed ^ 0xE5A1);
+        }
+    }
+    println!("— évaluation finale —");
+    evaluate(&m, eval_n.max(64), ks, threads, seed ^ 0xE5A1);
+    demo(&m, seed, ks);
+}
