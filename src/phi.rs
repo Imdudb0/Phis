@@ -1,667 +1,488 @@
 use crate::model::Model;
-use crate::sim::{Ctx, IdBuild};
-use crate::util::{hash_usize, show_byte};
+use crate::percept::Percept;
+use crate::phi::{ipow, PHI_EPS};
+use crate::sim::Ctx;
+use crate::sys::{split_mask, System};
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::rc::Rc;
-pub const PHI_EPS: f64 = 1e-9;
+
+const REL_TOL: f64 = 1e-12;
 const TIE_REL: f64 = 1e-9;
-pub const MAX_TIES: usize = 4;
-const TINY: f64 = 1e-300;
-const CACHE_CAP: usize = 4_000_000;
-const SEP: usize = usize::MAX / 2;
-const TAG_CTAB: u64 = 0x4354_4142_0000_0007;
-#[inline]
-pub fn ipow(a: usize, k: usize) -> usize {
-    let mut r = 1usize;
-    for _ in 0..k {
-        r = r.saturating_mul(a);
-    }
-    r
+
+/// Where the repertoires come from.
+/// `Exact`: `Ctx::marg_exact` (full enumeration of the joint states).
+/// `Mc`: the estimator's own Monte-Carlo `Ctx::marg`; everything else stays exhaustive.
+/// Exact vs Mc isolates the sampling noise; Mc vs estimator isolates the structural
+/// restrictions (neighbourhoods, sampled cuts, pair+closure relations).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Backend {
+    Exact,
+    Mc,
 }
-#[inline]
-pub fn id_term(p: f64, q: f64) -> f64 {
-    p * (p.max(TINY) / q.max(TINY)).log2().abs()
+
+#[derive(Clone, Debug)]
+pub struct ExactCfg {
+    pub backend: Backend,
+    /// largest mechanism (0 = every node of the complex)
+    pub kmax: usize,
+    /// largest purview (0 = every node of the complex)
+    pub qmax: usize,
+    pub max_states: usize,
+    pub max_mech: usize,
+    /// refuse when kmax + qmax exceeds this (Bell number of the partitions)
+    pub max_part: usize,
+    pub grain_max: usize,
+    pub max_cx: usize,
+    pub max_nodes: usize,
+    /// refuse when |A(E)|^n exceeds this (exact backend)
+    pub max_joint: usize,
+    /// largest relation order (0 = every subset of distinctions)
+    pub rel_order: usize,
+    /// cap on enumerated relations; beyond it the result is flagged incomplete
+    pub max_rel: usize,
+    /// Monte-Carlo draws R (only used by Backend::Mc)
+    pub draws: Option<usize>,
 }
-pub fn id_max(p: &[f64], q: &[f64]) -> (f64, usize) {
-    let mut best = 0.0f64;
-    let mut arg = 0usize;
-    for z in 0..p.len().min(q.len()) {
-        let v = id_term(p[z], q[z]);
-        if v > best {
-            best = v;
-            arg = z;
+
+impl ExactCfg {
+    /// Same kmax / qmax / grain / max_cx as the estimator, but exhaustive otherwise.
+    pub fn from_model(m: &Model) -> ExactCfg {
+        ExactCfg {
+            backend: Backend::Exact,
+            kmax: m.hy.kmax.clamp(1, 3),
+            qmax: m.hy.qmax.clamp(1, 3),
+            max_states: 8192,
+            max_mech: 4096,
+            max_part: 9,
+            grain_max: m.hy.grain_max.max(1),
+            max_cx: m.hy.max_cx.max(1),
+            max_nodes: 6,
+            max_joint: 2048,
+            rel_order: 0,
+            max_rel: 200_000,
+            draws: None,
         }
     }
-    (best, arg)
-}
-pub fn decode(mut idx: usize, a: usize, out: &mut [u16]) {
-    for o in out.iter_mut() {
-        *o = (idx % a) as u16;
-        idx /= a;
+    /// Every mechanism and every purview (needs n <= 4 with the default max_part).
+    pub fn full(m: &Model) -> ExactCfg {
+        let mut c = ExactCfg::from_model(m);
+        c.kmax = 0;
+        c.qmax = 0;
+        c
+    }
+    pub fn with_backend(mut self, b: Backend) -> ExactCfg {
+        self.backend = b;
+        self
+    }
+    pub fn with_rel_order(mut self, k: usize) -> ExactCfg {
+        self.rel_order = k;
+        self
+    }
+    pub fn with_draws(mut self, r: usize) -> ExactCfg {
+        self.draws = Some(r);
+        self
     }
 }
-#[inline]
-fn sub_index(idx: usize, a: usize, pos: &[usize], apow: &[usize]) -> usize {
-    let mut s = 0usize;
-    let mut mul = 1usize;
-    for &p in pos {
-        s += ((idx / apow[p]) % a) * mul;
-        mul *= a;
+
+/// Can the exact reference run on this (model, E)?
+pub fn tractable(m: &Model, e: &Percept, cfg: &ExactCfg) -> Result<(), String> {
+    let n = m.n();
+    let top = cfg.max_nodes.min(30);
+    if n > top {
+        return Err(format!("{} nodes: above max_nodes = {}", n, top));
     }
-    s
-}
-pub fn set_partitions(km: usize, kz: usize) -> Vec<Vec<u8>> {
-    fn rec(i: usize, mx: u8, lab: &mut Vec<u8>, out: &mut Vec<Vec<u8>>) {
-        if i == lab.len() {
-            if mx >= 1 {
-                out.push(lab.clone());
-            }
-            return;
+    let kk = if cfg.kmax == 0 { n } else { cfg.kmax.min(n) };
+    let qq = if cfg.qmax == 0 { n } else { cfg.qmax.min(n) };
+    if kk + qq > cfg.max_part {
+        return Err(format!(
+            "partitions of {}+{} elements: above max_part = {}",
+            kk, qq, cfg.max_part
+        ));
+    }
+    if cfg.backend == Backend::Exact {
+        let a = e.a.max(1);
+        let joint = ipow(a, n);
+        let lim = if cfg.grain_max > 1 { 2_048 } else { 4_000_000 };
+        let lim = lim.min(cfg.max_joint);
+        if joint > lim {
+            return Err(format!(
+                "|A(E)|^n = {}^{} = {}: above the exact limit {}",
+                a, n, joint, lim
+            ));
         }
-        for l in 0..=(mx + 1) {
-            lab[i] = l;
-            rec(i + 1, mx.max(l), lab, out);
-        }
     }
-    let n = km + kz;
-    let mut out: Vec<Vec<u8>> = Vec::new();
-    if n < 2 {
-        return out;
-    }
-    let mut lab = vec![0u8; n];
-    rec(1, 0, &mut lab, &mut out);
-    out
+    Ok(())
 }
-fn combos(u: &[usize], size: usize, start: usize, cur: &mut Vec<usize>, out: &mut Vec<Vec<usize>>) {
+
+// ------------------------------------------------------------------ helpers
+
+fn comb_rec(nodes: &[usize], start: usize, size: usize, cur: &mut Vec<usize>, out: &mut Vec<Vec<usize>>) {
     if cur.len() == size {
         out.push(cur.clone());
         return;
     }
-    for i in start..u.len() {
-        if u.len() - i < size - cur.len() {
+    for i in start..nodes.len() {
+        if nodes.len() - i < size - cur.len() {
             break;
         }
-        cur.push(u[i]);
-        combos(u, size, i + 1, cur, out);
+        cur.push(nodes[i]);
+        comb_rec(nodes, i + 1, size, cur, out);
         cur.pop();
     }
 }
-fn top_ids(mut v: Vec<(usize, f64)>, cap: usize) -> Vec<usize> {
-    v.sort_by(|x, y| {
-        y.1.partial_cmp(&x.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(x.0.cmp(&y.0))
-    });
-    v.truncate(cap);
-    v.iter().map(|p| p.0).collect()
+
+/// Every subset of `nodes` with min_size..=max_size elements, by size then lexicographically.
+pub fn subsets(nodes: &[usize], min_size: usize, max_size: usize) -> Vec<Vec<usize>> {
+    let mut out: Vec<Vec<usize>> = Vec::new();
+    let mut cur: Vec<usize> = Vec::new();
+    for size in min_size.max(1)..=max_size.min(nodes.len()) {
+        comb_rec(nodes, 0, size, &mut cur, &mut out);
+    }
+    out
 }
+
 fn norm(v: &[usize]) -> Vec<usize> {
     let mut x = v.to_vec();
     x.sort_unstable();
     x.dedup();
     x
 }
-fn join_ids(v: &[usize]) -> String {
-    v.iter().map(|j| j.to_string()).collect::<Vec<String>>().join(",")
+
+// ---------------------------------------------------------------- marginals
+
+/// Cached marginal of one node given a clamped subset, under the Ctx background.
+/// Lives only as long as the borrow of the Ctx, so the background cannot change under it.
+struct Mg<'c, 'm> {
+    cx: &'c Ctx<'m>,
+    be: Backend,
+    tau: usize,
+    cache: RefCell<HashMap<Vec<usize>, Rc<Vec<f64>>>>,
+    bad: Cell<bool>,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Dir {
-    Cause,
-    Effect,
-}
-#[derive(Clone, Debug)]
-pub struct PhiCfg {
-    pub kmax: usize,
-    pub qmax: usize,
-    pub nbr: usize,
-    pub max_states: usize,
-    pub max_mech: usize,
-}
-impl PhiCfg {
-    pub fn from_model(m: &Model) -> PhiCfg {
-        PhiCfg {
-            kmax: m.hy.kmax.clamp(1, 3),
-            qmax: m.hy.qmax.clamp(1, 3),
-            nbr: m.hy.nbr.max(1),
-            max_states: 8192,
-            max_mech: 2048,
-        }
+
+impl<'c, 'm> Mg<'c, 'm> {
+    fn new(cx: &'c Ctx<'m>, be: Backend, tau: usize) -> Mg<'c, 'm> {
+        Mg { cx, be, tau: tau.max(1), cache: RefCell::new(HashMap::new()), bad: Cell::new(false) }
     }
-}
-#[derive(Clone, Debug)]
-pub struct Face {
-    pub nodes: Vec<usize>,
-    pub phi: f64,
-    pub states: Vec<Vec<u16>>,
-}
-#[derive(Clone, Debug)]
-pub struct Dist {
-    pub mech: Vec<usize>,
-    pub mech_state: Vec<u16>,
-    pub cause: Vec<Face>,
-    pub effect: Vec<Face>,
-    pub phi_c: f64,
-    pub phi_e: f64,
-    pub phi_d: f64,
-    pub anchored: bool,
-}
-impl Dist {
-    pub fn is_distinction(&self) -> bool {
-        self.phi_d > PHI_EPS
-    }
-}
-pub fn sum_phi_d(ds: &[Dist]) -> f64 {
-    ds.iter()
-        .filter(|d| d.anchored && d.is_distinction())
-        .map(|d| d.phi_d)
-        .sum()
-}
-struct SideEval {
-    phi: f64,
-    states: Vec<Vec<u16>>,
-    exact: bool,
-}
-pub struct Phi<'c, 'm> {
-    pub cx: &'c Ctx<'m>,
-    pub tau: usize,
-    pub state: Vec<u16>,
-    pub cfg: PhiCfg,
-    nin: Vec<Vec<usize>>,
-    nout: Vec<Vec<usize>>,
-    ctab: RefCell<HashMap<u64, Rc<Vec<f64>>, IdBuild>>,
-    ctab_sz: Cell<usize>,
-}
-impl<'c, 'm> Phi<'c, 'm> {
-    pub fn new(cx: &'c Ctx<'m>, tau: usize, state: &[u16], cfg: PhiCfg) -> Phi<'c, 'm> {
-        let n = cx.n;
-        assert!(state.len() >= n, "state must hold one symbol per node");
-        let amax = (cx.a - 1) as u16;
-        let st: Vec<u16> = state[..n].iter().map(|&s| s.min(amax)).collect();
-        let mut nin: Vec<Vec<usize>> = vec![Vec::new(); n];
-        let mut nout: Vec<Vec<usize>> = vec![Vec::new(); n];
-        for &j in cx.free_nodes() {
-            let mut vi: Vec<(usize, f64)> = Vec::new();
-            let mut vo: Vec<(usize, f64)> = Vec::new();
-            for &i in cx.free_nodes() {
-                let wi = cx.weight(i, j).abs(); 
-                if wi > 0.0 {
-                    vi.push((i, wi));
-                }
-                let wo = cx.weight(j, i).abs(); 
-                if wo > 0.0 {
-                    vo.push((i, wo));
-                }
-            }
-            nin[j] = top_ids(vi, cfg.nbr);
-            nout[j] = top_ids(vo, cfg.nbr);
+
+    fn get(&self, j: usize, clamp: &[usize], syms: &[u16]) -> Rc<Vec<f64>> {
+        let mut pr: Vec<(usize, u16)> = clamp.iter().copied().zip(syms.iter().copied()).collect();
+        pr.sort_unstable();
+        let mut key: Vec<usize> = Vec::with_capacity(2 + 2 * pr.len());
+        key.push(j);
+        key.push(self.tau);
+        for &(c, s) in &pr {
+            key.push(c);
+            key.push(s as usize);
         }
-        Phi {
-            cx,
-            tau: tau.max(1),
-            state: st,
-            cfg,
-            nin,
-            nout,
-            ctab: RefCell::new(HashMap::default()),
-            ctab_sz: Cell::new(0),
+        let hit = self.cache.borrow().get(&key).cloned();
+        if let Some(v) = hit {
+            return v;
         }
-    }
-    pub fn standard(cx: &'c Ctx<'m>, tau: usize, state: &[u16]) -> Phi<'c, 'm> {
-        Phi::new(cx, tau, state, PhiCfg::from_model(cx.m))
-    }
-    pub fn mechanisms(&self) -> Vec<Vec<usize>> {
-        let n = self.cx.n;
-        let free = self.cx.free_nodes();
-        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
-        for &i in free {
-            for &j in self.nin[i].iter().chain(self.nout[i].iter()) {
-                if i != j {
-                    if !adj[i].contains(&j) {
-                        adj[i].push(j);
-                    }
-                    if !adj[j].contains(&i) {
-                        adj[j].push(i);
-                    }
-                }
-            }
-        }
-        let mut all: Vec<Vec<usize>> = free.iter().map(|&i| vec![i]).collect();
-        let mut layer: Vec<Vec<usize>> = all.clone();
-        for _ in 2..=self.cfg.kmax {
-            let mut seen: HashSet<Vec<usize>> = HashSet::new();
-            let mut next: Vec<Vec<usize>> = Vec::new();
-            for ms in &layer {
-                for &x in ms {
-                    for &y in &adj[x] {
-                        if ms.contains(&y) {
-                            continue;
-                        }
-                        let mut v = ms.clone();
-                        v.push(y);
-                        v.sort_unstable();
-                        if seen.insert(v.clone()) {
-                            next.push(v);
-                        }
-                    }
-                }
-            }
-            next.sort();
-            all.extend(next.iter().cloned());
-            layer = next;
-            if layer.is_empty() || all.len() >= self.cfg.max_mech {
-                break;
-            }
-        }
-        all.sort_by(|x, y| x.len().cmp(&y.len()).then_with(|| x.cmp(y)));
-        all.truncate(self.cfg.max_mech);
-        all
-    }
-    pub fn universe(&self, m: &[usize], dir: Dir) -> Vec<usize> {
-        let lists = match dir {
-            Dir::Cause => &self.nin,
-            Dir::Effect => &self.nout,
+        let cl: Vec<usize> = pr.iter().map(|p| p.0).collect();
+        let sy: Vec<u16> = pr.iter().map(|p| p.1).collect();
+        let mut out = vec![0.0f64; self.cx.a];
+        let done = match self.be {
+            Backend::Exact => self.cx.marg_exact(j, &cl, self.tau, &sy, &mut out),
+            Backend::Mc => false,
         };
-        let cap = 2 * self.cfg.nbr;
-        let mut seen = vec![false; self.cx.n];
-        let mut out: Vec<usize> = Vec::new();
-        let mut front: Vec<usize> = m.to_vec();
-        'hops: for _ in 0..self.tau {
-            let mut next: Vec<usize> = Vec::new();
-            for r in 0..self.cfg.nbr {
-                for &x in &front {
-                    if let Some(&y) = lists[x].get(r) {
-                        if !seen[y] {
-                            seen[y] = true;
-                            next.push(y);
-                            out.push(y);
-                            if out.len() >= cap {
-                                break 'hops;
-                            }
-                        }
-                    }
-                }
+        if !done {
+            if self.be == Backend::Exact {
+                self.bad.set(true);
             }
-            if next.is_empty() {
-                break;
-            }
-            front = next;
+            self.cx.marg(j, &cl, self.tau, &sy, &mut out);
         }
-        out.sort_unstable();
-        out
-    }
-    pub fn purviews(&self, u: &[usize]) -> Vec<Vec<usize>> {
-        let a = self.cx.a;
-        let mut out: Vec<Vec<usize>> = Vec::new();
-        for size in 1..=self.cfg.qmax.min(u.len()) {
-            if ipow(a, size) > self.cfg.max_states {
-                break;
-            }
-            let mut cur: Vec<usize> = Vec::new();
-            combos(u, size, 0, &mut cur, &mut out);
-        }
-        out
-    }
-    pub(crate) fn cause_table(&self, m: &[usize], z: &[usize]) -> Rc<Vec<f64>> {
-        let mut ks: Vec<usize> = Vec::with_capacity(m.len() + z.len() + 1);
-        ks.extend_from_slice(m);
-        ks.push(SEP);
-        ks.extend_from_slice(z);
-        let key = hash_usize(TAG_CTAB, &ks);
-        let hit = self.ctab.borrow().get(&key).cloned();
-        if let Some(t) = hit {
-            return t;
-        }
-        let a = self.cx.a;
-        let k = z.len();
-        let total = ipow(a, k);
-        let sm: Vec<u16> = m.iter().map(|&j| self.state[j]).collect();
-        let mut tab = vec![0.0f64; total];
-        let mut zs = vec![0u16; k];
-        let mut out = vec![0.0f64; a];
-        let mut sum = 0.0f64;
-        for idx in 0..total {
-            decode(idx, a, &mut zs);
-            let mut l = 1.0f64;
-            for (t, &j) in m.iter().enumerate() {
-                self.cx.marg(j, z, self.tau, &zs, &mut out);
-                l *= out[sm[t] as usize];
-            }
-            tab[idx] = l;
-            sum += l;
-        }
-        if sum > TINY {
-            let inv = 1.0 / sum;
-            for v in tab.iter_mut() {
-                *v *= inv;
-            }
-        } else {
-            tab.fill(1.0 / total as f64);
-        }
-        let rc = Rc::new(tab);
-        let mut c = self.ctab.borrow_mut();
-        if self.ctab_sz.get() + total > CACHE_CAP {
-            c.clear();
-            self.ctab_sz.set(0);
-        }
-        self.ctab_sz.set(self.ctab_sz.get() + total);
-        c.insert(key, Rc::clone(&rc));
+        let rc = Rc::new(out);
+        self.cache.borrow_mut().insert(key, Rc::clone(&rc));
         rc
     }
-    fn partitioned_cause(&self, m: &[usize], z: &[usize], lab: &[u8], apow: &[usize], q: &mut [f64]) {
-        let a = self.cx.a;
-        let km = m.len();
-        let kz = z.len();
-        let nb = lab.iter().copied().max().map_or(0, |x| x as usize + 1);
-        q.fill(1.0);
-        for b in 0..nb {
-            let bb = b as u8;
-            let mb: Vec<usize> = (0..km).filter(|&i| lab[i] == bb).map(|i| m[i]).collect();
-            let zpos: Vec<usize> = (0..kz).filter(|&i| lab[km + i] == bb).collect();
-            if zpos.is_empty() {
-                continue; 
+}
+
+// ------------------------------------------------------------ exact phi_s
+
+#[derive(Clone, Copy, Debug)]
+pub struct SysX {
+    pub phi: f64,
+    pub src: u32,
+    /// false: some repertoire fell back to Monte-Carlo
+    pub ok: bool,
+}
+
+fn all_vals(cx: &Ctx<'_>, y: usize) -> Vec<u16> {
+    match cx.e_sym(y) {
+        Some(s) => vec![s],
+        None => (0..cx.a as u16).collect(),
+    }
+}
+
+/// max over the product of allowed states of prod p * |sum r|, by full enumeration.
+fn max_prod_all(p: &[Rc<Vec<f64>>], r: &[Vec<f64>], vals: &[Vec<u16>]) -> f64 {
+    let d = p.len();
+    if d == 0 {
+        return 0.0;
+    }
+    let mut idx = vec![0usize; d];
+    let mut best = 0.0f64;
+    loop {
+        let mut pr = 1.0f64;
+        let mut s = 0.0f64;
+        for y in 0..d {
+            let v = vals[y][idx[y]] as usize;
+            pr *= p[y][v];
+            s += r[y][v];
+        }
+        let val = pr * s.abs();
+        if val > best {
+            best = val;
+        }
+        let mut y = 0usize;
+        while y < d {
+            idx[y] += 1;
+            if idx[y] < vals[y].len() {
+                break;
             }
-            if mb.is_empty() {
-                let f = 1.0 / (ipow(a, zpos.len()) as f64);
-                for v in q.iter_mut() {
-                    *v *= f;
-                }
-            } else {
-                let zb: Vec<usize> = zpos.iter().map(|&i| z[i]).collect();
-                let tab = self.cause_table(&mb, &zb);
-                for (idx, v) in q.iter_mut().enumerate() {
-                    *v *= tab[sub_index(idx, a, &zpos, apow)];
-                }
-            }
+            idx[y] = 0;
+            y += 1;
+        }
+        if y == d {
+            break;
         }
     }
-    fn cause_eval(&self, m: &[usize], z: &[usize], floor: f64) -> SideEval {
-        let a = self.cx.a;
-        let km = m.len();
-        let kz = z.len();
-        let total = ipow(a, kz);
-        let p = self.cause_table(m, z);
-        let apow: Vec<usize> = (0..kz).map(|i| ipow(a, i)).collect();
-        let parts = set_partitions(km, kz);
-        let mut q = vec![0.0f64; total];
-        let mut best = f64::INFINITY;
-        let mut best_q: Vec<f64> = Vec::new();
-        for lab in &parts {
-            self.partitioned_cause(m, z, lab, &apow, &mut q);
-            let (v, _) = id_max(&p, &q);
-            if v < best {
-                best = v;
-                best_q.clear();
-                best_q.extend_from_slice(&q);
-            }
-            if best <= PHI_EPS {
-                return SideEval { phi: best, states: Vec::new(), exact: true };
-            }
-            if best < floor {
-                return SideEval { phi: best, states: Vec::new(), exact: false };
-            }
+    best
+}
+
+/// Value of the directed cut "bit i of mask = 1 puts k[i] in the source side A":
+/// connections A -> B are replaced by noise, so only nodes of B change.
+fn cut_value_exact(
+    mg: &Mg<'_, '_>,
+    k: &[usize],
+    sk: &[u16],
+    p: &[Rc<Vec<f64>>],
+    vals: &[Vec<u16>],
+    pmax: &[f64],
+    mask: u32,
+) -> f64 {
+    let m = k.len();
+    let a = mg.cx.a;
+    let mut fa = 1.0f64;
+    let mut bpos: Vec<usize> = Vec::new();
+    for i in 0..m {
+        if ((mask >> i) & 1) == 1 {
+            fa *= pmax[i];
+        } else {
+            bpos.push(i);
         }
-        if !best.is_finite() {
-            return SideEval { phi: 0.0, states: Vec::new(), exact: true };
-        }
-        let tol = TIE_REL * best.max(1.0);
-        let mut states: Vec<Vec<u16>> = Vec::new();
-        for idx in 0..total {
-            if id_term(p[idx], best_q[idx]) >= best - tol {
-                let mut zs = vec![0u16; kz];
-                decode(idx, a, &mut zs);
-                states.push(zs);
-                if states.len() >= MAX_TIES {
-                    break;
-                }
-            }
-        }
-        SideEval { phi: best, states, exact: true }
     }
-    fn effect_eval(&self, m: &[usize], z: &[usize], floor: f64) -> SideEval {
-        let a = self.cx.a;
-        let km = m.len();
-        let kz = z.len();
-        let sm: Vec<u16> = m.iter().map(|&j| self.state[j]).collect();
-        let pz: Vec<Vec<f64>> = z
-            .iter()
-            .map(|&y| self.cx.marg_vec(y, m, self.tau, &sm))
-            .collect();
-        let fixed: Vec<Option<u16>> = z.iter().map(|&y| self.cx.e_sym(y)).collect();
-        let lat: Vec<usize> = (0..kz).filter(|&i| fixed[i].is_none()).collect();
-        let nstate = ipow(a, lat.len());
-        let mut cand = vec![0u16; nstate * kz];
-        let mut pc = vec![1.0f64; nstate];
-        let mut digits = vec![0u16; lat.len()];
-        for c in 0..nstate {
-            decode(c, a, &mut digits);
-            let mut t = 0usize;
-            for i in 0..kz {
-                let s = match fixed[i] {
-                    Some(s) => s,
-                    None => {
-                        let d = digits[t];
-                        t += 1;
-                        d
-                    }
-                };
-                cand[c * kz + i] = s;
-                pc[c] *= pz[i][s as usize];
+    let bnodes: Vec<usize> = bpos.iter().map(|&i| k[i]).collect();
+    let bsyms: Vec<u16> = bpos.iter().map(|&i| sk[i]).collect();
+    let mut pb: Vec<Rc<Vec<f64>>> = Vec::with_capacity(bpos.len());
+    let mut rb: Vec<Vec<f64>> = Vec::with_capacity(bpos.len());
+    let mut vb: Vec<Vec<u16>> = Vec::with_capacity(bpos.len());
+    let mut changed = false;
+    for &i in &bpos {
+        let q = mg.get(k[i], &bnodes, &bsyms);
+        let mut r = vec![0.0f64; a];
+        for v in 0..a {
+            r[v] = (p[i][v] / q[v]).log2();
+            if r[v].abs() > 1e-12 {
+                changed = true;
             }
         }
-        let parts = set_partitions(km, kz);
-        let mut qy: Vec<Vec<f64>> = vec![vec![0.0f64; a]; kz];
-        let mut qc = vec![0.0f64; nstate];
-        let mut best = f64::INFINITY;
-        let mut best_q: Vec<f64> = Vec::new();
-        for lab in &parts {
-            for i in 0..kz {
-                let bb = lab[km + i];
-                let mut mb: Vec<usize> = Vec::new();
-                let mut smb: Vec<u16> = Vec::new();
-                for t in 0..km {
-                    if lab[t] == bb {
-                        mb.push(m[t]);
-                        smb.push(sm[t]);
-                    }
-                }
-                self.cx.marg(z[i], &mb, self.tau, &smb, &mut qy[i]);
-            }
-            let mut v = 0.0f64;
-            for c in 0..nstate {
-                let mut q = 1.0f64;
-                for i in 0..kz {
-                    q *= qy[i][cand[c * kz + i] as usize];
-                }
-                qc[c] = q;
-                let t = id_term(pc[c], q);
-                if t > v {
-                    v = t;
-                }
-            }
-            if v < best {
-                best = v;
-                best_q.clear();
-                best_q.extend_from_slice(&qc);
-            }
-            if best <= PHI_EPS {
-                return SideEval { phi: best, states: Vec::new(), exact: true };
-            }
-            if best < floor {
-                return SideEval { phi: best, states: Vec::new(), exact: false };
-            }
-        }
-        if !best.is_finite() {
-            return SideEval { phi: 0.0, states: Vec::new(), exact: true };
-        }
-        let tol = TIE_REL * best.max(1.0);
-        let mut states: Vec<Vec<u16>> = Vec::new();
-        for c in 0..nstate {
-            if id_term(pc[c], best_q[c]) >= best - tol {
-                states.push(cand[c * kz..(c + 1) * kz].to_vec());
-                if states.len() >= MAX_TIES {
-                    break;
-                }
-            }
-        }
-        SideEval { phi: best, states, exact: true }
+        pb.push(Rc::clone(&p[i]));
+        rb.push(r);
+        vb.push(vals[i].clone());
     }
-    pub fn phi_cause(&self, m: &[usize], z: &[usize]) -> (f64, Vec<Vec<u16>>) {
-        let (m, z) = (norm(m), norm(z));
-        if m.is_empty() || z.is_empty() {
-            return (0.0, Vec::new());
-        }
-        debug_assert!(m.iter().chain(z.iter()).all(|&i| self.cx.pinned(i).is_none()));
-        let ev = self.cause_eval(&m, &z, -1.0);
-        if ev.phi <= PHI_EPS { (0.0, Vec::new()) } else { (ev.phi, ev.states) }
+    if changed { fa * max_prod_all(&pb, &rb, &vb) } else { 0.0 }
+}
+
+/// Exact integrated information of the candidate system `k` at grain `tau`:
+/// min over EVERY directed bipartition, max over EVERY state of the system
+/// (anchored nodes at E's symbol). Same definition as sys.rs, nothing sampled.
+pub fn system_phi_exact(cx: &mut Ctx<'_>, be: Backend, state: &[u16], tau: usize, k: &[usize]) -> SysX {
+    let m = k.len();
+    if m < 2 {
+        return SysX { phi: 0.0, src: 0, ok: true };
     }
-    pub fn phi_effect(&self, m: &[usize], z: &[usize]) -> (f64, Vec<Vec<u16>>) {
-        let (m, z) = (norm(m), norm(z));
-        if m.is_empty() || z.is_empty() {
-            return (0.0, Vec::new());
-        }
-        debug_assert!(m.iter().chain(z.iter()).all(|&i| self.cx.pinned(i).is_none()));
-        let ev = self.effect_eval(&m, &z, -1.0);
-        if ev.phi <= PHI_EPS { (0.0, Vec::new()) } else { (ev.phi, ev.states) }
+    assert!(m <= 30, "a candidate system has at most 30 nodes");
+    let n = cx.n;
+    let mut inside = vec![false; n];
+    for &j in k {
+        inside[j] = true;
     }
-    fn best_side(&self, m: &[usize], cands: &[Vec<usize>], dir: Dir) -> (f64, Vec<Face>) {
-        let mut best = 0.0f64;
-        let mut faces: Vec<Face> = Vec::new();
-        for z in cands {
-            let floor = if best > PHI_EPS { best - TIE_REL * best.max(1.0) } else { -1.0 };
-            let ev = match dir {
-                Dir::Cause => self.cause_eval(m, z, floor),
-                Dir::Effect => self.effect_eval(m, z, floor),
+    let mut bn: Vec<usize> = Vec::new();
+    let mut bs: Vec<u16> = Vec::new();
+    for j in 0..n {
+        if !inside[j] {
+            bn.push(j);
+            bs.push(state[j]);
+        }
+    }
+    cx.set_background(&bn, &bs);
+    let cx: &Ctx<'_> = &*cx;
+    let a = cx.a;
+    let amax = (a - 1) as u16;
+    let mg = Mg::new(cx, be, tau);
+    let sk: Vec<u16> = k.iter().map(|&j| state[j].min(amax)).collect();
+    let mut p: Vec<Rc<Vec<f64>>> = Vec::with_capacity(m);
+    let mut vals: Vec<Vec<u16>> = Vec::with_capacity(m);
+    let mut pmax: Vec<f64> = Vec::with_capacity(m);
+    for &y in k {
+        let py = mg.get(y, k, &sk);
+        let vs = all_vals(cx, y);
+        let mut mx = 0.0f64;
+        for &v in &vs {
+            if py[v as usize] > mx {
+                mx = py[v as usize];
+            }
+        }
+        p.push(py);
+        vals.push(vs);
+        pmax.push(mx);
+    }
+    let full: u32 = (1u32 << m) - 1;
+    let mut best = f64::INFINITY;
+    let mut bm = 0u32;
+    for mask in 1..full {
+        let v = cut_value_exact(&mg, k, &sk, &p, &vals, &pmax, mask);
+        if v < best {
+            best = v;
+            bm = mask;
+        }
+        if best <= PHI_EPS {
+            break;
+        }
+    }
+    let phi = if best.is_finite() { best.max(0.0) } else { 0.0 };
+    SysX { phi, src: bm, ok: !mg.bad.get() }
+}
+
+// ----------------------------------------------------------- exact complexes
+
+#[derive(Clone, Debug)]
+pub struct FoundX {
+    pub tau: usize,
+    pub systems: Vec<System>,
+    pub ok: bool,
+}
+
+fn best_system_exact(
+    cx: &mut Ctx<'_>,
+    cfg: &ExactCfg,
+    state: &[u16],
+    tau: usize,
+    rem: &[usize],
+    ok: &mut bool,
+) -> Option<(Vec<usize>, f64, u32)> {
+    if rem.len() < 2 {
+        return None;
+    }
+    let mut best: Option<(Vec<usize>, f64, u32)> = None;
+    for k in subsets(rem, 2, rem.len()) {
+        let s = system_phi_exact(cx, cfg.backend, state, tau, &k);
+        if !s.ok {
+            *ok = false;
+        }
+        let better = match &best {
+            None => true,
+            Some(b) => s.phi > b.1 * (1.0 + REL_TOL),
+        };
+        if better {
+            best = Some((k, s.phi, s.src));
+        }
+    }
+    match best {
+        Some(b) if b.1 > PHI_EPS => Some(b),
+        _ => None,
+    }
+}
+
+/// Exclusion, recursively: grain tau* = the one whose best system has the largest phi_s
+/// (smaller grain wins ties), then the best system among the remaining nodes, and so on.
+pub fn find_complexes_exact(cx: &mut Ctx<'_>, state: &[u16], cfg: &ExactCfg) -> FoundX {
+    let n = cx.n;
+    let all: Vec<usize> = (0..n).collect();
+    let mut ok = true;
+    let mut tau_star = 1usize;
+    let mut first: Option<(Vec<usize>, f64, u32)> = None;
+    for tau in 1..=cfg.grain_max.max(1) {
+        if let Some(c) = best_system_exact(cx, cfg, state, tau, &all, &mut ok) {
+            let better = match &first {
+                None => true,
+                Some(f) => c.1 > f.1 * (1.0 + REL_TOL),
             };
-            if !ev.exact || ev.phi <= PHI_EPS {
-                continue;
-            }
-            let tol = TIE_REL * best.max(ev.phi).max(1.0);
-            if ev.phi > best + tol {
-                best = ev.phi;
-                faces.clear();
-                faces.push(Face { nodes: z.clone(), phi: ev.phi, states: ev.states });
-            } else if ev.phi >= best - tol {
-                if faces.len() < MAX_TIES {
-                    faces.push(Face { nodes: z.clone(), phi: ev.phi, states: ev.states });
-                }
-                if ev.phi > best {
-                    best = ev.phi;
-                }
+            if better {
+                tau_star = tau;
+                first = Some(c);
             }
         }
-        (best, faces)
     }
-    pub fn distinctions(&self, only_anchored: bool) -> Vec<Dist> {
-        let mut out: Vec<Dist> = Vec::new();
-        for m in self.mechanisms() {
-            let uc = self.universe(&m, Dir::Cause);
-            let ue = self.universe(&m, Dir::Effect);
-            if only_anchored && !(self.cx.touches_e(&uc) || self.cx.touches_e(&ue)) {
-                continue;
-            }
-            let cc = self.purviews(&uc);
-            let ce = self.purviews(&ue);
-            let (phi_c, fc) = self.best_side(&m, &cc, Dir::Cause);
-            let (phi_e, fe) = self.best_side(&m, &ce, Dir::Effect);
-            if phi_c <= PHI_EPS && phi_e <= PHI_EPS {
-                continue;
-            }
-            let anchored = fc.iter().chain(fe.iter()).any(|f| self.cx.touches_e(&f.nodes));
-            let mech_state: Vec<u16> = m.iter().map(|&j| self.state[j]).collect();
-            out.push(Dist {
-                mech: m,
-                mech_state,
-                cause: fc,
-                effect: fe,
-                phi_c,
-                phi_e,
-                phi_d: phi_c.min(phi_e),
-                anchored,
-            });
-        }
-        out
-    }
-    pub fn dist_e(&self) -> Vec<Dist> {
-        self.distinctions(true)
-            .into_iter()
-            .filter(|d| d.anchored && d.is_distinction())
-            .collect()
-    }
-    pub fn footprint(&self, d: &Dist) -> Vec<usize> {
-        let mut v: Vec<usize> = Vec::new();
-        for f in d.cause.iter().chain(d.effect.iter()) {
-            for &j in &f.nodes {
-                if let Some(p) = self.cx.e_pos(j) {
-                    v.push(p);
+    let mut chosen: Vec<(Vec<usize>, f64, u32)> = Vec::new();
+    if let Some(f) = first {
+        let mut remaining: Vec<usize> = all.iter().copied().filter(|j| !f.0.contains(j)).collect();
+        chosen.push(f);
+        while chosen.len() < cfg.max_cx.max(1) && remaining.len() >= 2 {
+            match best_system_exact(cx, cfg, state, tau_star, &remaining, &mut ok) {
+                Some(c) => {
+                    remaining.retain(|j| !c.0.contains(j));
+                    chosen.push(c);
                 }
+                None => break,
             }
         }
-        v.sort_unstable();
-        v.dedup();
-        v
     }
-    pub fn repertoire_marginals(&self, m: &[usize], z: &[usize], dir: Dir) -> Vec<Vec<f64>> {
-        let a = self.cx.a;
-        let (m, z) = (norm(m), norm(z));
-        let kz = z.len();
-        let mut out = vec![vec![0.0f64; a]; kz];
-        if m.is_empty() || kz == 0 {
-            for row in out.iter_mut() {
-                row.fill(1.0 / a as f64);
-            }
-            return out;
+    let systems: Vec<System> = chosen
+        .into_iter()
+        .map(|(k, phi, src)| {
+            let (a, b) = split_mask(&k, src);
+            System { nodes: k, phi_s: phi, cut_src: a, cut_dst: b, exact: true }
+        })
+        .collect();
+    FoundX { tau: tau_star, systems, ok }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::Hyper;
+    use crate::sys::{system_phi, SharpCfg};
+    use crate::util::Rng;
+
+    fn small(seed: u64, np: usize, nl: usize) -> Model {
+        let hy = Hyper { budget: 4, grain_max: 1, ..Hyper::default() };
+        Model::random(np, nl, hy, &mut Rng::new(seed))
+    }
+
+    #[test]
+    fn exhaustive_cuts_reproduce_the_estimator_when_it_enumerates() {
+        let m = small(11, 3, 2);
+        let e = Percept::from_bytes(b"abb");
+        let mut cx = Ctx::new(&m, &e, 0);
+        let state = cx.initial_state();
+        let cfg = SharpCfg::from_model(&m);
+        for k in subsets(&[0, 1, 2, 3, 4], 2, 5) {
+            let est = system_phi(&mut cx, &state, 1, &cfg, &k).phi;
+            let exh = system_phi_exact(&mut cx, Backend::Mc, &state, 1, &k).phi;
+            assert!((est - exh).abs() <= 1e-9 * est.max(1.0), "{:?}: {} vs {}", k, est, exh);
         }
-        match dir {
-            Dir::Effect => {
-                let sm: Vec<u16> = m.iter().map(|&j| self.state[j]).collect();
-                for (i, &y) in z.iter().enumerate() {
-                    self.cx.marg(y, &m, self.tau, &sm, &mut out[i]);
-                }
-            }
-            Dir::Cause => {
-                let p = self.cause_table(&m, &z);
-                let apow: Vec<usize> = (0..kz).map(|i| ipow(a, i)).collect();
-                for idx in 0..p.len() {
-                    for i in 0..kz {
-                        out[i][(idx / apow[i]) % a] += p[idx];
-                    }
+    }
+
+    #[test]
+    fn acyclic_graph_has_no_complex() {
+        let mut m = small(5, 3, 2);
+        let n = m.n();
+        for i in 0..n {
+            for j in 0..n {
+                if i > j {
+                    m.w[i * n + j] = 0.0;
                 }
             }
         }
-        out
-    }
-    fn fmt_face(&self, f: &Face) -> String {
-        let mut s = format!("{{{}}}=", join_ids(&f.nodes));
-        for (k, st) in f.states.iter().enumerate() {
-            if k > 0 {
-                s.push('|');
-            }
-            for &v in st {
-                match self.cx.alphabet.get(v as usize) {
-                    Some(&b) => s.push_str(&show_byte(b)),
-                    None => s.push('?'),
-                }
-            }
-        }
-        s.push_str(&format!(" phi={:.4}", f.phi));
-        s
-    }
-    pub fn describe(&self, d: &Dist) -> String {
-        let mut s = format!(
-            "m{{{}}} phi_d={:.4} (c={:.4} e={:.4}){}",
-            join_ids(&d.mech),
-            d.phi_d,
-            d.phi_c,
-            d.phi_e,
-            if d.anchored { " [E]" } else { "" }
-        );
-        for f in &d.cause {
-            s.push_str(&format!("\n  cause  {}", self.fmt_face(f)));
-        }
-        for f in &d.effect {
-            s.push_str(&format!("\n  effect {}", self.fmt_face(f)));
-        }
-        s
+        let e = Percept::from_bytes(b"aba");
+        let mut cx = Ctx::new(&m, &e, 0);
+        let state = cx.initial_state();
+        let f = find_complexes_exact(&mut cx, &state, &ExactCfg::from_model(&m));
+        assert!(f.systems.is_empty());
+        assert!(f.ok);
     }
 }
