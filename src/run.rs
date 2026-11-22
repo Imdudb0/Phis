@@ -1,6 +1,7 @@
 use super::{
     find_complexes_exact, relations_exact, residuals_exact, tractable, Backend, Dx, ExactCfg,
 };
+use crate::phi::find_complexes_exact;
 use crate::model::Model;
 use crate::percept::Percept;
 use crate::phi::{sum_phi_d, Dir, Dist, PHI_EPS};
