@@ -8,7 +8,8 @@
 
 mod dx;
 pub use dx::{residuals_exact, Dx};
-// mod relx;   // 5b-3
+mod relx;
+pub use relx::{gap, relations_exact, RelGap, RelsX};
 // mod run;    // 5b-4
 // mod calib;  // 5b-5
 
