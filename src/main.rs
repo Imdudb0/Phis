@@ -870,3 +870,5 @@ impl Tape {
         }
     }
 }
+
+fn main() {}
