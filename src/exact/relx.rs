@@ -8,7 +8,7 @@
 //! effect purview) read in one of its tied states; the overlap is the set of latent nodes
 //! present in every chosen face with the same symbol, never bytes of E.
 //!
-//!     phi_r(S) = max over those choices of |overlap| * min_{d in S} phi_d / |face_d|
+//!     phi_r!(S) = max over those choices of |overlap| * min_{d in S} phi_d / |face_d|
 //!
 //! |overlap| <= |face_d| for every member, so phi_r <= min_{d in S} phi_d by construction.
 //! One relation per set S (its best choice; ties are kept as ties and the smallest overlap
