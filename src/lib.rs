@@ -5,3 +5,4 @@ pub mod percept;
 pub mod phi;
 pub mod net;
 pub mod search;
+pub mod explain;
