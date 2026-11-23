@@ -1220,7 +1220,8 @@ struct Stats {
     nll: f64,
     ntok: usize,
     g_valid: usize,
-    g_exact: usize,
+    g_better: usize, // glouton au moins aussi vraisemblable que la vérité
+    g_gain: f64,     // somme de ln(P(o|ĥ)/P(o|h*)) sur les réponses valides
     s_valid: usize,
     s_any: usize,
     u_valid: usize,
@@ -1232,7 +1233,8 @@ impl Stats {
         self.nll += o.nll;
         self.ntok += o.ntok;
         self.g_valid += o.g_valid;
-        self.g_exact += o.g_exact;
+        self.g_better += o.g_better;
+        self.g_gain += o.g_gain;
         self.s_valid += o.s_valid;
         self.s_any += o.s_any;
         self.u_valid += o.u_valid;
@@ -1251,12 +1253,17 @@ fn eval_chunk(m: &Model, eps: &mut [Episode], k: usize, seed: u64) -> Stats {
         st.ntok += ep.toks.len() - ep.plen;
         let (base, first) = prefill(m, &ep.toks[..ep.plen]);
         let out = decode(m, &base, &first, &ep.sig, 0.0, false, &mut rng);
+        // vérité mesurée sur la même échelle (LMAX) que les candidats
+        let lt = likelihood(&mut ep.ar, &ep.rules, ep.h, ep.o, LMAX).max(1e-300);
         if let Some(id) = parse_cause(&mut ep.ar, &ep.sig, &out) {
-            if id == ep.h {
-                st.g_exact += 1;
-            }
-            if likelihood(&mut ep.ar, &ep.rules, id, ep.o, LMAX) > 0.0 {
+            let lp = likelihood(&mut ep.ar, &ep.rules, id, ep.o, LMAX);
+            if lp > 0.0 {
                 st.g_valid += 1;
+                // tolérance : l'ordre d'itération des HashMap change les derniers bits des sommes f64
+                if id == ep.h || lp >= lt * (1.0 - 1e-9) {
+                    st.g_better += 1;
+                }
+                st.g_gain += lp.ln() - lt.ln();
             }
         }
         for uni in [false, true] {
@@ -1300,9 +1307,10 @@ fn evaluate(m: &Model, n: usize, k: usize, nthreads: usize, seed: u64) {
             }
         });
         println!(
-            "  niv {level} │ NLL/tok {:.3} │ glouton : {:.0}% valide, {:.0}% exact │ échantillons : {:.0}% valides, ≥1 sur {k} : {:.0}% │ uniforme : {:.0}% valides, ≥1 sur {k} : {:.0}%",
+            "  niv {level} │ NLL/tok {:.3} │ glouton : {:.0}% valide, {:.0}% ≥ vérité, gain {:+.2} nats │ échantillons : {:.0}% valides, ≥1 sur {k} : {:.0}% │ uniforme : {:.0}% valides, ≥1 sur {k} : {:.0}%",
             st.nll / st.ntok.max(1) as f64,
-            pct(st.g_valid, st.n), pct(st.g_exact, st.n),
+            pct(st.g_valid, st.n), pct(st.g_better, st.n),
+            st.g_gain / st.g_valid.max(1) as f64,
             pct(st.s_valid, st.n * k), pct(st.s_any, st.n),
             pct(st.u_valid, st.n * k), pct(st.u_any, st.n)
         );
@@ -1575,9 +1583,12 @@ fn demo(m: &Model, seed: u64, k: usize) {
         let outs: Vec<String> = r.outs.iter().map(|(p, rhs)| format!("{:.2}:{}", p, show_pat(rhs))).collect();
         println!("règle       : {} -> {}", show_pat(&r.lhs), outs.join(" | "));
     }
-    let truth = likelihood(&mut ep.ar, &ep.rules, ep.h, ep.o, ep.kmax);
+    let truth = likelihood(&mut ep.ar, &ep.rules, ep.h, ep.o, LMAX); // même échelle que les candidats
     println!("observation : {}", ep.ar.show(ep.o));
-    println!("cause vraie : {}   (P(obs|cause) = {:.4}, ≤ {} pas)", ep.ar.show(ep.h), truth, ep.kmax);
+    println!(
+        "cause vraie : {}   (P(obs|cause) = {:.4}, échelle ≤ {} pas ; tirée en ≤ {})",
+        ep.ar.show(ep.h), truth, LMAX, ep.kmax
+    );
     let (base, first) = prefill(m, &ep.toks[..ep.plen]);
     for i in 0..=k {
         let temp = if i == 0 { 0.0 } else { 1.0 };
@@ -1586,7 +1597,16 @@ fn demo(m: &Model, seed: u64, k: usize) {
             Some(id) => {
                 let l = likelihood(&mut ep.ar, &ep.rules, id, ep.o, LMAX);
                 let tag = if i == 0 { "glouton    " } else { "échantillon" };
-                println!("{} : {}   P(obs|cause) = {:.4}", tag, ep.ar.show(id), l);
+                let vs = if id == ep.h {
+                    "= vérité"
+                } else if l <= 0.0 {
+                    "invalide"
+                } else if l >= truth * (1.0 - 1e-9) {
+                    "≥ vérité"
+                } else {
+                    "< vérité"
+                };
+                println!("{} : {}   P(obs|cause) = {:.4}   {}", tag, ep.ar.show(id), l, vs);
             }
             None => println!("(cause mal formée)"),
         }
