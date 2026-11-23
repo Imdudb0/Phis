@@ -6,3 +6,4 @@ pub mod phi;
 pub mod net;
 pub mod search;
 pub mod explain;
+pub mod model;
