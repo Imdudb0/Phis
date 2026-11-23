@@ -1,1347 +1,1464 @@
-use std::cmp::Ordering;
+#![forbid(unsafe_code)]
+
+use std::collections::{HashMap, HashSet};
 use std::env;
-use std::error::Error;
 use std::f32::consts::PI;
-use std::fs;
-use std::path::Path;
-
-type Res<T> = Result<T, Box<dyn Error>>;
-
-const N: usize = 64;
-const REGIONS: usize = 4;
-const SETTLING: usize = 12;
-const MAGIC: &[u8] = b"PHISHARP";
-const VERSION: u32 = 1;
-const LN_256: f32 = 256.0_f32.ln();
-
-/* ------------------------------------------------------------------------- */
-/* Aléatoire interne                                                         */
-/* ------------------------------------------------------------------------- */
-
-#[derive(Clone)]
+const NV: usize = 4; 
+const NS: usize = 12; 
+const T_BOS: usize = 0;
+const T_SIG: usize = 1;
+const T_RULE: usize = 2;
+const T_ARROW: usize = 3;
+const T_BAR: usize = 4;
+const T_OBS: usize = 5;
+const T_HYP: usize = 6;
+const T_END: usize = 7;
+const T_LP: usize = 8;
+const T_RP: usize = 9;
+const T_P: usize = 10; 
+const T_AR: usize = 14; 
+const T_VAR: usize = 18; 
+const T_SYM: usize = 22; 
+const VOCAB: usize = T_SYM + NS;
+const LMAX: usize = 4; 
+const HMAX: usize = 12; 
+const OMAX: usize = 20; 
+const MAXT: usize = 256; 
+const MAXH: usize = 48; 
 struct Rng(u64);
-
 impl Rng {
-    fn new(seed: u64) -> Self {
-        Self(seed.max(1))
+    fn new(seed: u64) -> Rng {
+        let mut r = Rng(seed.wrapping_mul(0x2545_F491_4F6C_DD1D) ^ 0xDEAD_BEEF_CAFE_F00D);
+        r.next_u64();
+        r
     }
-
-    fn next(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x >> 12;
-        x ^= x << 25;
-        x ^= x >> 27;
-        self.0 = x;
-        x.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
     }
-
-    fn unit(&mut self) -> f32 {
-        ((self.next() >> 40) as f32) / ((1_u32 << 24) as f32)
+    fn unif(&mut self) -> f32 {
+        (self.next_u64() >> 40) as f32 / 16_777_216.0
     }
-
-    fn signed(&mut self) -> f32 {
-        self.unit() * 2.0 - 1.0
+    fn below(&mut self, n: usize) -> usize {
+        (self.next_u64() % n as u64) as usize
     }
-
-    fn usize(&mut self, n: usize) -> usize {
-        (self.next() % n.max(1) as u64) as usize
+    fn chance(&mut self, p: f32) -> bool {
+        self.unif() < p
     }
-
-    fn bool(&mut self, p: f32) -> bool {
-        self.unit() < p
+    fn normal(&mut self) -> f32 {
+        let u1 = self.unif().max(1e-7);
+        let u2 = self.unif();
+        (-2.0 * u1.ln()).sqrt() * (2.0 * PI * u2).cos()
     }
 }
-
-/* ------------------------------------------------------------------------- */
-/* Utilitaires vectoriels                                                    */
-/* ------------------------------------------------------------------------- */
-
-fn dot(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| x * y).sum()
+type Id = u32;
+type Bind = [Option<Id>; NV];
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct Node {
+    sym: usize,
+    kids: Vec<Id>,
 }
-
-fn norm(a: &[f32]) -> f32 {
-    dot(a, a).sqrt().max(1.0e-8)
+#[derive(Clone, PartialEq)]
+enum Pat {
+    Var(u8),
+    App(usize, Vec<Pat>),
 }
-
-fn cosine(a: &[f32], b: &[f32]) -> f32 {
-    dot(a, b) / (norm(a) * norm(b))
+struct Rule {
+    lhs: Pat,
+    outs: Vec<(f32, Pat)>, 
 }
-
-fn distance(a: &[f32], b: &[f32]) -> f32 {
-    a.iter()
-        .zip(b)
-        .map(|(x, y)| (x - y).abs())
-        .sum::<f32>()
-        / a.len() as f32
+struct Arena {
+    nodes: Vec<Node>,
+    tsize: Vec<u32>, 
+    map: HashMap<Node, Id>,
 }
-
-fn softmax(logits: &mut [f32]) {
-    let m = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let mut sum = 0.0;
-
-    for x in logits.iter_mut() {
-        *x = (*x - m).exp();
-        sum += *x;
+impl Arena {
+    fn new() -> Arena {
+        Arena { nodes: Vec::new(), tsize: Vec::new(), map: HashMap::new() }
     }
-
-    for x in logits {
-        *x /= sum.max(1.0e-12);
+    fn mk(&mut self, sym: usize, kids: Vec<Id>) -> Id {
+        let n = Node { sym, kids };
+        if let Some(&id) = self.map.get(&n) {
+            return id;
+        }
+        let id = self.nodes.len() as Id;
+        let mut sz = 1u32;
+        for &k in &n.kids {
+            sz = sz.saturating_add(self.tsize[k as usize]);
+        }
+        self.tsize.push(sz);
+        self.nodes.push(n.clone());
+        self.map.insert(n, id);
+        id
+    }
+    fn size(&self, id: Id) -> usize {
+        self.tsize[id as usize] as usize
+    }
+    fn matches(&self, p: &Pat, id: Id, b: &mut Bind) -> bool {
+        match p {
+            Pat::Var(v) => {
+                let v = *v as usize;
+                let cur = b[v];
+                match cur {
+                    Some(x) => x == id,
+                    None => {
+                        b[v] = Some(id);
+                        true
+                    }
+                }
+            }
+            Pat::App(s, ps) => {
+                let n = &self.nodes[id as usize];
+                if n.sym != *s || n.kids.len() != ps.len() {
+                    return false;
+                }
+                for (q, &k) in ps.iter().zip(n.kids.iter()) {
+                    if !self.matches(q, k, b) {
+                        return false;
+                    }
+                }
+                true
+            }
+        }
+    }
+    fn inst(&mut self, p: &Pat, b: &Bind) -> Id {
+        match p {
+            Pat::Var(v) => b[*v as usize].expect("variable libre dans un membre droit"),
+            Pat::App(s, ps) => {
+                let mut kids = Vec::with_capacity(ps.len());
+                for q in ps {
+                    kids.push(self.inst(q, b));
+                }
+                self.mk(*s, kids)
+            }
+        }
+    }
+    fn reach(&self, root: Id) -> Vec<Id> {
+        let mut seen: HashSet<Id> = HashSet::new();
+        let mut out = Vec::new();
+        let mut st = vec![root];
+        while let Some(i) = st.pop() {
+            if !seen.insert(i) {
+                continue;
+            }
+            out.push(i);
+            st.extend(self.nodes[i as usize].kids.iter().copied());
+        }
+        out
+    }
+    fn redexes(&self, root: Id, rules: &[Rule]) -> Vec<(Id, usize, Bind)> {
+        let mut out = Vec::new();
+        let mut ids = self.reach(root);
+        ids.sort_unstable();
+        for id in ids {
+            for (ri, r) in rules.iter().enumerate() {
+                let mut b: Bind = [None; NV];
+                if self.matches(&r.lhs, id, &mut b) {
+                    out.push((id, ri, b));
+                }
+            }
+        }
+        out
+    }
+    fn replace(&mut self, root: Id, target: Id, rep: Id, memo: &mut HashMap<Id, Id>) -> Id {
+        if root == target {
+            return rep;
+        }
+        if let Some(&m) = memo.get(&root) {
+            return m;
+        }
+        let n = self.nodes[root as usize].clone();
+        let mut kids = Vec::with_capacity(n.kids.len());
+        let mut changed = false;
+        for &k in &n.kids {
+            let nk = self.replace(k, target, rep, memo);
+            changed |= nk != k;
+            kids.push(nk);
+        }
+        let r = if changed { self.mk(n.sym, kids) } else { root };
+        memo.insert(root, r);
+        r
+    }
+    fn step(&mut self, root: Id, rules: &[Rule], rng: &mut Rng) -> Option<Id> {
+        let rx = self.redexes(root, rules);
+        if rx.is_empty() {
+            return None;
+        }
+        let (node, ri, b) = rx[rng.below(rx.len())];
+        let outs = &rules[ri].outs;
+        let mut u = rng.unif();
+        let mut chosen = &outs[outs.len() - 1].1;
+        for (p, rhs) in outs {
+            if u < *p {
+                chosen = rhs;
+                break;
+            }
+            u -= *p;
+        }
+        let rep = self.inst(chosen, &b);
+        Some(self.replace(root, node, rep, &mut HashMap::new()))
+    }
+    fn ser(&self, id: Id, out: &mut Vec<usize>) {
+        let n = &self.nodes[id as usize];
+        out.push(T_SYM + n.sym);
+        if !n.kids.is_empty() {
+            out.push(T_LP);
+            for &k in &n.kids {
+                self.ser(k, out);
+            }
+            out.push(T_RP);
+        }
+    }
+    fn show(&self, id: Id) -> String {
+        let n = &self.nodes[id as usize];
+        if n.kids.is_empty() {
+            return format!("s{}", n.sym);
+        }
+        let ks: Vec<String> = n.kids.iter().map(|&k| self.show(k)).collect();
+        format!("s{}({})", n.sym, ks.join(","))
     }
 }
-
-fn full_mask() -> u64 {
-    if N == 64 {
-        u64::MAX
+fn ser_pat(p: &Pat, out: &mut Vec<usize>) {
+    match p {
+        Pat::Var(v) => out.push(T_VAR + *v as usize),
+        Pat::App(s, ps) => {
+            out.push(T_SYM + *s);
+            if !ps.is_empty() {
+                out.push(T_LP);
+                for q in ps {
+                    ser_pat(q, out);
+                }
+                out.push(T_RP);
+            }
+        }
+    }
+}
+fn show_pat(p: &Pat) -> String {
+    match p {
+        Pat::Var(v) => format!("X{}", v),
+        Pat::App(s, ps) if ps.is_empty() => format!("s{}", s),
+        Pat::App(s, ps) => {
+            let ks: Vec<String> = ps.iter().map(show_pat).collect();
+            format!("s{}({})", s, ks.join(","))
+        }
+    }
+}
+fn pat_size(p: &Pat) -> usize {
+    match p {
+        Pat::Var(_) => 1,
+        Pat::App(_, ps) => 1 + ps.iter().map(pat_size).sum::<usize>(),
+    }
+}
+fn pat_vars(p: &Pat, seen: &mut [bool; NV]) {
+    match p {
+        Pat::Var(v) => seen[*v as usize] = true,
+        Pat::App(_, ps) => {
+            for q in ps {
+                pat_vars(q, seen);
+            }
+        }
+    }
+}
+struct Sig {
+    syms: Vec<usize>,
+    arity: [usize; NS],
+    has: [bool; NS],
+}
+fn random_sig(rng: &mut Rng) -> Sig {
+    let n = 5 + rng.below(4); 
+    let mut ids: Vec<usize> = (0..NS).collect();
+    for i in (1..NS).rev() {
+        let j = rng.below(i + 1);
+        ids.swap(i, j);
+    }
+    ids.truncate(n);
+        let ncst = 2 + rng.below(2); 
+    let mut sig = Sig { syms: ids.clone(), arity: [0; NS], has: [false; NS] };
+    for (i, &s) in ids.iter().enumerate() {
+        sig.has[s] = true;
+        sig.arity[s] = if i < ncst {
+            0
+        } else {
+            let u = rng.unif();
+            if u < 0.3 { 1 } else if u < 0.9 { 2 } else { 3 }
+        };
+    }
+    sig.syms.sort_unstable();
+    sig
+}
+fn pick_sym(rng: &mut Rng, sig: &Sig, compound: bool) -> usize {
+    let c: Vec<usize> = sig.syms.iter().copied().filter(|&s| (sig.arity[s] > 0) == compound).collect();
+    c[rng.below(c.len())]
+}
+fn lhs_slot(rng: &mut Rng, sig: &Sig, depth: usize, nv: &mut usize) -> Pat {
+    if depth > 0 && rng.chance(0.3) {
+        let comp = rng.chance(0.8);
+        let s = pick_sym(rng, sig, comp);
+        let a = sig.arity[s];
+        let mut ks = Vec::with_capacity(a);
+        for _ in 0..a {
+            ks.push(lhs_slot(rng, sig, depth - 1, nv));
+        }
+        Pat::App(s, ks)
+    } else if *nv > 0 && (*nv >= NV || rng.chance(0.08)) {
+        Pat::Var(rng.below(*nv) as u8)
     } else {
-        (1_u64 << N) - 1
+        *nv += 1;
+        Pat::Var((*nv - 1) as u8)
     }
 }
-
-fn across(mask: u64, i: usize, j: usize) -> bool {
-    (((mask >> i) ^ (mask >> j)) & 1) != 0
+fn rand_lhs(rng: &mut Rng, sig: &Sig) -> (Pat, usize) {
+    loop {
+        let mut nv = 0usize;
+        let p = if rng.chance(0.1) {
+            Pat::App(pick_sym(rng, sig, false), Vec::new())
+        } else {
+            let s = pick_sym(rng, sig, true);
+            let mut ks = Vec::new();
+            for _ in 0..sig.arity[s] {
+                ks.push(lhs_slot(rng, sig, 1, &mut nv));
+            }
+            Pat::App(s, ks)
+        };
+        if pat_size(&p) <= 7 {
+            return (p, nv);
+        }
+    }
 }
-
-/* ------------------------------------------------------------------------- */
-/* Dictionnaire                                                              */
-/* ------------------------------------------------------------------------- */
-
-#[derive(Clone)]
-struct Entry {
-    term: String,
-    definition: String,
+fn rand_rhs(rng: &mut Rng, sig: &Sig, depth: usize, nv: usize, unused: &mut Vec<usize>) -> Pat {
+    let pc = if depth == 2 { 0.9 } else { 0.45 };
+    if depth > 0 && rng.chance(pc) {
+        let s = pick_sym(rng, sig, true);
+        let mut ks = Vec::new();
+        for _ in 0..sig.arity[s] {
+            ks.push(rand_rhs(rng, sig, depth - 1, nv, unused));
+        }
+        Pat::App(s, ks)
+    } else if !unused.is_empty() && rng.chance(0.85) {
+        let i = rng.below(unused.len());
+        Pat::Var(unused.swap_remove(i) as u8)
+    } else if nv > 0 && rng.chance(0.4) {
+        Pat::Var(rng.below(nv) as u8)
+    } else {
+        Pat::App(pick_sym(rng, sig, false), Vec::new())
+    }
 }
-
-fn load_dictionary(path: &str) -> Res<Vec<Entry>> {
-    let text = fs::read_to_string(path)?;
-    let mut entries = Vec::new();
-
-    for (line_no, raw) in text.lines().enumerate() {
-        let line = raw.trim();
-
-        if line.is_empty() || line.starts_with('#') {
+fn random_rules(rng: &mut Rng, sig: &Sig, nr: usize) -> Vec<Rule> {
+    let mut rules: Vec<Rule> = Vec::new();
+    while rules.len() < nr {
+        let (lhs, nv) = rand_lhs(rng, sig);
+        let n_out = if rng.chance(0.35) { 2 } else { 1 };
+        let mut rhss: Vec<Pat> = Vec::new();
+        let mut tries = 0;
+        while rhss.len() < n_out && tries < 50 {
+            tries += 1;
+            let mut unused: Vec<usize> = (0..nv).collect();
+            let rhs = rand_rhs(rng, sig, 2, nv, &mut unused);
+            if pat_size(&rhs) <= 8 && rhs != lhs && !rhss.contains(&rhs) {
+                rhss.push(rhs);
+            }
+        }
+        if rhss.is_empty() {
             continue;
         }
-
-        let pair = line
-            .split_once('\t')
-            .or_else(|| line.split_once(" ::= "))
-            .or_else(|| line.split_once(" = "));
-
-        let Some((term, definition)) = pair else {
-            return Err(format!(
-                "{}:{} : entrée attendue sous la forme terme<TAB>définition",
-                path,
-                line_no + 1
-            )
-            .into());
+        let probs: Vec<f32> = if rhss.len() == 1 {
+            vec![1.0]
+        } else {
+            let p = [0.25f32, 0.5, 0.75][rng.below(3)];
+            vec![p, 1.0 - p]
         };
-
-        if term.trim().is_empty() || definition.trim().is_empty() {
-            return Err(format!("{}:{} : entrée vide", path, line_no + 1).into());
-        }
-
-        entries.push(Entry {
-            term: term.trim().to_string(),
-            definition: definition.trim().to_string(),
-        });
+        rules.push(Rule { lhs, outs: probs.into_iter().zip(rhss).collect() });
     }
-
-    if entries.is_empty() {
-        return Err("dictionnaire vide".into());
-    }
-
-    Ok(entries)
+    rules
 }
-
-/* ------------------------------------------------------------------------- */
-/* Graphe connexionniste non réciproque                                      */
-/* ------------------------------------------------------------------------- */
-
-#[derive(Clone)]
-struct Graph {
-    /// W : transition causale dirigée.
-    w: Vec<f32>,
-
-    /// U : seconde transition dirigée, apprise indépendamment de W.
-    /// W[i,j] n'est jamais lié à W[j,i], U[i,j] ou U[j,i].
-    u: Vec<f32>,
-
-    bias: Vec<f32>,
-
-    /// Projection octet -> état causal.
-    encoder: Vec<f32>,
-
-    /// Régénération état -> octet. Elle ne sert jamais de modèle de langue.
-    decoder: Vec<f32>,
+fn gen_term(ar: &mut Arena, rng: &mut Rng, sig: &Sig, rules: &[Rule], depth: usize) -> Id {
+    if depth == 0 || rng.chance(0.15) {
+        let c = pick_sym(rng, sig, false);
+        return ar.mk(c, Vec::new());
+    }
+    if rng.chance(0.4) {
+        let r = &rules[rng.below(rules.len())];
+        let mut seen = [false; NV];
+        pat_vars(&r.lhs, &mut seen);
+        let mut b: Bind = [None; NV];
+        for v in 0..NV {
+            if seen[v] {
+                b[v] = Some(gen_term(ar, rng, sig, rules, depth - 1));
+            }
+        }
+        return ar.inst(&r.lhs, &b);
+    }
+    let f = pick_sym(rng, sig, true);
+    let mut ks = Vec::new();
+    for _ in 0..sig.arity[f] {
+        ks.push(gen_term(ar, rng, sig, rules, depth - 1));
+    }
+    ar.mk(f, ks)
 }
-
-impl Graph {
-    fn new(rng: &mut Rng) -> Self {
-        let mut w = vec![0.0; N * N];
-        let mut u = vec![0.0; N * N];
-        let mut encoder = vec![0.0; 256 * N];
-        let mut decoder = vec![0.0; N * 256];
-
-        for i in 0..N {
-            for j in 0..N {
-                w[i * N + j] = rng.signed() * 0.075;
-                u[i * N + j] = rng.signed() * 0.045;
-            }
-        }
-
-        for x in &mut encoder {
-            *x = rng.signed() * 0.18;
-        }
-
-        for x in &mut decoder {
-            *x = rng.signed() * 0.012;
-        }
-
-        Self {
-            w,
-            u,
-            bias: vec![0.0; N],
-            encoder,
-            decoder,
-        }
-    }
-
-    fn step(&self, x: &[f32], z: &[f32], cut: Option<u64>) -> Vec<f32> {
-        let mut y = vec![0.0; N];
-
-        for i in 0..N {
-            let mut a = self.bias[i] + 0.22 * z[i];
-
-            for j in 0..N {
-                if cut.is_some_and(|m| across(m, i, j)) {
-                    continue;
-                }
-
-                let k = i * N + j;
-                a += self.w[k] * x[j];
-                a += self.u[k] * x[j] * (0.5 + 0.5 * x[i]);
-            }
-
-            y[i] = a.tanh();
-        }
-
-        y
-    }
-
-    fn settle(&self, z: &[f32], cut: Option<u64>) -> Vec<f32> {
-        let mut x: Vec<f32> = z.iter().map(|v| (0.35 * v).tanh()).collect();
-
-        for _ in 0..SETTLING {
-            let y = self.step(&x, z, cut);
-
-            for i in 0..N {
-                x[i] = 0.42 * x[i] + 0.58 * y[i];
-            }
-        }
-
-        x
-    }
-
-    /// L'alphabet est toujours celui des octets présents dans E.
-    fn encode(&self, effect: &[u8]) -> Vec<f32> {
-        let mut z = vec![0.0; N];
-        let mut total = 0.0;
-
-        for (p, &byte) in effect.iter().enumerate() {
-            let temporal = 1.0 / (1.0 + p as f32 / 48.0);
-            total += temporal;
-
-            for i in 0..N {
-                let phase = ((p + 1) * (i + 1)) as f32 * 0.00091;
-                let order = 1.0 + 0.17 * phase.sin();
-                z[i] += temporal * order * self.encoder[byte as usize * N + i];
-            }
-        }
-
-        if total > 0.0 {
-            for v in &mut z {
-                *v /= total;
-            }
-        }
-
-        z
-    }
-
-    fn state_at(x: &[f32], position: usize) -> Vec<f32> {
-        let mut s = x.to_vec();
-
-        for i in 0..N {
-            let t = (position + 1) as f32;
-            let f = (i + 1) as f32;
-            s[i] += 0.055 * (t * f * 0.0017).sin();
-            s[i] += 0.035 * (t * (N - i) as f32 * 0.0023).cos();
-        }
-
-        s
-    }
-
-    fn distribution(&self, x: &[f32], position: usize) -> [f32; 256] {
-        let s = Self::state_at(x, position);
-        let mut logits = [0.0_f32; 256];
-
-        for byte in 0..256 {
-            logits[byte] = dot(
-                &self.decoder[byte * N..(byte + 1) * N],
-                &s,
-            ) * 0.7;
-        }
-
-        softmax(&mut logits);
-        logits
-    }
-
-    fn loss(&self, effect: &[u8], x: &[f32]) -> f32 {
-        if effect.is_empty() {
-            return 0.0;
-        }
-
-        effect
-            .iter()
-            .enumerate()
-            .map(|(p, &byte)| {
-                let q = self.distribution(x, p);
-                -q[byte as usize].max(1.0e-12).ln()
-            })
-            .sum::<f32>()
-            / effect.len() as f32
-    }
-
-    fn effect_repertoire(&self, effect: &[u8], x: &[f32]) -> [f32; 256] {
-        let mut mean = [0.0_f32; 256];
-
-        if effect.is_empty() {
-            mean.fill(1.0 / 256.0);
-            return mean;
-        }
-
-        let count = effect.len().min(16);
-        let stride = (effect.len() / count).max(1);
-        let mut used = 0;
-
-        for p in (0..effect.len()).step_by(stride).take(count) {
-            let q = self.distribution(x, p);
-
-            for b in 0..256 {
-                mean[b] += q[b];
-            }
-
-            used += 1;
-        }
-
-        for q in &mut mean {
-            *q /= used.max(1) as f32;
-        }
-
-        mean
-    }
-
-    /// Descente sur la seule régénération de E, puis consolidation des arêtes
-    /// traversant la partition minimale. Aucune cause cachée n'intervient.
-    fn learn(&mut self, effect: &[u8], h: &Candidate, lr: f32) {
-        if effect.is_empty() {
-            return;
-        }
-
-        let positions = effect.len().min(32);
-        let stride = (effect.len() / positions).max(1);
-        let scale = 1.0 / positions as f32;
-        let mut gx = vec![0.0_f32; N];
-
-        for p in (0..effect.len()).step_by(stride).take(positions) {
-            let target = effect[p] as usize;
-            let s = Self::state_at(&h.x, p);
-            let q = self.distribution(&h.x, p);
-
-            for byte in 0..256 {
-                let error = (q[byte] - f32::from(byte == target)) * scale;
-
-                for i in 0..N {
-                    let k = byte * N + i;
-                    gx[i] += self.decoder[k] * error;
-                    self.decoder[k] -= lr * error * s[i];
-                    self.decoder[k] = self.decoder[k].clamp(-3.0, 3.0);
-                }
-            }
-        }
-
-        let y = self.step(&h.x, &h.z, None);
-
-        for i in 0..N {
-            let gp = gx[i] * (1.0 - y[i] * y[i]);
-            self.bias[i] -= lr * 0.15 * gp;
-
-            for j in 0..N {
-                let k = i * N + j;
-                let cross = across(h.cut, i, j);
-
-                self.w[k] -= lr * 0.08 * gp * h.x[j];
-                self.u[k] -= lr * 0.04 * gp * h.x[j] * (0.5 + 0.5 * h.x[i]);
-
-                if cross {
-                    let integration = lr * 0.0025 * h.phi * h.x[i] * h.x[j];
-                    self.w[k] += integration;
-                    self.u[k] -= integration * 0.37;
-                }
-
-                self.w[k] = self.w[k].clamp(-1.5, 1.5);
-                self.u[k] = self.u[k].clamp(-1.5, 1.5);
-            }
-        }
-
-        for &byte in effect {
-            for i in 0..N {
-                let k = byte as usize * N + i;
-                let pull = lr * 0.0008 * (h.x[i] - self.encoder[k]);
-                self.encoder[k] += pull;
-                self.encoder[k] = self.encoder[k].clamp(-2.0, 2.0);
-            }
-        }
-    }
+struct Episode {
+    sig: Sig,
+    rules: Vec<Rule>,
+    ar: Arena,
+    h: Id,       
+    o: Id,       
+    kmax: usize, 
+    toks: Vec<usize>,
+    plen: usize, 
 }
-
-/* ------------------------------------------------------------------------- */
-/* φ_sharp                                                                   */
-/* ------------------------------------------------------------------------- */
-
-#[derive(Clone, Copy)]
-struct Phi {
-    value: f32,
-    cut: u64,
-    cause: f32,
-    effect: f32,
-    integration: f32,
+fn ptok(p: f32) -> usize {
+    if p > 0.99 { 3 } else if p > 0.7 { 2 } else if p > 0.4 { 1 } else { 0 }
 }
-
-fn partitions() -> Vec<u64> {
-    let mut result = vec![
-        0xaaaa_aaaa_aaaa_aaaa,
-        0xcccc_cccc_cccc_cccc,
-        0xf0f0_f0f0_f0f0_f0f0,
-        0xff00_ff00_ff00_ff00,
-        0xffff_0000_ffff_0000,
-        0x0000_0000_ffff_ffff,
-    ];
-
-    for k in 0..10_u64 {
-        let mut mask = 0_u64;
-
-        for i in 0..N {
-            let bit = ((i as u64 * 17 + k * 29 + (i as u64 / 7) * 11) % 23) < 11;
-            if bit {
-                mask |= 1_u64 << i;
-            }
-        }
-
-        result.push(mask & full_mask());
+fn encode(sig: &Sig, rules: &[Rule], ar: &Arena, o: Id, h: Option<Id>) -> (Vec<usize>, usize) {
+    let mut t = vec![T_BOS, T_SIG];
+    for &s in &sig.syms {
+        t.push(T_SYM + s);
+        t.push(T_AR + sig.arity[s]);
     }
-
-    result.retain(|&m| m != 0 && m != full_mask());
-    result
-}
-
-impl Graph {
-    fn phi_sharp(&self, effect: &[u8], z: &[f32], x: &[f32]) -> Phi {
-        let whole = self.step(x, z, None);
-        let q_whole = self.effect_repertoire(effect, x);
-
-        let loss = self.loss(effect, x);
-        let effect_info = (1.0 - loss / LN_256).clamp(0.0, 1.0);
-
-        let uniform = 1.0 / 256.0;
-        let repertoire_info = q_whole
-            .iter()
-            .map(|q| (q - uniform).abs())
-            .sum::<f32>()
-            * 0.5;
-
-        let effect_power = (0.72 * effect_info + 0.28 * repertoire_info).clamp(0.0, 1.0);
-
-        let mut cause_power = 0.0;
-
-        for region in 0..REGIONS {
-            let mut perturbed = x.clone();
-
-            for i in 0..N {
-                if i * REGIONS / N == region {
-                    perturbed[i] = -perturbed[i];
-                }
+    for r in rules {
+        t.push(T_RULE);
+        ser_pat(&r.lhs, &mut t);
+        t.push(T_ARROW);
+        for (i, (p, rhs)) in r.outs.iter().enumerate() {
+            if i > 0 {
+                t.push(T_BAR);
             }
-
-            let counterfactual = self.step(&perturbed, z, None);
-            cause_power += distance(&whole, &counterfactual);
-        }
-
-        cause_power = (cause_power / REGIONS as f32 * 2.0).tanh();
-
-        let mut mip = f32::INFINITY;
-        let mut min_cut = 0;
-
-        for mask in partitions() {
-            let partitioned = self.step(x, z, Some(mask));
-            let cause_distance = distance(&whole, &partitioned);
-            let q_partitioned = self.effect_repertoire(effect, &partitioned);
-
-            let effect_distance = q_whole
-                .iter()
-                .zip(q_partitioned.iter())
-                .map(|(a, b)| (a - b).abs())
-                .sum::<f32>()
-                * 0.5;
-
-            let integrated = (cause_distance * 1.8 + effect_distance).clamp(0.0, 1.0);
-
-            if integrated < mip {
-                mip = integrated;
-                min_cut = mask;
-            }
-        }
-
-        if !mip.is_finite() {
-            mip = 0.0;
-        }
-
-        let value = (cause_power * effect_power * mip)
-            .max(0.0)
-            .cbrt();
-
-        Phi {
-            value,
-            cut: min_cut,
-            cause: cause_power,
-            effect: effect_power,
-            integration: mip,
+            t.push(T_P + ptok(*p));
+            ser_pat(rhs, &mut t);
         }
     }
-}
-
-/* ------------------------------------------------------------------------- */
-/* Recherche abductive                                                       */
-/* ------------------------------------------------------------------------- */
-
-#[derive(Clone)]
-struct Candidate {
-    z: Vec<f32>,
-    x: Vec<f32>,
-    loss: f32,
-    phi: f32,
-    cut: u64,
-    score: f32,
-}
-
-struct Abduction {
-    best: Candidate,
-    evaluations: usize,
-    phi: Phi,
-}
-
-impl Graph {
-    fn evaluate(&self, effect: &[u8], z: Vec<f32>) -> Candidate {
-        let x = self.settle(&z, None);
-        let loss = self.loss(effect, &x);
-        let phi = self.phi_sharp(effect, &z, &x);
-        let regeneration = (1.0 - loss / LN_256).clamp(-1.0, 1.0);
-
-        Candidate {
-            score: 3.4 * phi.value + regeneration - 0.035 * loss,
-            z,
-            x,
-            loss,
-            phi: phi.value,
-            cut: phi.cut,
-        }
+    t.push(T_OBS);
+    ar.ser(o, &mut t);
+    t.push(T_HYP);
+    let plen = t.len();
+    if let Some(h) = h {
+        ar.ser(h, &mut t);
+        t.push(T_END);
     }
-
-    fn mutate(z: &[f32], rng: &mut Rng, sigma: f32) -> Vec<f32> {
-        z.iter()
-            .map(|v| {
-                let a = rng.signed();
-                let b = rng.signed();
-                (v + sigma * (a + b) * 0.5).clamp(-3.0, 3.0)
-            })
-            .collect()
-    }
-
-    fn abduce(&self, effect: &[u8], entries: &[Entry], budget: usize, rng: &mut Rng) -> Abduction {
-        let budget = budget.max(1);
-        let base = self.encode(effect);
-
-        let mut projected: Vec<(f32, usize)> = entries
-            .iter()
-            .enumerate()
-            .map(|(i, entry)| {
-                let bytes = format!("{} {}", entry.term, entry.definition);
-                (cosine(&base, &self.encode(bytes.as_bytes())), i)
-            })
-            .collect();
-
-        projected.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
-
-        let mut population = vec![base.clone()];
-
-        for &(_, i) in projected.iter().take(5) {
-            let bytes = format!("{} {}", entries[i].term, entries[i].definition);
-            let projection = self.encode(bytes.as_bytes());
-            let mut seed = base.clone();
-
-            for k in 0..N {
-                seed[k] = 0.52 * seed[k] + 0.48 * projection[k];
-            }
-
-            population.push(seed);
+    (t, plen)
+}
+fn make_episode(rng: &mut Rng, level: usize) -> Episode {
+    loop {
+        let sig = random_sig(rng);
+        let nr = 1 + rng.below((level + 1).min(4));
+        let rules = random_rules(rng, &sig, nr);
+        let mut ar = Arena::new();
+        let depth = if level >= 3 { 3 } else { 2 };
+        let h = gen_term(&mut ar, rng, &sig, &rules, depth);
+        if ar.size(h) > HMAX {
+            continue;
         }
-
-        while population.len() < 12 {
-            population.push(Self::mutate(&base, rng, 0.32));
-        }
-
-        let mut evaluations = 0;
-        let mut best: Option<Candidate> = None;
-        let mut generation = 0;
-
-        while evaluations < budget {
-            let mut scored = Vec::new();
-
-            for z in population {
-                if evaluations >= budget {
+        let k = 1 + rng.below(level);
+        let mut o = h;
+        let mut ok = true;
+        for _ in 0..k {
+            match ar.step(o, &rules, rng) {
+                Some(n) if ar.size(n) <= OMAX => o = n,
+                _ => {
+                    ok = false;
                     break;
                 }
-
-                let candidate = self.evaluate(effect, z);
-                evaluations += 1;
-
-                if best
-                    .as_ref()
-                    .is_none_or(|b| candidate.score > b.score)
-                {
-                    best = Some(candidate.clone());
-                }
-
-                scored.push(candidate);
-            }
-
-            scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
-
-            let elites: Vec<Candidate> = scored.into_iter().take(6).collect();
-            let mut next: Vec<Vec<f32>> = elites.iter().map(|c| c.z.clone()).collect();
-            let sigma = 0.34 / (1.0 + generation as f32 * 0.09);
-
-            while next.len() < 14 && !elites.is_empty() {
-                let parent = &elites[rng.usize(elites.len())].z;
-                next.push(Self::mutate(parent, rng, sigma));
-            }
-
-            population = next;
-            generation += 1;
-        }
-
-        let best = best.expect("au moins une hypothèse");
-        let phi = self.phi_sharp(effect, &best.z, &best.x);
-
-        Abduction {
-            best,
-            evaluations,
-            phi,
-        }
-    }
-}
-
-/* ------------------------------------------------------------------------- */
-/* Abstraction méta-relationnelle et projection référentielle                */
-/* ------------------------------------------------------------------------- */
-
-fn relational_signature(x: &[f32]) -> Vec<f32> {
-    let mut signature = vec![0.0; REGIONS * 8];
-
-    for i in 0..N {
-        let r = i * REGIONS / N;
-        signature[r * 8] += x[i];
-        signature[r * 8 + 1] += x[i] * x[i];
-        signature[r * 8 + 2] += x[i].tanh();
-
-        let j = (i * 29 + 17) % N;
-        signature[r * 8 + 3] += x[i] * x[j];
-        signature[r * 8 + 4] += (x[i] - x[j]).abs();
-
-        let k = (i + 1) % N;
-        signature[r * 8 + 5] += x[i] * x[k];
-        signature[r * 8 + 6] += (x[i] + x[j]) * 0.5;
-        signature[r * 8 + 7] += (x[i] - x[j]).sin();
-    }
-
-    for chunk in signature.chunks_exact_mut(8) {
-        for value in chunk {
-            *value /= N as f32 / REGIONS as f32;
-        }
-    }
-
-    signature
-}
-
-#[derive(Clone)]
-struct Referent {
-    index: usize,
-    score: f32,
-    direct: f32,
-    relational: f32,
-}
-
-fn project_referents(graph: &Graph, entries: &[Entry], x: &[f32]) -> Vec<Referent> {
-    let signature = relational_signature(x);
-    let mut result = Vec::new();
-
-    for (index, entry) in entries.iter().enumerate() {
-        let bytes = format!("{} {}", entry.term, entry.definition);
-        let z = graph.encode(bytes.as_bytes());
-        let projected = graph.settle(&z, None);
-
-        let direct = cosine(x, &projected);
-        let relational = cosine(&signature, &relational_signature(&projected));
-
-        let score = 0.38 * direct + 0.62 * relational;
-
-        result.push(Referent {
-            index,
-            score,
-            direct,
-            relational,
-        });
-    }
-
-    result.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
-    result
-}
-
-/* ------------------------------------------------------------------------- */
-/* Verbalisation maximale et résidu                                          */
-/* ------------------------------------------------------------------------- */
-
-fn residual(effect: &[u8], graph: &Graph, h: &Abduction, referents: &[Referent]) -> String {
-    let mut unclear: Vec<(f32, usize)> = effect
-        .iter()
-        .enumerate()
-        .map(|(p, &byte)| {
-            let q = graph.distribution(&h.best.x, p);
-            (-q[byte as usize].max(1.0e-12).ln(), p)
-        })
-        .collect();
-
-    unclear.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
-
-    let mut parts = Vec::new();
-
-    if !unclear.is_empty() && unclear[0].0 > LN_256 * 0.55 {
-        let locations = unclear
-            .iter()
-            .take(8)
-            .map(|(_, p)| format!("octet {}={:02x}", p, effect[*p]))
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        parts.push(format!(
-            "une contrainte causale supplémentaire est requise autour de {}",
-            locations
-        ));
-    }
-
-    if h.phi.cause < 0.12 {
-        parts.push(
-            "plusieurs causes régionales restent interchangeables ; une variation observable de leurs conditions de production manque"
-                .to_string(),
-        );
-    }
-
-    if h.phi.integration < 0.025 {
-        parts.push(
-            "les relations entre les parties de perceived.eff sont sous-déterminées ; il manque une interaction ou un ordre observable"
-                .to_string(),
-        );
-    }
-
-    if referents
-        .first()
-        .is_none_or(|r| r.score < 0.12)
-    {
-        parts.push(
-            "aucun référent défini ne porte encore assez la cause globale ; une définition couvrant cette relation manque"
-                .to_string(),
-        );
-    }
-
-    if h.best.loss > LN_256 * 0.65 {
-        parts.push(
-            "la régénération laisse des effets sans cause commune ; des octets discriminants ou un contexte de production sont requis"
-                .to_string(),
-        );
-    }
-
-    if parts.is_empty() {
-        "aucun résidu régional saillant ; les contraintes présentes suffisent à la cause retenue".to_string()
-    } else {
-        parts.join(" ; ")
-    }
-}
-
-fn explain(
-    effect: &[u8],
-    model: &Model,
-    h: &Abduction,
-) -> (String, Vec<Referent>) {
-    let referents = project_referents(&model.graph, &model.entries, &h.best.x);
-    let best_score = referents.first().map_or(0.0, |r| r.score);
-
-    let selected: Vec<&Referent> = referents
-        .iter()
-        .filter(|r| r.score >= best_score - 0.085 && r.score > 0.015)
-        .collect();
-
-    let selected: Vec<&Referent> = if selected.is_empty() {
-        referents.iter().take(1).collect()
-    } else {
-        selected
-    };
-
-    let mut out = String::new();
-
-    out.push_str(&format!(
-        "La recherche abductive converge après {} évaluations causales : φ_sharp={:.6}, puissance de cause={:.6}, puissance d'effet={:.6}, intégration={:.6}, résidu de régénération={:.6}.\n\n",
-        h.evaluations,
-        h.phi.value,
-        h.phi.cause,
-        h.phi.effect,
-        h.phi.integration,
-        h.best.loss
-    ));
-
-    out.push_str("Sens découvert et élaboration maximale :\n");
-
-    for (rank, r) in selected.iter().enumerate() {
-        let entry = &model.entries[r.index];
-
-        out.push_str(&format!(
-            "{}. {} — {} [projection référentielle={:.4}, similarité d'état={:.4], abstraction méta-relationnelle={:.4}]\n",
-            rank + 1,
-            entry.term,
-            entry.definition,
-            r.score,
-            r.direct,
-            r.relational
-        ));
-    }
-
-    if selected.len() > 1 {
-        out.push_str("\nRelations supportées simultanément par la cause :\n");
-
-        for pair in selected.windows(2) {
-            let a = &model.entries[pair[0].index];
-            let b = &model.entries[pair[1].index];
-
-            let relation = if pair[0].relational >= pair[0].direct.abs() {
-                "partagent une organisation relationnelle indépendante de leurs mots"
-            } else {
-                "sont projetés dans deux aspects d'une même cause globale"
-            };
-
-            out.push_str(&format!("- {} et {} {}.\n", a.term, b.term, relation));
-        }
-    }
-
-    out.push_str(&format!(
-        "\nRésidu de perceived.eff : {}.\n",
-        residual(effect, &model.graph, h, &referents)
-    ));
-
-    (out, referents)
-}
-
-/* ------------------------------------------------------------------------- */
-/* PTGRS                                                                     */
-/* ------------------------------------------------------------------------- */
-
-#[derive(Clone)]
-enum Term {
-    Leaf(usize),
-    Cat(Box<Term>, Box<Term>),
-    Relation(u8, Box<Term>, Box<Term>),
-    Echo(Box<Term>),
-}
-
-impl Term {
-    fn show(&self, entries: &[Entry]) -> String {
-        match self {
-            Self::Leaf(i) => format!("Émettre({})", entries[*i].term),
-            Self::Cat(a, b) => format!("Composer({}, {})", a.show(entries), b.show(entries)),
-            Self::Relation(r, a, b) => format!(
-                "Relation{}({}, {})",
-                r,
-                a.show(entries),
-                b.show(entries)
-            ),
-            Self::Echo(a) => format!("Réitérer({})", a.show(entries)),
-        }
-    }
-}
-
-struct Ptgrs;
-
-impl Ptgrs {
-    fn sample(entries: &[Entry], rng: &mut Rng, depth: usize) -> Term {
-        if depth == 0 || rng.bool(0.46) {
-            return Term::Leaf(rng.usize(entries.len()));
-        }
-
-        match rng.usize(10) {
-            0..=4 => Term::Cat(
-                Box::new(Self::sample(entries, rng, depth - 1)),
-                Box::new(Self::sample(entries, rng, depth - 1)),
-            ),
-            5..=8 => Term::Relation(
-                rng.usize(4) as u8,
-                Box::new(Self::sample(entries, rng, depth - 1)),
-                Box::new(Self::sample(entries, rng, depth - 1)),
-            ),
-            _ => Term::Echo(Box::new(Self::sample(entries, rng, depth - 1))),
-        }
-    }
-
-    fn rewrite(term: &Term, entries: &[Entry], rng: &mut Rng, out: &mut String) {
-        match term {
-            Term::Leaf(i) => {
-                let entry = &entries[*i];
-
-                if rng.bool(0.76) {
-                    out.push_str(&entry.definition);
-                } else {
-                    out.push_str(&entry.term);
-                }
-            }
-
-            Term::Cat(a, b) => {
-                Self::rewrite(a, entries, rng, out);
-                out.push(' ');
-                Self::rewrite(b, entries, rng, out);
-            }
-
-            Term::Relation(kind, a, b) => {
-                const LINKS: [&str; 4] = [
-                    " qui ",
-                    " parce que ",
-                    " tandis que ",
-                    " dont le sens dépend de ",
-                ];
-
-                Self::rewrite(a, entries, rng, out);
-                out.push_str(LINKS[*kind as usize % LINKS.len()]);
-                Self::rewrite(b, entries, rng, out);
-            }
-
-            Term::Echo(a) => {
-                let mut local = String::new();
-                Self::rewrite(a, entries, rng, &mut local);
-                out.push_str(&local);
-
-                if !local.is_empty() {
-                    out.push_str(" ; ");
-                    out.push_str(local.trim());
-                }
             }
         }
-    }
-
-    /// La cause est retournée uniquement pour gen/eval. train la détruit
-    /// immédiatement et ne transmet que E au système.
-    fn generate(entries: &[Entry], rng: &mut Rng) -> (Vec<u8>, Term) {
-        let cause = Self::sample(entries, rng, 3);
-        let mut effect = String::new();
-        Self::rewrite(&cause, entries, rng, &mut effect);
-
-        while effect.len() > 4096 {
-            let mut cut = 4096;
-            while !effect.is_char_boundary(cut) {
-                cut -= 1;
-            }
-            effect.truncate(cut);
-        }
-
-        (effect.into_bytes(), cause)
-    }
-}
-
-/* ------------------------------------------------------------------------- */
-/* Modèle et sérialisation                                                   */
-/* ------------------------------------------------------------------------- */
-
-struct Model {
-    graph: Graph,
-    entries: Vec<Entry>,
-    inference_budget: usize,
-    trained_steps: usize,
-    seed: u64,
-}
-
-impl Model {
-    fn new(entries: Vec<Entry>, seed: u64) -> Self {
-        let mut rng = Rng::new(seed);
-
-        Self {
-            graph: Graph::new(&mut rng),
-            entries,
-            inference_budget: 128,
-            trained_steps: 0,
-            seed,
-        }
-    }
-
-    fn save(&self, path: &str) -> Res<()> {
-        let mut out = Vec::new();
-        out.extend_from_slice(MAGIC);
-        put_u32(&mut out, VERSION);
-        put_u64(&mut out, self.seed);
-        put_u64(&mut out, self.inference_budget as u64);
-        put_u64(&mut out, self.trained_steps as u64);
-        put_u32(&mut out, N as u32);
-
-        put_f32_slice(&mut out, &self.graph.w);
-        put_f32_slice(&mut out, &self.graph.u);
-        put_f32_slice(&mut out, &self.graph.bias);
-        put_f32_slice(&mut out, &self.graph.encoder);
-        put_f32_slice(&mut out, &self.graph.decoder);
-
-        put_u32(&mut out, self.entries.len() as u32);
-
-        for entry in &self.entries {
-            put_string(&mut out, &entry.term);
-            put_string(&mut out, &entry.definition);
-        }
-
-        if let Some(parent) = Path::new(path).parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)?;
-            }
-        }
-
-        fs::write(path, out)?;
-        Ok(())
-    }
-
-    fn load(path: &str) -> Res<Self> {
-        let bytes = fs::read(path)?;
-        let mut c = Cursor::new(&bytes);
-
-        if c.take(MAGIC.len())? != MAGIC {
-            return Err("ce fichier n'est pas un modèle Phisharp".into());
-        }
-
-        if c.u32()? != VERSION {
-            return Err("version de modèle incompatible".into());
-        }
-
-        let seed = c.u64()?;
-        let inference_budget = c.u64()? as usize;
-        let trained_steps = c.u64()? as usize;
-        let n = c.u32()? as usize;
-
-        if n != N {
-            return Err(format!("dimension de graphe incompatible : {}", n).into());
-        }
-
-        let graph = Graph {
-            w: c.f32_slice(N * N)?,
-            u: c.f32_slice(N * N)?,
-            bias: c.f32_slice(N)?,
-            encoder: c.f32_slice(256 * N)?,
-            decoder: c.f32_slice(N * 256)?,
-        };
-
-        let count = c.u32()? as usize;
-        let mut entries = Vec::with_capacity(count);
-
-        for _ in 0..count {
-            entries.push(Entry {
-                term: c.string()?,
-                definition: c.string()?,
-            });
-        }
-
-        Ok(Self {
-            graph,
-            entries,
-            inference_budget,
-            trained_steps,
-            seed,
-        })
-    }
-}
-
-fn put_u32(out: &mut Vec<u8>, x: u32) {
-    out.extend_from_slice(&x.to_le_bytes());
-}
-
-fn put_u64(out: &mut Vec<u8>, x: u64) {
-    out.extend_from_slice(&x.to_le_bytes());
-}
-
-fn put_f32_slice(out: &mut Vec<u8>, values: &[f32]) {
-    put_u64(out, values.len() as u64);
-
-    for x in values {
-        out.extend_from_slice(&x.to_le_bytes());
-    }
-}
-
-fn put_string(out: &mut Vec<u8>, value: &str) {
-    put_u64(out, value.len() as u64);
-    out.extend_from_slice(value.as_bytes());
-}
-
-struct Cursor<'a> {
-    bytes: &'a [u8],
-    position: usize,
-}
-
-impl<'a> Cursor<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, position: 0 }
-    }
-
-    fn take(&mut self, n: usize) -> Res<&'a [u8]> {
-        let end = self
-            .position
-            .checked_add(n)
-            .ok_or("dépassement de lecture")?;
-
-        if end > self.bytes.len() {
-            return Err("modèle tronqué".into());
-        }
-
-        let result = &self.bytes[self.position..end];
-        self.position = end;
-        Ok(result)
-    }
-
-    fn u32(&mut self) -> Res<u32> {
-        Ok(u32::from_le_bytes(self.take(4)?.try_into()?))
-    }
-
-    fn u64(&mut self) -> Res<u64> {
-        Ok(u64::from_le_bytes(self.take(8)?.try_into()?))
-    }
-
-    fn f32_slice(&mut self, expected: usize) -> Res<Vec<f32>> {
-        let count = self.u64()? as usize;
-
-        if count != expected {
-            return Err("taille de matrice invalide".into());
-        }
-
-        let mut values = Vec::with_capacity(count);
-
-        for _ in 0..count {
-            values.push(f32::from_le_bytes(self.take(4)?.try_into()?));
-        }
-
-        Ok(values)
-    }
-
-    fn string(&mut self) -> Res<String> {
-        let n = self.u64()? as usize;
-        Ok(String::from_utf8(self.take(n)?.to_vec())?)
-    }
-}
-
-/* ------------------------------------------------------------------------- */
-/* Commandes                                                                 */
-/* ------------------------------------------------------------------------- */
-
-fn option(args: &[String], name: &str) -> Option<String> {
-    args.iter()
-        .position(|a| a == name)
-        .and_then(|i| args.get(i + 1))
-        .cloned()
-}
-
-fn required(args: &[String], name: &str) -> Res<String> {
-    option(args, name).ok_or_else(|| format!("argument requis : {}", name).into())
-}
-
-fn train(args: &[String]) -> Res<()> {
-    let model_path = required(args, "--model")?;
-    let dictionary = required(args, "--dictionary")?;
-    let steps = option(args, "--steps")
-        .unwrap_or_else(|| "192".into())
-        .parse::<usize>()?;
-    let seed = option(args, "--seed")
-        .unwrap_or_else(|| "0x50a1a5".into())
-        .replace("0x", "");
-    let seed = u64::from_str_radix(&seed, 16).or_else(|_| seed.parse::<u64>())?;
-
-    let entries = load_dictionary(&dictionary)?;
-    let mut model = Model::new(entries, seed);
-    let mut rng = Rng::new(seed ^ 0x9e37_79b9_7f4a_7c15);
-
-    println!(
-        "Séance abductive unique : {} définitions, {} effets synthétiques.",
-        model.entries.len(),
-        steps
-    );
-
-    let mut mean_phi = 0.0;
-    let mut mean_loss = 0.0;
-
-    for step in 0..steps {
-        let effect = if step % 5 == 0 {
-            let i = rng.usize(model.entries.len());
-            model.entries[i].definition.as_bytes().to_vec()
-        } else {
-            let (effect, hidden_cause) = Ptgrs::generate(&model.entries, &mut rng);
-            drop(hidden_cause);
-            effect
-        };
-
-        if effect.is_empty() {
+        if !ok || o == h {
             continue;
         }
-
-        let search_budget = 18;
-        let h = model
-            .graph
-            .abduce(&effect, &model.entries, search_budget, &mut rng);
-
-        mean_phi += h.best.phi;
-        mean_loss += h.best.loss;
-
-        let lr = 0.055 / (1.0 + step as f32 / (steps.max(1) as f32 * 0.7));
-        model.graph.learn(&effect, &h.best, lr);
-        model.trained_steps += 1;
-
-        if (step + 1) % 16 == 0 || step + 1 == steps {
-            let n = (step + 1) as f32;
-            println!(
-                "étape {:>5}/{:<5}  φ_moyen={:.6}  résidu_moyen={:.6}",
-                step + 1,
-                steps,
-                mean_phi / n,
-                mean_loss / n
-            );
+        let (toks, plen) = encode(&sig, &rules, &ar, o, Some(h));
+        if toks.len() > MAXT {
+            continue;
+        }
+        return Episode { sig, rules, ar, h, o, kmax: level, toks, plen };
+    }
+}
+fn mm(a: &[f32], b: &[f32], n: usize, k: usize, m: usize) -> Vec<f32> {
+    let mut o = vec![0.0f32; n * m];
+    for i in 0..n {
+        let orow = &mut o[i * m..(i + 1) * m];
+        for p in 0..k {
+            let av = a[i * k + p];
+            let brow = &b[p * m..(p + 1) * m];
+            for j in 0..m {
+                orow[j] += av * brow[j];
+            }
         }
     }
-
-    model.save(&model_path)?;
-    println!("Modèle écrit : {}", model_path);
-    Ok(())
+    o
 }
-
-fn generate(args: &[String]) -> Res<()> {
-    let dictionary = required(args, "--dictionary")?;
-    let file = required(args, "--file")?;
-    let entries = load_dictionary(&dictionary)?;
-    let seed = option(args, "--seed")
-        .unwrap_or_else(|| "17".into())
-        .parse::<u64>()?;
+fn rope_apply(x: &mut [f32], t: usize, d: usize, heads: usize, sign: f32) {
+    let dh = d / heads;
+    let half = dh / 2;
+    for pos in 0..t {
+        for h in 0..heads {
+            let base = pos * d + h * dh;
+            for c in 0..half {
+                let freq = 10000f32.powf(-(c as f32) / half as f32);
+                let (s, co) = (pos as f32 * freq).sin_cos();
+                let s = s * sign;
+                let (a, b) = (x[base + c], x[base + half + c]);
+                x[base + c] = a * co - b * s;
+                x[base + half + c] = a * s + b * co;
+            }
+        }
+    }
+}
+fn attn_fwd(q: &[f32], k: &[f32], v: &[f32], t: usize, d: usize, heads: usize) -> (Vec<f32>, Vec<f32>) {
+    let dh = d / heads;
+    let sc = 1.0 / (dh as f32).sqrt();
+    let mut out = vec![0.0f32; t * d];
+    let mut p = vec![0.0f32; heads * t * t];
+    for h in 0..heads {
+        let o = h * dh;
+        for i in 0..t {
+            let pr = &mut p[(h * t + i) * t..(h * t + i + 1) * t];
+            let mut mx = f32::NEG_INFINITY;
+            for j in 0..=i {
+                let mut s = 0.0f32;
+                for c in 0..dh {
+                    s += q[i * d + o + c] * k[j * d + o + c];
+                }
+                s *= sc;
+                pr[j] = s;
+                if s > mx {
+                    mx = s;
+                }
+            }
+            let mut z = 0.0f32;
+            for j in 0..=i {
+                let e = (pr[j] - mx).exp();
+                pr[j] = e;
+                z += e;
+            }
+            for j in 0..=i {
+                let w = pr[j] / z;
+                pr[j] = w;
+                for c in 0..dh {
+                    out[i * d + o + c] += w * v[j * d + o + c];
+                }
+            }
+        }
+    }
+    (out, p)
+}
+fn attn_bwd(
+    q: &[f32], k: &[f32], v: &[f32], p: &[f32], g: &[f32], t: usize, d: usize, heads: usize,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let dh = d / heads;
+    let sc = 1.0 / (dh as f32).sqrt();
+    let mut dq = vec![0.0f32; t * d];
+    let mut dk = vec![0.0f32; t * d];
+    let mut dv = vec![0.0f32; t * d];
+    let mut dp = vec![0.0f32; t];
+    for h in 0..heads {
+        let o = h * dh;
+        for i in 0..t {
+            let pr = &p[(h * t + i) * t..(h * t + i + 1) * t];
+            let mut dot = 0.0f32;
+            for j in 0..=i {
+                let mut s = 0.0f32;
+                for c in 0..dh {
+                    s += g[i * d + o + c] * v[j * d + o + c];
+                    dv[j * d + o + c] += pr[j] * g[i * d + o + c];
+                }
+                dp[j] = s;
+                dot += pr[j] * s;
+            }
+            for j in 0..=i {
+                let ds = pr[j] * (dp[j] - dot) * sc;
+                for c in 0..dh {
+                    dq[i * d + o + c] += ds * k[j * d + o + c];
+                    dk[j * d + o + c] += ds * q[i * d + o + c];
+                }
+            }
+        }
+    }
+    (dq, dk, dv)
+}
+enum Op {
+    Leaf,
+    MatMul(usize, usize),
+    Add(usize, usize),
+    Silu(usize),
+    Rms(usize, usize),                         
+    Embed(usize, Vec<usize>),                  
+    Rope(usize, usize),                        
+    Attn(usize, usize, usize, usize, Vec<f32>), 
+    Xent(usize, Vec<usize>, Vec<bool>, f32),   
+}
+struct Tape {
+    val: Vec<Vec<f32>>,
+    shp: Vec<(usize, usize)>,
+    ops: Vec<Op>,
+    grad: Vec<Vec<f32>>,
+}
+impl Tape {
+    fn new() -> Tape {
+        Tape { val: Vec::new(), shp: Vec::new(), ops: Vec::new(), grad: Vec::new() }
+    }
+    fn push(&mut self, v: Vec<f32>, r: usize, c: usize, op: Op) -> usize {
+        self.val.push(v);
+        self.shp.push((r, c));
+        self.ops.push(op);
+        self.val.len() - 1
+    }
+    fn leaf(&mut self, v: Vec<f32>, r: usize, c: usize) -> usize {
+        self.push(v, r, c, Op::Leaf)
+    }
+    fn matmul(&mut self, a: usize, b: usize) -> usize {
+        let (n, k) = self.shp[a];
+        let (k2, m) = self.shp[b];
+        assert_eq!(k, k2, "dimensions incompatibles dans matmul");
+        let o = mm(&self.val[a], &self.val[b], n, k, m);
+        self.push(o, n, m, Op::MatMul(a, b))
+    }
+    fn add(&mut self, a: usize, b: usize) -> usize {
+        let (n, m) = self.shp[a];
+        let o: Vec<f32> = self.val[a].iter().zip(&self.val[b]).map(|(x, y)| x + y).collect();
+        self.push(o, n, m, Op::Add(a, b))
+    }
+    fn silu(&mut self, a: usize) -> usize {
+        let (n, m) = self.shp[a];
+        let o: Vec<f32> = self.val[a].iter().map(|&x| x / (1.0 + (-x).exp())).collect();
+        self.push(o, n, m, Op::Silu(a))
+    }
+    fn rms(&mut self, x: usize, g: usize) -> usize {
+        let (n, d) = self.shp[x];
+        let mut o = vec![0.0f32; n * d];
+        {
+            let xv = &self.val[x];
+            let gv = &self.val[g];
+            for i in 0..n {
+                let row = &xv[i * d..(i + 1) * d];
+                let r = (row.iter().map(|v| v * v).sum::<f32>() / d as f32 + 1e-5).sqrt();
+                for j in 0..d {
+                    o[i * d + j] = gv[j] * row[j] / r;
+                }
+            }
+        }
+        self.push(o, n, d, Op::Rms(x, g))
+    }
+    fn embed(&mut self, tab: usize, ids: &[usize]) -> usize {
+        let (_, d) = self.shp[tab];
+        let mut o = Vec::with_capacity(ids.len() * d);
+        for &i in ids {
+            o.extend_from_slice(&self.val[tab][i * d..(i + 1) * d]);
+        }
+        self.push(o, ids.len(), d, Op::Embed(tab, ids.to_vec()))
+    }
+    fn rope(&mut self, x: usize, heads: usize) -> usize {
+        let (t, d) = self.shp[x];
+        let mut o = self.val[x].clone();
+        rope_apply(&mut o, t, d, heads, 1.0);
+        self.push(o, t, d, Op::Rope(x, heads))
+    }
+    fn attn(&mut self, q: usize, k: usize, v: usize, heads: usize) -> usize {
+        let (t, d) = self.shp[q];
+        let (o, p) = attn_fwd(&self.val[q], &self.val[k], &self.val[v], t, d, heads);
+        self.push(o, t, d, Op::Attn(q, k, v, heads, p))
+    }
+    fn xent(&mut self, lg: usize, tg: Vec<usize>, mk: Vec<bool>, sc: f32) -> usize {
+        let (n, c) = self.shp[lg];
+        let mut loss = 0.0f32;
+        for i in 0..n {
+            if !mk[i] {
+                continue;
+            }
+            let row = &self.val[lg][i * c..(i + 1) * c];
+            let mx = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let lse = mx + row.iter().map(|&x| (x - mx).exp()).sum::<f32>().ln();
+            loss += lse - row[tg[i]];
+        }
+        self.push(vec![loss * sc], 1, 1, Op::Xent(lg, tg, mk, sc))
+    }
+    fn backward(&mut self, root: usize) {
+        let Tape { val, shp, ops, grad } = self;
+        *grad = val.iter().map(|v| vec![0.0f32; v.len()]).collect();
+        grad[root][0] = 1.0;
+        for i in (0..=root).rev() {
+            let (lo, hi) = grad.split_at_mut(i);
+            let g = &hi[0];
+            match &ops[i] {
+                Op::Leaf => {}
+                Op::Add(a, b) => {
+                    for (d, x) in lo[*a].iter_mut().zip(g.iter()) {
+                        *d += *x;
+                    }
+                    for (d, x) in lo[*b].iter_mut().zip(g.iter()) {
+                        *d += *x;
+                    }
+                }
+                Op::MatMul(a, b) => {
+                    let (n, k) = shp[*a];
+                    let (_, m) = shp[*b];
+                    let bv = &val[*b];
+                    let da = &mut lo[*a];
+                    for r in 0..n {
+                        let grow = &g[r * m..(r + 1) * m];
+                        for p in 0..k {
+                            let brow = &bv[p * m..(p + 1) * m];
+                            let mut s = 0.0f32;
+                            for j in 0..m {
+                                s += grow[j] * brow[j];
+                            }
+                            da[r * k + p] += s;
+                        }
+                    }
+                    let av = &val[*a];
+                    let db = &mut lo[*b];
+                    for r in 0..n {
+                        let grow = &g[r * m..(r + 1) * m];
+                        for p in 0..k {
+                            let x = av[r * k + p];
+                            let drow = &mut db[p * m..(p + 1) * m];
+                            for j in 0..m {
+                                drow[j] += x * grow[j];
+                            }
+                        }
+                    }
+                }
+                Op::Silu(a) => {
+                    let xv = &val[*a];
+                    let da = &mut lo[*a];
+                    for j in 0..xv.len() {
+                        let x = xv[j];
+                        let s = 1.0 / (1.0 + (-x).exp());
+                        da[j] += g[j] * s * (1.0 + x * (1.0 - s));
+                    }
+                }
+                Op::Rms(xi, gi) => {
+                    let (n, d) = shp[*xi];
+                    let xv = &val[*xi];
+                    let gv = &val[*gi];
+                    let mut dx = vec![0.0f32; n * d];
+                    let mut dg = vec![0.0f32; d];
+                    for r in 0..n {
+                        let row = &xv[r * d..(r + 1) * d];
+                        let gr = &g[r * d..(r + 1) * d];
+                        let ms = row.iter().map(|v| v * v).sum::<f32>() / d as f32 + 1e-5;
+                        let rr = ms.sqrt();
+                        let mut dot = 0.0f32;
+                        for j in 0..d {
+                            dot += gv[j] * gr[j] * row[j];
+                            dg[j] += gr[j] * row[j] / rr;
+                        }
+                        let coef = dot / (d as f32 * rr * ms);
+                        for j in 0..d {
+                            dx[r * d + j] = gv[j] * gr[j] / rr - row[j] * coef;
+                        }
+                    }
+                    for (a, b) in lo[*xi].iter_mut().zip(&dx) {
+                        *a += *b;
+                    }
+                    for (a, b) in lo[*gi].iter_mut().zip(&dg) {
+                        *a += *b;
+                    }
+                }
+                Op::Embed(tab, ids) => {
+                    let (_, d) = shp[*tab];
+                    let dt = &mut lo[*tab];
+                    for (r, &id) in ids.iter().enumerate() {
+                        for j in 0..d {
+                            dt[id * d + j] += g[r * d + j];
+                        }
+                    }
+                }
+                Op::Rope(x, heads) => {
+                    let (t, d) = shp[*x];
+                    let mut dx = g.clone();
+                    rope_apply(&mut dx, t, d, *heads, -1.0);
+                    for (a, b) in lo[*x].iter_mut().zip(&dx) {
+                        *a += *b;
+                    }
+                }
+                Op::Attn(q, k, v, heads, p) => {
+                    let (t, d) = shp[*q];
+                    let (dq, dk, dv) = attn_bwd(&val[*q], &val[*k], &val[*v], p, g, t, d, *heads);
+                    for (a, b) in lo[*q].iter_mut().zip(&dq) {
+                        *a += *b;
+                    }
+                    for (a, b) in lo[*k].iter_mut().zip(&dk) {
+                        *a += *b;
+                    }
+                    for (a, b) in lo[*v].iter_mut().zip(&dv) {
+                        *a += *b;
+                    }
+                }
+                Op::Xent(lg, tg, mk, sc) => {
+                    let (n, c) = shp[*lg];
+                    let lv = &val[*lg];
+                    let dl = &mut lo[*lg];
+                    let g0 = g[0] * *sc;
+                    for r in 0..n {
+                        if !mk[r] {
+                            continue;
+                        }
+                        let row = &lv[r * c..(r + 1) * c];
+                        let mx = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                        let z: f32 = row.iter().map(|&x| (x - mx).exp()).sum();
+                        for j in 0..c {
+                            let pr = (row[j] - mx).exp() / z;
+                            let tgt = if j == tg[r] { 1.0 } else { 0.0 };
+                            dl[r * c + j] += g0 * (pr - tgt);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+const D: usize = 48; 
+const NH: usize = 4; 
+const NL: usize = 3; 
+const FF: usize = 128; 
+const PL: usize = 8; 
+const NT: usize = 3 + NL * PL; 
+type Seq = (Vec<usize>, usize); 
+struct Model {
+    w: Vec<Vec<f32>>,
+    shp: Vec<(usize, usize)>,
+}
+impl Model {
+    fn new(rng: &mut Rng) -> Model {
+        let mut shp = vec![(VOCAB, D)];
+        for _ in 0..NL {
+            shp.extend_from_slice(&[(1, D), (D, D), (D, D), (D, D), (D, D), (1, D), (D, FF), (FF, D)]);
+        }
+        shp.push((1, D));
+        shp.push((D, VOCAB));
+        let resid = 1.0 / ((2 * NL) as f32).sqrt();
+        let mut w: Vec<Vec<f32>> = Vec::with_capacity(NT);
+        for (i, &(r, c)) in shp.iter().enumerate() {
+            let sd = if r == 1 {
+                0.0
+            } else if i == 0 {
+                0.1
+            } else if i == NT - 1 {
+                0.05
+            } else {
+                let base = 1.0 / (r as f32).sqrt();
+                if matches!((i - 1) % PL, 4 | 7) { base * resid } else { base }
+            };
+            w.push((0..r * c).map(|_| if r == 1 { 1.0 } else { sd * rng.normal() }).collect());
+        }
+        Model { w, shp }
+    }
+    fn count(&self) -> usize {
+        self.w.iter().map(|v| v.len()).sum()
+    }
+    fn tape(&self) -> Tape {
+        let mut tp = Tape::new();
+        for (v, &(r, c)) in self.w.iter().zip(self.shp.iter()) {
+            tp.leaf(v.clone(), r, c);
+        }
+        tp
+    }
+}
+fn forward(tp: &mut Tape, toks: &[usize]) -> usize {
+    let mut x = tp.embed(0, toks);
+    for l in 0..NL {
+        let b = 1 + l * PL;
+        let h = tp.rms(x, b);
+        let q = tp.matmul(h, b + 1);
+        let k = tp.matmul(h, b + 2);
+        let v = tp.matmul(h, b + 3);
+        let q = tp.rope(q, NH);
+        let k = tp.rope(k, NH);
+        let a = tp.attn(q, k, v, NH);
+        let o = tp.matmul(a, b + 4);
+        x = tp.add(x, o);
+        let h = tp.rms(x, b + 5);
+        let u = tp.matmul(h, b + 6);
+        let u = tp.silu(u);
+        let o = tp.matmul(u, b + 7);
+        x = tp.add(x, o);
+    }
+    let h = tp.rms(x, NT - 2);
+    tp.matmul(h, NT - 1)
+}
+fn seq_run(m: &Model, toks: &[usize], plen: usize, scale: f32, acc: Option<&mut Vec<Vec<f32>>>) -> f32 {
+    let n = toks.len() - 1;
+    let mut tp = m.tape();
+    let lg = forward(&mut tp, &toks[..n]);
+    let mask: Vec<bool> = (0..n).map(|i| i + 1 >= plen).collect();
+    let loss = tp.xent(lg, toks[1..].to_vec(), mask, scale);
+    let val = tp.val[loss][0];
+    if let Some(a) = acc {
+        tp.backward(loss);
+        for (dst, src) in a.iter_mut().zip(tp.grad.iter()) {
+            for (x, y) in dst.iter_mut().zip(src.iter()) {
+                *x += *y;
+            }
+        }
+    }
+    val
+}
+fn worker(m: &Model, seqs: &[Seq], scale: f32) -> (f32, Vec<Vec<f32>>) {
+    let mut acc: Vec<Vec<f32>> = m.w.iter().map(|v| vec![0.0f32; v.len()]).collect();
+    let mut loss = 0.0f32;
+    for (t, p) in seqs {
+        loss += seq_run(m, t, *p, scale, Some(&mut acc));
+    }
+    (loss, acc)
+}
+fn train_step(m: &Model, batch: &[Seq], nthreads: usize) -> (f32, Vec<Vec<f32>>) {
+    let ntgt: usize = batch.iter().map(|(t, p)| t.len() - *p).sum();
+    let scale = 1.0 / ntgt as f32;
+    let per = ((batch.len() + nthreads - 1) / nthreads).max(1);
+    let mut loss = 0.0f32;
+    let mut grads: Vec<Vec<f32>> = m.w.iter().map(|v| vec![0.0f32; v.len()]).collect();
+    std::thread::scope(|sc| {
+        let mut hs = Vec::new();
+        for ch in batch.chunks(per) {
+            hs.push(sc.spawn(move || worker(m, ch, scale)));
+        }
+        for h in hs {
+            let (l, g) = h.join().expect("thread d'entraînement");
+            loss += l;
+            for (a, b) in grads.iter_mut().zip(g.iter()) {
+                for (x, y) in a.iter_mut().zip(b.iter()) {
+                    *x += *y;
+                }
+            }
+        }
+    });
+    (loss, grads)
+}
+fn make_batch(rng: &mut Rng, size: usize, maxlv: usize) -> Vec<Seq> {
+    (0..size)
+        .map(|_| {
+            let lv = 1 + rng.below(maxlv);
+            let e = make_episode(rng, lv);
+            (e.toks, e.plen)
+        })
+        .collect()
+}
+struct Adam {
+    m: Vec<Vec<f32>>,
+    v: Vec<Vec<f32>>,
+    t: i32,
+}
+impl Adam {
+    fn new(w: &[Vec<f32>]) -> Adam {
+        let z = || w.iter().map(|x| vec![0.0f32; x.len()]).collect::<Vec<_>>();
+        Adam { m: z(), v: z(), t: 0 }
+    }
+    fn step(&mut self, w: &mut [Vec<f32>], g: &[Vec<f32>], shp: &[(usize, usize)], lr: f32, wd: f32) {
+        self.t += 1;
+        let (b1, b2) = (0.9f32, 0.98f32);
+        let (c1, c2) = (1.0 - b1.powi(self.t), 1.0 - b2.powi(self.t));
+        for i in 0..w.len() {
+            let dec = if shp[i].0 == 1 { 0.0 } else { wd };
+            for j in 0..w[i].len() {
+                let gj = g[i][j];
+                self.m[i][j] = b1 * self.m[i][j] + (1.0 - b1) * gj;
+                self.v[i][j] = b2 * self.v[i][j] + (1.0 - b2) * gj * gj;
+                let upd = (self.m[i][j] / c1) / ((self.v[i][j] / c2).sqrt() + 1e-8);
+                w[i][j] -= lr * (upd + dec * w[i][j]);
+            }
+        }
+    }
+}
+fn lr_at(step: usize, total: usize, base: f32) -> f32 {
+    let warm = (total / 20).clamp(10, 200);
+    if step < warm {
+        return base * (step + 1) as f32 / warm as f32;
+    }
+    let pr = (step - warm) as f32 / total.saturating_sub(warm).max(1) as f32;
+    base * (0.1 + 0.45 * (1.0 + (PI * pr).cos()))
+}
+#[derive(Clone)]
+struct Cache {
+    k: Vec<Vec<f32>>,
+    v: Vec<Vec<f32>>,
+    len: usize,
+}
+impl Cache {
+    fn new() -> Cache {
+        Cache { k: vec![Vec::new(); NL], v: vec![Vec::new(); NL], len: 0 }
+    }
+}
+fn rms_row(x: &[f32], g: &[f32]) -> Vec<f32> {
+    let r = (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32 + 1e-5).sqrt();
+    x.iter().zip(g).map(|(a, b)| a * b / r).collect()
+}
+fn rope_row(x: &mut [f32], pos: usize) {
+    let dh = D / NH;
+    let half = dh / 2;
+    for h in 0..NH {
+        for c in 0..half {
+            let freq = 10000f32.powf(-(c as f32) / half as f32);
+            let (s, co) = (pos as f32 * freq).sin_cos();
+            let (a, b) = (x[h * dh + c], x[h * dh + half + c]);
+            x[h * dh + c] = a * co - b * s;
+            x[h * dh + half + c] = a * s + b * co;
+        }
+    }
+}
+fn infer_step(m: &Model, ca: &mut Cache, tok: usize) -> Vec<f32> {
+    let pos = ca.len;
+    let dh = D / NH;
+    let sc = 1.0 / (dh as f32).sqrt();
+    let mut x = m.w[0][tok * D..(tok + 1) * D].to_vec();
+    for l in 0..NL {
+        let b = 1 + l * PL;
+        let h = rms_row(&x, &m.w[b]);
+        let mut q = mm(&h, &m.w[b + 1], 1, D, D);
+        let mut k = mm(&h, &m.w[b + 2], 1, D, D);
+        let v = mm(&h, &m.w[b + 3], 1, D, D);
+        rope_row(&mut q, pos);
+        rope_row(&mut k, pos);
+        ca.k[l].extend_from_slice(&k);
+        ca.v[l].extend_from_slice(&v);
+        let mut a = vec![0.0f32; D];
+        for hd in 0..NH {
+            let o = hd * dh;
+            let mut p = vec![0.0f32; pos + 1];
+            let mut mx = f32::NEG_INFINITY;
+            for j in 0..=pos {
+                let kj = &ca.k[l][j * D + o..j * D + o + dh];
+                let s = q[o..o + dh].iter().zip(kj).map(|(u, w)| u * w).sum::<f32>() * sc;
+                p[j] = s;
+                mx = mx.max(s);
+            }
+            let mut z = 0.0f32;
+            for j in 0..=pos {
+                p[j] = (p[j] - mx).exp();
+                z += p[j];
+            }
+            for j in 0..=pos {
+                let wgt = p[j] / z;
+                for c in 0..dh {
+                    a[o + c] += wgt * ca.v[l][j * D + o + c];
+                }
+            }
+        }
+        let ao = mm(&a, &m.w[b + 4], 1, D, D);
+        for i in 0..D {
+            x[i] += ao[i];
+        }
+        let h2 = rms_row(&x, &m.w[b + 5]);
+        let mut u = mm(&h2, &m.w[b + 6], 1, D, FF);
+        for z in u.iter_mut() {
+            *z /= 1.0 + (-*z).exp();
+        }
+        let dn = mm(&u, &m.w[b + 7], 1, FF, D);
+        for i in 0..D {
+            x[i] += dn[i];
+        }
+    }
+    ca.len += 1;
+    let h = rms_row(&x, &m.w[NT - 2]);
+    mm(&h, &m.w[NT - 1], 1, D, VOCAB)
+}
+fn prefill(m: &Model, prompt: &[usize]) -> (Cache, Vec<f32>) {
+    let mut ca = Cache::new();
+    let mut lg = Vec::new();
+    for &t in prompt {
+        lg = infer_step(m, &mut ca, t);
+    }
+    (ca, lg)
+}
+struct Gram {
+    stack: Vec<usize>, 
+    nodes: usize,
+    lp: bool,
+    done: bool,
+}
+impl Gram {
+    fn new() -> Gram {
+        Gram { stack: Vec::new(), nodes: 0, lp: false, done: false }
+    }
+    fn need(&self) -> usize {
+        self.stack.iter().sum::<usize>() + if self.nodes == 0 { 1 } else { 0 }
+    }
+    fn allowed(&self, sig: &Sig) -> Vec<usize> {
+        if self.done {
+            return vec![T_END];
+        }
+        if self.lp {
+            return vec![T_LP];
+        }
+        if self.stack.last() == Some(&0) {
+            return vec![T_RP];
+        }
+        let need = self.need();
+        sig.syms
+            .iter()
+            .filter(|&&s| sig.arity[s] == 0 || self.nodes + need + sig.arity[s] <= HMAX)
+            .map(|&s| T_SYM + s)
+            .collect()
+    }
+    fn push(&mut self, tok: usize, sig: &Sig) {
+        if tok == T_LP {
+            self.lp = false;
+        } else if tok == T_RP {
+            self.stack.pop();
+            if self.stack.is_empty() {
+                self.done = true;
+            }
+        } else if tok >= T_SYM {
+            let a = sig.arity[tok - T_SYM];
+            self.nodes += 1;
+            if let Some(top) = self.stack.last_mut() {
+                *top -= 1;
+            }
+            if a > 0 {
+                self.stack.push(a);
+                self.lp = true;
+            } else if self.stack.is_empty() {
+                self.done = true;
+            }
+        }
+    }
+}
+fn pick(lg: &[f32], allowed: &[usize], temp: f32, uniform: bool, rng: &mut Rng) -> usize {
+    if allowed.len() == 1 {
+        return allowed[0];
+    }
+    if uniform {
+        return allowed[rng.below(allowed.len())];
+    }
+    if temp <= 0.0 {
+        let mut best = allowed[0];
+        for &t in allowed {
+            if lg[t] > lg[best] {
+                best = t;
+            }
+        }
+        return best;
+    }
+    let mx = allowed.iter().map(|&t| lg[t]).fold(f32::NEG_INFINITY, f32::max);
+    let ws: Vec<f32> = allowed.iter().map(|&t| ((lg[t] - mx) / temp).exp()).collect();
+    let mut u = rng.unif() * ws.iter().sum::<f32>();
+    for (i, w) in ws.iter().enumerate() {
+        if u < *w {
+            return allowed[i];
+        }
+        u -= *w;
+    }
+    allowed[allowed.len() - 1]
+}
+fn decode(m: &Model, base: &Cache, first: &[f32], sig: &Sig, temp: f32, uniform: bool, rng: &mut Rng) -> Vec<usize> {
+    let mut ca = base.clone();
+    let mut lg = first.to_vec();
+    let mut g = Gram::new();
+    let mut out = Vec::new();
+    for _ in 0..MAXH {
+        let tok = pick(&lg, &g.allowed(sig), temp, uniform, rng);
+        out.push(tok);
+        if tok == T_END {
+            break;
+        }
+        g.push(tok, sig);
+        if !uniform {
+            lg = infer_step(m, &mut ca, tok);
+        }
+    }
+    out
+}
+fn parse(ar: &mut Arena, sig: &Sig, t: &[usize], pos: &mut usize) -> Option<Id> {
+    let tk = *t.get(*pos)?;
+    if tk < T_SYM || tk >= T_SYM + NS || !sig.has[tk - T_SYM] {
+        return None;
+    }
+    let s = tk - T_SYM;
+    *pos += 1;
+    let mut kids = Vec::new();
+    if sig.arity[s] > 0 {
+        if t.get(*pos) != Some(&T_LP) {
+            return None;
+        }
+        *pos += 1;
+        for _ in 0..sig.arity[s] {
+            kids.push(parse(ar, sig, t, pos)?);
+        }
+        if t.get(*pos) != Some(&T_RP) {
+            return None;
+        }
+        *pos += 1;
+    }
+    Some(ar.mk(s, kids))
+}
+fn parse_cause(ar: &mut Arena, sig: &Sig, out: &[usize]) -> Option<Id> {
+    let mut pos = 0;
+    let id = parse(ar, sig, out, &mut pos)?;
+    if out.get(pos) == Some(&T_END) { Some(id) } else { None }
+}
+fn likelihood(ar: &mut Arena, rules: &[Rule], h: Id, o: Id, kmax: usize) -> f64 {
+    let mut cur: HashMap<Id, f64> = HashMap::new();
+    cur.insert(h, 1.0);
+    let mut total = 0.0f64;
+    for _ in 0..kmax {
+        let mut nxt: HashMap<Id, f64> = HashMap::new();
+        for (&s, &p) in cur.iter() {
+            let rx = ar.redexes(s, rules);
+            if rx.is_empty() {
+                continue;
+            }
+            let pr = p / rx.len() as f64;
+            for (node, ri, b) in rx {
+                for (q, rhs) in &rules[ri].outs {
+                    let rep = ar.inst(rhs, &b);
+                    let n = ar.replace(s, node, rep, &mut HashMap::new());
+                    if ar.size(n) <= OMAX {
+                        *nxt.entry(n).or_insert(0.0) += pr * *q as f64;
+                    }
+                }
+            }
+        }
+        total += nxt.get(&o).copied().unwrap_or(0.0);
+        cur = nxt;
+    }
+    total / kmax as f64
+}
+#[derive(Default)]
+struct Stats {
+    n: usize,
+    nll: f64,
+    ntok: usize,
+    g_valid: usize,
+    g_exact: usize,
+    s_valid: usize,
+    s_any: usize,
+    u_valid: usize,
+    u_any: usize,
+}
+impl Stats {
+    fn add(&mut self, o: &Stats) {
+        self.n += o.n;
+        self.nll += o.nll;
+        self.ntok += o.ntok;
+        self.g_valid += o.g_valid;
+        self.g_exact += o.g_exact;
+        self.s_valid += o.s_valid;
+        self.s_any += o.s_any;
+        self.u_valid += o.u_valid;
+        self.u_any += o.u_any;
+    }
+}
+fn pct(a: usize, b: usize) -> f64 {
+    100.0 * a as f64 / b.max(1) as f64
+}
+fn eval_chunk(m: &Model, eps: &mut [Episode], k: usize, seed: u64) -> Stats {
+    let mut st = Stats::default();
     let mut rng = Rng::new(seed);
-
-    let (effect, cause) = Ptgrs::generate(&entries, &mut rng);
-    fs::write(&file, effect)?;
-
-    if let Some(path) = option(args, "--cause") {
-        fs::write(path, cause.show(&entries))?;
+    for ep in eps.iter_mut() {
+        st.n += 1;
+        st.nll += seq_run(m, &ep.toks, ep.plen, 1.0, None) as f64;
+        st.ntok += ep.toks.len() - ep.plen;
+        let (base, first) = prefill(m, &ep.toks[..ep.plen]);
+        let out = decode(m, &base, &first, &ep.sig, 0.0, false, &mut rng);
+        if let Some(id) = parse_cause(&mut ep.ar, &ep.sig, &out) {
+            if id == ep.h {
+                st.g_exact += 1;
+            }
+            if likelihood(&mut ep.ar, &ep.rules, id, ep.o, LMAX) > 0.0 {
+                st.g_valid += 1;
+            }
+        }
+        for uni in [false, true] {
+            let mut any = false;
+            for _ in 0..k {
+                let out = decode(m, &base, &first, &ep.sig, 1.0, uni, &mut rng);
+                let ok = match parse_cause(&mut ep.ar, &ep.sig, &out) {
+                    Some(id) => likelihood(&mut ep.ar, &ep.rules, id, ep.o, LMAX) > 0.0,
+                    None => false,
+                };
+                any |= ok;
+                if uni {
+                    st.u_valid += ok as usize;
+                } else {
+                    st.s_valid += ok as usize;
+                }
+            }
+            if uni {
+                st.u_any += any as usize;
+            } else {
+                st.s_any += any as usize;
+            }
+        }
     }
-
-    println!("E écrit dans {}", file);
-    Ok(())
+    st
 }
-
-fn ask(args: &[String]) -> Res<()> {
-    let model_path = required(args, "--model")?;
-    let file = required(args, "--file")?;
-    let model = Model::load(&model_path)?;
-    let effect = fs::read(&file)?;
-
-    if effect.is_empty() {
-        return Err("perceived.eff est vide : aucun effet à expliquer".into());
-    }
-
-    let mut rng = Rng::new(model.seed ^ effect.len() as u64 ^ 0xa8bd_105e_3379);
-    let h = model.graph.abduce(
-        &effect,
-        &model.entries,
-        model.inference_budget,
-        &mut rng,
-    );
-
-    let (text, _) = explain(&effect, &model, &h);
-    print!("{}", text);
-    Ok(())
-}
-
-fn evaluate(args: &[String]) -> Res<()> {
-    let model_path = required(args, "--model")?;
-    let file = required(args, "--file")?;
-    let cause_path = required(args, "--cause")?;
-
-    let model = Model::load(&model_path)?;
-    let effect = fs::read(file)?;
-    let cause = fs::read_to_string(cause_path)?;
-    let mut rng = Rng::new(model.seed ^ 0xe7a1);
-
-    let h = model.graph.abduce(
-        &effect,
-        &model.entries,
-        model.inference_budget,
-        &mut rng,
-    );
-
-    let (text, referents) = explain(&effect, &model, &h);
-    print!("{}", text);
-
-    if let Some(top) = referents.first() {
-        let term = &model.entries[top.index].term;
+fn evaluate(m: &Model, n: usize, k: usize, nthreads: usize, seed: u64) {
+    for level in 1..=LMAX {
+        let mut rng = Rng::new(seed ^ (level as u64).wrapping_mul(7919));
+        let mut eps: Vec<Episode> = (0..n).map(|_| make_episode(&mut rng, level)).collect();
+        let per = ((n + nthreads - 1) / nthreads).max(1);
+        let mut st = Stats::default();
+        std::thread::scope(|sc| {
+            let mut hs = Vec::new();
+            for (i, ch) in eps.chunks_mut(per).enumerate() {
+                let sd = seed.wrapping_add(1 + i as u64 + 97 * level as u64);
+                hs.push(sc.spawn(move || eval_chunk(m, ch, k, sd)));
+            }
+            for h in hs {
+                st.add(&h.join().expect("thread d'évaluation"));
+            }
+        });
         println!(
-            "\nÉvaluation a posteriori seulement : référent={} ; présent_dans_cause_cachée={}",
-            term,
-            cause.contains(term)
+            "  niv {level} │ NLL/tok {:.3} │ glouton : {:.0}% valide, {:.0}% exact │ échantillons : {:.0}% valides, ≥1 sur {k} : {:.0}% │ uniforme : {:.0}% valides, ≥1 sur {k} : {:.0}%",
+            st.nll / st.ntok.max(1) as f64,
+            pct(st.g_valid, st.n), pct(st.g_exact, st.n),
+            pct(st.s_valid, st.n * k), pct(st.s_any, st.n),
+            pct(st.u_valid, st.n * k), pct(st.u_any, st.n)
         );
     }
-
-    Ok(())
 }
-
-fn usage() {
-    eprintln!(
-        "Phisharp\n\
-         \n\
-         train --model out/sharp.phis --dictionary definitions.fr [--steps 192] [--seed 1]\n\
-         gen --dictionary definitions.fr --file perceived.eff [--cause hidden.cause] [--seed 17]\n\
-         ask --model out/sharp.phis --file perceived.eff\n\
-         eval --model out/sharp.phis --file perceived.eff --cause hidden.cause\n\
-         \n\
-         Dictionnaire : une entrée par ligne, terme<TAB>définition."
-    );
+fn consistency(m: &Model, toks: &[usize]) -> f32 {
+    let n = toks.len() - 1;
+    let mut tp = m.tape();
+    let lg = forward(&mut tp, &toks[..n]);
+    let mut ca = Cache::new();
+    let mut worst = 0.0f32;
+    for i in 0..n {
+        let row = infer_step(m, &mut ca, toks[i]);
+        for c in 0..VOCAB {
+            worst = worst.max((row[c] - tp.val[lg][i * VOCAB + c]).abs());
+        }
+    }
+    worst
 }
-
-fn run() -> Res<()> {
-    let args: Vec<String> = env::args().collect();
-
-    match args.get(1).map(String::as_str) {
-        Some("train") => train(&args),
-        Some("gen") => generate(&args),
-        Some("ask") => ask(&args),
-        Some("eval") => evaluate(&args),
-        _ => {
-            usage();
-            Ok(())
+fn grad_check(seed: u64) {
+    let mut rng = Rng::new(seed);
+    let mut m = Model::new(&mut rng);
+    let ep = make_episode(&mut rng, 2);
+    let ntgt = ep.toks.len() - ep.plen;
+    let scale = 1.0 / ntgt as f32;
+    println!("check : {} paramètres, séquence de {} tokens ({} cibles)", m.count(), ep.toks.len(), ntgt);
+    let mut acc: Vec<Vec<f32>> = m.w.iter().map(|v| vec![0.0f32; v.len()]).collect();
+    let l0 = seq_run(&m, &ep.toks, ep.plen, scale, Some(&mut acc));
+    println!("perte initiale {:.3} (loi uniforme : {:.3})", l0, (VOCAB as f32).ln());
+    let eps = 2e-2f32;
+    let (mut bad, mut tot, mut worst) = (0usize, 0usize, 0.0f32);
+    for i in 0..m.w.len() {
+        let mut idx = vec![0usize]; 
+        for j in 0..acc[i].len() {
+            if acc[i][j].abs() > acc[i][idx[0]].abs() {
+                idx[0] = j;
+            }
+        }
+        for _ in 0..3 {
+            idx.push(rng.below(acc[i].len()));
+        }
+        for &j in &idx {
+            let o = m.w[i][j];
+            m.w[i][j] = o + eps;
+            let lp = seq_run(&m, &ep.toks, ep.plen, scale, None);
+            m.w[i][j] = o - eps;
+            let lm = seq_run(&m, &ep.toks, ep.plen, scale, None);
+            m.w[i][j] = o;
+            let num = (lp - lm) / (2.0 * eps);
+            let ana = acc[i][j];
+            let ratio = (num - ana).abs() / (3e-3 + 0.05 * num.abs().max(ana.abs()));
+            worst = worst.max(ratio);
+            tot += 1;
+            if ratio > 1.0 {
+                bad += 1;
+                println!("  ✗ tenseur {i} idx {j} : analytique {ana:.5} vs numérique {num:.5}");
+            }
+        }
+    }
+    println!("différences finies : {bad}/{tot} hors tolérance (pire ratio {worst:.2}, < 1 attendu)");
+    let diff = consistency(&m, &ep.toks);
+    println!("cache K/V vs passe complète : écart max des logits {diff:.2e}");
+    println!("{}", if bad == 0 && diff < 1e-3 { "OK" } else { "ATTENTION : voir ci-dessus" });
+}
+fn demo(m: &Model, seed: u64, k: usize) {
+    let mut rng = Rng::new(seed ^ 0xDE30);
+    let mut ep = make_episode(&mut rng, 3);
+    println!("— Exemple (niveau 3) —");
+    let sg: Vec<String> = ep.sig.syms.iter().map(|&s| format!("s{}/{}", s, ep.sig.arity[s])).collect();
+    println!("signature   : {}", sg.join(" "));
+    for r in &ep.rules {
+        let outs: Vec<String> = r.outs.iter().map(|(p, rhs)| format!("{:.2}:{}", p, show_pat(rhs))).collect();
+        println!("règle       : {} -> {}", show_pat(&r.lhs), outs.join(" | "));
+    }
+    let truth = likelihood(&mut ep.ar, &ep.rules, ep.h, ep.o, ep.kmax);
+    println!("observation : {}", ep.ar.show(ep.o));
+    println!("cause vraie : {}   (P(obs|cause) = {:.4}, ≤ {} pas)", ep.ar.show(ep.h), truth, ep.kmax);
+    let (base, first) = prefill(m, &ep.toks[..ep.plen]);
+    for i in 0..=k {
+        let temp = if i == 0 { 0.0 } else { 1.0 };
+        let out = decode(m, &base, &first, &ep.sig, temp, false, &mut rng);
+        match parse_cause(&mut ep.ar, &ep.sig, &out) {
+            Some(id) => {
+                let l = likelihood(&mut ep.ar, &ep.rules, id, ep.o, LMAX);
+                let tag = if i == 0 { "glouton    " } else { "échantillon" };
+                println!("{} : {}   P(obs|cause) = {:.4}", tag, ep.ar.show(id), l);
+            }
+            None => println!("(cause mal formée)"),
         }
     }
 }
-
+fn arg<T: std::str::FromStr>(kv: &HashMap<String, String>, key: &str, def: T) -> T {
+    kv.get(key).and_then(|v| v.parse().ok()).unwrap_or(def)
+}
+fn default_threads() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+}
 fn main() {
-    if let Err(error) = run() {
-        eprintln!("phisharp: {}", error);
-        std::process::exit(2);
+    let mut kv: HashMap<String, String> = HashMap::new();
+    for a in env::args().skip(1) {
+        if let Some((k, v)) = a.split_once('=') {
+            kv.insert(k.to_string(), v.to_string());
+        }
     }
+    let seed: u64 = arg(&kv, "seed", 1);
+    let threads: usize = arg::<usize>(&kv, "threads", default_threads()).max(1);
+    if arg::<u32>(&kv, "check", 0) == 1 {
+        grad_check(seed);
+        return;
+    }
+    let steps: usize = arg(&kv, "steps", 4000);
+    let bs: usize = arg(&kv, "batch", 32);
+    let lr: f32 = arg(&kv, "lr", 2e-3);
+    let wd: f32 = arg(&kv, "wd", 0.01);
+    let clip: f32 = arg(&kv, "clip", 1.0);
+    let log_every: usize = arg::<usize>(&kv, "log", 50).max(1);
+    let eval_every: usize = arg(&kv, "eval_every", 1000);
+    let eval_n: usize = arg(&kv, "eval_n", 32);
+    let ks: usize = arg(&kv, "k", 8);
+    let curriculum: u32 = arg(&kv, "curriculum", 1);
+    let mut rng = Rng::new(seed);
+    let mut m = Model::new(&mut rng);
+    let mut adam = Adam::new(&m.w);
+    println!(
+        "PTGRS-Abducer : {} paramètres | {} threads | lot {} | {} pas | lr {:.1e}",
+        m.count(), threads, bs, steps, lr
+    );
+    let t0 = std::time::Instant::now();
+    let ramp = (steps * 3 / 5).max(1); 
+    for step in 0..steps {
+        let maxlv = if curriculum == 1 { (1 + step * LMAX / ramp).min(LMAX) } else { LMAX };
+        let batch = make_batch(&mut rng, bs, maxlv);
+        let (loss, mut g) = train_step(&m, &batch, threads);
+        let gn = g.iter().map(|v| v.iter().map(|x| x * x).sum::<f32>()).sum::<f32>().sqrt();
+        if !loss.is_finite() || !gn.is_finite() {
+            eprintln!("divergence au pas {step} (perte {loss}) : essayez un lr plus petit");
+            return;
+        }
+        if gn > clip {
+            for v in g.iter_mut() {
+                for x in v.iter_mut() {
+                    *x *= clip / gn;
+                }
+            }
+        }
+        let lr_t = lr_at(step, steps, lr);
+        adam.step(&mut m.w, &g, &m.shp, lr_t, wd);
+        if step == 0 || (step + 1) % log_every == 0 {
+            println!(
+                "pas {:>5}/{} │ niv≤{} │ perte {:.4} │ ‖g‖ {:.2} │ lr {:.1e} │ {:.0}s",
+                step + 1, steps, maxlv, loss, gn, lr_t, t0.elapsed().as_secs_f32()
+            );
+        }
+        if eval_every > 0 && (step + 1) % eval_every == 0 && step + 1 < steps {
+            evaluate(&m, eval_n, ks, threads, seed ^ 0xE5A1);
+        }
+    }
+    println!("— évaluation finale —");
+    evaluate(&m, eval_n.max(64), ks, threads, seed ^ 0xE5A1);
+    demo(&m, seed, ks);
 }
