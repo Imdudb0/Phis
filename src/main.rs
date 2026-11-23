@@ -902,7 +902,7 @@ struct Model {
     nx: usize,
 }
 impl Model {
-    fn new(rng: &mut Rng) -> Model {
+    fn new(rng: &mut Rng, use_struct: bool) -> Model {
         let mut shp = vec![(VOCAB, D)];
         for _ in 0..NL {
             shp.extend_from_slice(&[(1, D), (D, D), (D, D), (D, D), (D, D), (1, D), (D, FF), (FF, D)]);
