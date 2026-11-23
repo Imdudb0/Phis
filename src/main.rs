@@ -6,9 +6,12 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::f32::consts::PI;
-const NV: usize = 4;
-const NS: usize = 12; // symboles du vocabulaire
-const NS_TR: usize = 10; // ids tirés à l'entraînement ; NS_TR..NS réservés au hors-distribution
+use std::fs;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+
+const NV: usize = 4; 
+const NS: usize = 12; 
 const T_BOS: usize = 0;
 const T_SIG: usize = 1;
 const T_RULE: usize = 2;
@@ -19,19 +22,16 @@ const T_HYP: usize = 6;
 const T_END: usize = 7;
 const T_LP: usize = 8;
 const T_RP: usize = 9;
-const T_P: usize = 10; // 4 classes de proba : 10..=13
-const T_AR: usize = 14; // arités 0..=4 : 14..=18 (4 jamais vue à l'entraînement)
-const T_VAR: usize = 19; // 19..=22
-const T_SYM: usize = 23;
+const T_P: usize = 10; 
+const T_AR: usize = 14; 
+const T_VAR: usize = 18; 
+const T_SYM: usize = 22; 
 const VOCAB: usize = T_SYM + NS;
-const LMAX: usize = 4;
-const HMAX: usize = 12;
-const OMAX: usize = 20;
-const MAXT: usize = 256;
-const MAXH: usize = 48;
-const REACH_CAP: usize = 30_000; // plafond d'états du BFS de validité
-const POOL_CAP: usize = 300; // termes « libres » énumérés par l'oracle
-
+const LMAX: usize = 4; 
+const HMAX: usize = 12; 
+const OMAX: usize = 20; 
+const MAXT: usize = 256; 
+const MAXH: usize = 48; 
 struct Rng(u64);
 impl Rng {
     fn new(seed: u64) -> Rng {
@@ -227,30 +227,6 @@ impl Arena {
         let ks: Vec<String> = n.kids.iter().map(|&k| self.show(k)).collect();
         format!("s{}({})", n.sym, ks.join(","))
     }
-    
-    fn count_occ(&self, root: Id, x: Id) -> usize {
-        if root == x {
-            return 1;
-        }
-        self.nodes[root as usize].kids.iter().map(|&k| self.count_occ(k, x)).sum::<usize>()
-    }
-    // remplace seulement les occurrences de x désignées par `mask` (ordre de parcours)
-    fn replace_occ(&mut self, root: Id, x: Id, t: Id, mask: u32, cnt: &mut usize) -> Id {
-        if root == x {
-            let i = *cnt;
-            *cnt += 1;
-            return if i < 32 && (mask >> i) & 1 == 1 { t } else { root };
-        }
-        let n = self.nodes[root as usize].clone();
-        let mut kids = Vec::with_capacity(n.kids.len());
-        let mut changed = false;
-        for &k in &n.kids {
-            let nk = self.replace_occ(k, x, t, mask, cnt);
-            changed |= nk != k;
-            kids.push(nk);
-        }
-        if changed { self.mk(n.sym, kids) } else { root }
-    }
 }
 fn ser_pat(p: &Pat, out: &mut Vec<usize>) {
     match p {
@@ -293,32 +269,20 @@ fn pat_vars(p: &Pat, seen: &mut [bool; NV]) {
         }
     }
 }
-#[derive(Clone, Copy)]
-struct Cfg {
-    pool: usize,                   // ids tirables pour la signature : 0..pool
-    force_new: bool,               // impose ≥ 1 symbole d'id ≥ NS_TR
-    force_ar4: bool,               // impose un symbole d'arité 4
-    rules: Option<(usize, usize)>, // nb de règles [lo, hi] ; None = loi d'entraînement
-    maxt: usize,                   // longueur max de séquence
+struct Sig {
+    syms: Vec<usize>,
+    arity: [usize; NS],
+    has: [bool; NS],
 }
-impl Cfg {
-    fn train() -> Cfg {
-        Cfg { pool: NS_TR, force_new: false, force_ar4: false, rules: None, maxt: MAXT }
-    }
-}
-fn random_sig(rng: &mut Rng, cfg: &Cfg) -> Sig {
-    let n = 5 + rng.below(4);
-    let mut ids: Vec<usize> = (0..cfg.pool).collect();
-    for i in (1..ids.len()).rev() {
+fn random_sig(rng: &mut Rng) -> Sig {
+    let n = 5 + rng.below(4); 
+    let mut ids: Vec<usize> = (0..NS).collect();
+    for i in (1..NS).rev() {
         let j = rng.below(i + 1);
         ids.swap(i, j);
     }
     ids.truncate(n);
-    if cfg.force_new && !ids.iter().any(|&s| s >= NS_TR) {
-        let k = rng.below(ids.len());
-        ids[k] = NS_TR + rng.below(NS - NS_TR);
-    }
-    let ncst = 2 + rng.below(2);
+        let ncst = 2 + rng.below(2); 
     let mut sig = Sig { syms: ids.clone(), arity: [0; NS], has: [false; NS] };
     for (i, &s) in ids.iter().enumerate() {
         sig.has[s] = true;
@@ -329,104 +293,9 @@ fn random_sig(rng: &mut Rng, cfg: &Cfg) -> Sig {
             if u < 0.3 { 1 } else if u < 0.9 { 2 } else { 3 }
         };
     }
-    if cfg.force_ar4 {
-        let k = ncst + rng.below(n - ncst);
-        sig.arity[ids[k]] = 4;
-    }
     sig.syms.sort_unstable();
     sig
 }
-struct Episode {
-    sig: Sig,
-    rules: Vec<Rule>,
-    ar: Arena,
-    h: Id,
-    o: Id,
-    kmax: usize,
-    depth: usize, // profondeur de gen_term utilisée (pour le prior exact)
-    toks: Vec<usize>,
-    plen: usize,
-    jcache: HashMap<Id, (bool, bool)>, // cache du juge
-    capped: usize,                     // nb de jugements plafonnés par REACH_CAP
-}
-fn encode_raw(sig: &Sig, rules: &[Rule], otoks: &[usize], hyp: Option<(&Arena, Id)>) -> (Vec<usize>, usize) {
-    let mut t = vec![T_BOS, T_SIG];
-    for &s in &sig.syms {
-        t.push(T_SYM + s);
-        t.push(T_AR + sig.arity[s]);
-    }
-    for r in rules {
-        t.push(T_RULE);
-        ser_pat(&r.lhs, &mut t);
-        t.push(T_ARROW);
-        for (i, (p, rhs)) in r.outs.iter().enumerate() {
-            if i > 0 {
-                t.push(T_BAR);
-            }
-            t.push(T_P + ptok(*p));
-            ser_pat(rhs, &mut t);
-        }
-    }
-    t.push(T_OBS);
-    t.extend_from_slice(otoks);
-    t.push(T_HYP);
-    let plen = t.len();
-    if let Some((ar, h)) = hyp {
-        ar.ser(h, &mut t);
-        t.push(T_END);
-    }
-    (t, plen)
-}
-fn encode(sig: &Sig, rules: &[Rule], ar: &Arena, o: Id, h: Option<Id>) -> (Vec<usize>, usize) {
-    let mut ot = Vec::new();
-    ar.ser(o, &mut ot);
-    encode_raw(sig, rules, &ot, h.map(|x| (ar, x)))
-}
-fn make_episode_cfg(rng: &mut Rng, cfg: &Cfg, level: usize) -> Episode {
-    loop {
-        let sig = random_sig(rng, cfg);
-        let nr = match cfg.rules {
-            Some((lo, hi)) => lo + rng.below(hi - lo + 1),
-            None => 1 + rng.below((level + 1).min(4)),
-        };
-        let rules = random_rules(rng, &sig, nr);
-        let mut ar = Arena::new();
-        let depth = if level >= 3 { 3 } else { 2 };
-        let h = gen_term(&mut ar, rng, &sig, &rules, depth);
-        if ar.size(h) > HMAX {
-            continue;
-        }
-        let k = 1 + rng.below(level);
-        let mut o = h;
-        let mut ok = true;
-        for _ in 0..k {
-            match ar.step(o, &rules, rng) {
-                Some(n) if ar.size(n) <= OMAX => o = n,
-                _ => {
-                    ok = false;
-                    break;
-                }
-            }
-        }
-        if !ok || o == h {
-            continue;
-        }
-        let (toks, plen) = encode(&sig, &rules, &ar, o, Some(h));
-        if toks.len() > cfg.maxt {
-            continue;
-        }
-        return Episode { sig, rules, ar, h, o, kmax: level, depth, toks, plen, jcache: HashMap::new(), capped: 0 };
-    }
-}
-fn make_episode(rng: &mut Rng, level: usize) -> Episode {
-    make_episode_cfg(rng, &Cfg::train(), level)
-}
-struct Sig {
-    syms: Vec<usize>,
-    arity: [usize; NS],
-    has: [bool; NS],
-}
-
 fn pick_sym(rng: &mut Rng, sig: &Sig, compound: bool) -> usize {
     let c: Vec<usize> = sig.syms.iter().copied().filter(|&s| (sig.arity[s] > 0) == compound).collect();
     c[rng.below(c.len())]
@@ -536,11 +405,80 @@ fn gen_term(ar: &mut Arena, rng: &mut Rng, sig: &Sig, rules: &[Rule], depth: usi
     }
     ar.mk(f, ks)
 }
-
+struct Episode {
+    sig: Sig,
+    rules: Vec<Rule>,
+    ar: Arena,
+    h: Id,       
+    o: Id,       
+    kmax: usize, 
+    toks: Vec<usize>,
+    plen: usize, 
+}
 fn ptok(p: f32) -> usize {
     if p > 0.99 { 3 } else if p > 0.7 { 2 } else if p > 0.4 { 1 } else { 0 }
 }
-
+fn encode(sig: &Sig, rules: &[Rule], ar: &Arena, o: Id, h: Option<Id>) -> (Vec<usize>, usize) {
+    let mut t = vec![T_BOS, T_SIG];
+    for &s in &sig.syms {
+        t.push(T_SYM + s);
+        t.push(T_AR + sig.arity[s]);
+    }
+    for r in rules {
+        t.push(T_RULE);
+        ser_pat(&r.lhs, &mut t);
+        t.push(T_ARROW);
+        for (i, (p, rhs)) in r.outs.iter().enumerate() {
+            if i > 0 {
+                t.push(T_BAR);
+            }
+            t.push(T_P + ptok(*p));
+            ser_pat(rhs, &mut t);
+        }
+    }
+    t.push(T_OBS);
+    ar.ser(o, &mut t);
+    t.push(T_HYP);
+    let plen = t.len();
+    if let Some(h) = h {
+        ar.ser(h, &mut t);
+        t.push(T_END);
+    }
+    (t, plen)
+}
+fn make_episode(rng: &mut Rng, level: usize) -> Episode {
+    loop {
+        let sig = random_sig(rng);
+        let nr = 1 + rng.below((level + 1).min(4));
+        let rules = random_rules(rng, &sig, nr);
+        let mut ar = Arena::new();
+        let depth = if level >= 3 { 3 } else { 2 };
+        let h = gen_term(&mut ar, rng, &sig, &rules, depth);
+        if ar.size(h) > HMAX {
+            continue;
+        }
+        let k = 1 + rng.below(level);
+        let mut o = h;
+        let mut ok = true;
+        for _ in 0..k {
+            match ar.step(o, &rules, rng) {
+                Some(n) if ar.size(n) <= OMAX => o = n,
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if !ok || o == h {
+            continue;
+        }
+        let (toks, plen) = encode(&sig, &rules, &ar, o, Some(h));
+        if toks.len() > MAXT {
+            continue;
+        }
+        return Episode { sig, rules, ar, h, o, kmax: level, toks, plen };
+    }
+}
 fn mm(a: &[f32], b: &[f32], n: usize, k: usize, m: usize) -> Vec<f32> {
     let mut o = vec![0.0f32; n * m];
     for i in 0..n {
@@ -888,15 +826,6 @@ struct Model {
     shp: Vec<(usize, usize)>,
 }
 impl Model {
-        fn shapes() -> Vec<(usize, usize)> {
-        let mut shp = vec![(VOCAB, D)];
-        for _ in 0..NL {
-            shp.extend_from_slice(&[(1, D), (D, D), (D, D), (D, D), (D, D), (1, D), (D, FF), (FF, D)]);
-        }
-        shp.push((1, D));
-        shp.push((D, VOCAB));
-        shp
-    }
     fn new(rng: &mut Rng) -> Model {
         let shp = Model::shapes();
         let resid = 1.0 / ((2 * NL) as f32).sqrt();
@@ -915,77 +844,6 @@ impl Model {
             w.push((0..r * c).map(|_| if r == 1 { 1.0 } else { sd * rng.normal() }).collect());
         }
         Model { w, shp }
-    }
-    fn header() -> [u32; 10] {
-        [1, VOCAB as u32, D as u32, NH as u32, NL as u32, FF as u32, NT as u32, NS as u32, NS_TR as u32, T_SYM as u32]
-    }
-    // format : "PHIS" | 10×u32 (version + architecture) | pas:u64 | graine:u64
-    //          | pour chaque tenseur : lignes:u32 colonnes:u32 données f32 LE | FNV-1a 64 de tout ce qui précède
-    fn save(&self, path: &str, steps: u64, seed: u64) -> std::io::Result<()> {
-        let mut b: Vec<u8> = Vec::new();
-        b.extend_from_slice(b"PHIS");
-        for x in Model::header().iter() {
-            b.extend_from_slice(&x.to_le_bytes());
-        }
-        b.extend_from_slice(&steps.to_le_bytes());
-        b.extend_from_slice(&seed.to_le_bytes());
-        for (w, &(r, c)) in self.w.iter().zip(self.shp.iter()) {
-            b.extend_from_slice(&(r as u32).to_le_bytes());
-            b.extend_from_slice(&(c as u32).to_le_bytes());
-            for &x in w {
-                b.extend_from_slice(&x.to_le_bytes());
-            }
-        }
-        let ck = fnv(&b);
-        b.extend_from_slice(&ck.to_le_bytes());
-        let tmp = format!("{}.tmp", path);
-        std::fs::write(&tmp, &b)?;
-        std::fs::rename(&tmp, path)
-    }
-    fn load(path: &str) -> Result<(Model, u64, u64), String> {
-        let b = std::fs::read(path).map_err(|e| format!("lecture de {} : {}", path, e))?;
-        if b.len() < 4 + 40 + 16 + 8 {
-            return Err("fichier trop court".to_string());
-        }
-        let (body, tail) = b.split_at(b.len() - 8);
-        let mut c8 = [0u8; 8];
-        c8.copy_from_slice(tail);
-        if fnv(body) != u64::from_le_bytes(c8) {
-            return Err("somme de contrôle invalide (fichier corrompu ou tronqué)".to_string());
-        }
-        if &body[..4] != &b"PHIS"[..] {
-            return Err("ce n'est pas un fichier .phis".to_string());
-        }
-        let mut pos = 4usize;
-        let want = Model::header();
-        let mut got = [0u32; 10];
-        for g in got.iter_mut() {
-            *g = rd_u32(body, &mut pos);
-        }
-        if got != want {
-            return Err(format!("architecture incompatible : fichier {:?} ≠ binaire {:?}", got, want));
-        }
-        let steps = rd_u64(body, &mut pos);
-        let seed = rd_u64(body, &mut pos);
-        let shp = Model::shapes();
-        let need: usize = shp.iter().map(|&(r, c)| 8 + 4 * r * c).sum();
-        if body.len() != pos + need {
-            return Err("taille inattendue".to_string());
-        }
-        let mut w: Vec<Vec<f32>> = Vec::with_capacity(shp.len());
-        for &(r, c) in &shp {
-            let fr = rd_u32(body, &mut pos) as usize;
-            let fc = rd_u32(body, &mut pos) as usize;
-            if (fr, fc) != (r, c) {
-                return Err("forme de tenseur inattendue".to_string());
-            }
-            let mut t = Vec::with_capacity(r * c);
-            for _ in 0..r * c {
-                t.push(rd_f32(body, &mut pos));
-            }
-            w.push(t);
-        }
-        Ok((Model { w, shp }, steps, seed))
     }
     fn count(&self) -> usize {
         self.w.iter().map(|v| v.len()).sum()
@@ -1356,100 +1214,6 @@ fn likelihood(ar: &mut Arena, rules: &[Rule], h: Id, o: Id, kmax: usize) -> f64 
     }
     total / kmax as f64
 }
-// successeurs d'un état avec leurs probabilités (mêmes règles que `likelihood`)
-fn succs(ar: &mut Arena, rules: &[Rule], s: Id) -> Vec<(Id, f64)> {
-    let rx = ar.redexes(s, rules);
-    if rx.is_empty() {
-        return Vec::new();
-    }
-    let pr = 1.0 / rx.len() as f64;
-    let mut acc: HashMap<Id, f64> = HashMap::new();
-    for (node, ri, b) in rx {
-        for (q, rhs) in &rules[ri].outs {
-            let rep = ar.inst(rhs, &b);
-            let n = ar.replace(s, node, rep, &mut HashMap::new());
-            if ar.size(n) <= OMAX {
-                *acc.entry(n).or_insert(0.0) += pr * *q as f64;
-            }
-        }
-    }
-    let mut v: Vec<(Id, f64)> = acc.into_iter().collect();
-    v.sort_by_key(|e| e.0);
-    v
-}
-// distance minimale (≥ 1 pas, ≤ kmax) de h à o ; équivaut à likelihood > 0
-fn reach_min(ar: &mut Arena, rules: &[Rule], h: Id, o: Id, kmax: usize, capped: &mut bool) -> Option<usize> {
-    let mut seen: HashSet<Id> = HashSet::new();
-    seen.insert(h);
-    let mut cur = vec![h];
-    for d in 1..=kmax {
-        let mut nxt = Vec::new();
-        for &s in &cur {
-            for (n, _) in succs(ar, rules, s) {
-                if n == o {
-                    return Some(d);
-                }
-                if seen.insert(n) {
-                    nxt.push(n);
-                }
-            }
-        }
-        if nxt.is_empty() {
-            return None;
-        }
-        if seen.len() > REACH_CAP {
-            *capped = true;
-            return None;
-        }
-        cur = nxt;
-    }
-    None
-}
-// (valide ≤ kmax de l'épisode, valide ≤ LMAX) — toujours contre le vrai épisode
-fn judge(ep: &mut Episode, c: Option<Id>) -> (bool, bool) {
-    let id = match c {
-        Some(id) => id,
-        None => return (false, false),
-    };
-    if let Some(&r) = ep.jcache.get(&id) {
-        return r;
-    }
-    let mut capped = false;
-    let hz = ep.kmax.max(LMAX);
-    let r = match reach_min(&mut ep.ar, &ep.rules, id, ep.o, hz, &mut capped) {
-        Some(d) => (d <= ep.kmax, d <= LMAX),
-        None => (false, false),
-    };
-    if capped {
-        ep.capped += 1;
-    }
-    ep.jcache.insert(id, r);
-    r
-}
-fn fnv(bytes: &[u8]) -> u64 {
-    let mut h = 0xcbf2_9ce4_8422_2325u64;
-    for &b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01B3);
-    }
-    h
-}
-fn rd_u32(b: &[u8], p: &mut usize) -> u32 {
-    let v = u32::from_le_bytes([b[*p], b[*p + 1], b[*p + 2], b[*p + 3]]);
-    *p += 4;
-    v
-}
-fn rd_f32(b: &[u8], p: &mut usize) -> f32 {
-    let v = f32::from_le_bytes([b[*p], b[*p + 1], b[*p + 2], b[*p + 3]]);
-    *p += 4;
-    v
-}
-fn rd_u64(b: &[u8], p: &mut usize) -> u64 {
-    let mut a = [0u8; 8];
-    a.copy_from_slice(&b[*p..*p + 8]);
-    *p += 8;
-    u64::from_le_bytes(a)
-}
 #[derive(Default)]
 struct Stats {
     n: usize,
@@ -1601,373 +1365,204 @@ fn grad_check(seed: u64) {
     println!("différences finies : {bad}/{tot} hors tolérance (pire ratio {worst:.2}, < 1 attendu)");
     let diff = consistency(&m, &ep.toks);
     println!("cache K/V vs passe complète : écart max des logits {diff:.2e}");
-    println!("{}", if bad == 0 && diff < 1e-3 { "OK" } else { "ATTENTION : voir ci-dessus" });
-}
-// P(gen_term(depth) = t) exact, pour la signature et les règles de l'épisode
-struct Prior<'a> {
-    sig: &'a Sig,
-    rules: &'a [Rule],
-    nc: f64,
-    nf: f64,
-    memo: HashMap<(Id, usize), f64>,
-}
-impl<'a> Prior<'a> {
-    fn new(sig: &'a Sig, rules: &'a [Rule]) -> Prior<'a> {
-        let nc = sig.syms.iter().filter(|&&s| sig.arity[s] == 0).count() as f64;
-        let nf = sig.syms.iter().filter(|&&s| sig.arity[s] > 0).count() as f64;
-        Prior { sig, rules, nc, nf, memo: HashMap::new() }
-    }
-    fn p(&mut self, ar: &Arena, t: Id, d: usize) -> f64 {
-        if let Some(&v) = self.memo.get(&(t, d)) {
-            return v;
+    // aller-retour .phis : identique bit à bit, et toute altération est détectée
+    let bytes = m.to_bytes(7).expect("sérialisation");
+    let identical = match Model::from_bytes(&bytes) {
+        Ok((m2, st)) => {
+            st == 7
+                && m2.shp == m.shp
+                && m2.w.iter().zip(&m.w).all(|(a, b)| a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits()))
         }
-        let sym = ar.nodes[t as usize].sym;
-        let kids = ar.nodes[t as usize].kids.clone();
-        let known = self.sig.has[sym];
-        let mut pr = 0.0f64;
-        if d == 0 {
-            if known && kids.is_empty() {
-                pr = 1.0 / self.nc;
-            }
-        } else {
-            if known && kids.is_empty() {
-                pr += 0.15 / self.nc;
-            }
-            let rules = self.rules;
-            let mut rs = 0.0f64;
-            for r in rules {
-                let mut b: Bind = [None; NV];
-                if ar.matches(&r.lhs, t, &mut b) {
-                    let mut seen = [false; NV];
-                    pat_vars(&r.lhs, &mut seen);
-                    let mut prod = 1.0f64;
-                    for v in 0..NV {
-                        if seen[v] {
-                            if let Some(x) = b[v] {
-                                prod *= self.p(ar, x, d - 1);
-                            }
-                        }
-                    }
-                    rs += prod / rules.len() as f64;
-                }
-            }
-            pr += 0.85 * 0.4 * rs;
-            if known && !kids.is_empty() && self.sig.arity[sym] == kids.len() {
-                let mut prod = 1.0 / self.nf;
-                for &k in &kids {
-                    prod *= self.p(ar, k, d - 1);
-                }
-                pr += 0.85 * 0.6 * prod;
-            }
-        }
-        self.memo.insert((t, d), pr);
-        pr
-    }
+        Err(_) => false,
+    };
+    let mut flipped = bytes.clone();
+    let mid = flipped.len() / 2;
+    flipped[mid] ^= 0x01;
+    let detected = Model::from_bytes(&flipped).is_err() && Model::from_bytes(&bytes[..bytes.len() - 1]).is_err();
+    println!(
+        "aller-retour .phis : {} octets, identique bit à bit : {identical}, altération détectée : {detected}",
+        bytes.len()
+    );
+    println!("{}", if bad == 0 && diff < 1e-3 && identical && detected { "OK" } else { "ATTENTION : voir ci-dessus" });
 }
+// ───────────────────── Sérialisation du modèle (.phis) ─────────────────────
+// Format v1, petit-boutien, sans dépendance :
+//   "PHIS" | version u32 | D NH NL FF VOCAB NS NV (7 × u32) | pas cumulés u64 | nb de tenseurs u32
+//   puis, pour chaque tenseur : lignes u32 | colonnes u32 | lignes×colonnes × f32
+//   enfin la somme FNV-1a 64 bits de tous les octets précédents (u64).
+// Au chargement, l'architecture et chaque forme sont revérifiées : un fichier produit avec
+// d'autres D / NH / NL / FF / vocabulaire est refusé avec un message explicite.
+const MAGIC: [u8; 4] = *b"PHIS";
+const FORMAT_VERSION: u32 = 1;
+const DEFAULT_MODEL_PATH: &str = "out/sharp.phis";
 
-// pool de petits termes (tous les termes de taille ≤ upto) pour les variables effacées
-struct Pool {
-    terms: Vec<Id>,
-    upto: usize,
+fn err_data(msg: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, msg.into())
 }
-fn tuples(by: &[Vec<Id>], a: usize, total: usize, cur: &mut Vec<Id>, out: &mut Vec<Vec<Id>>, cap: usize) {
-    if out.len() > cap {
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut h = 0xCBF2_9CE4_8422_2325u64;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    h
+}
+fn arch() -> [(&'static str, usize); 7] {
+    [("D", D), ("NH", NH), ("NL", NL), ("FF", FF), ("VOCAB", VOCAB), ("NS", NS), ("NV", NV)]
+}
+struct Reader<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+impl<'a> Reader<'a> {
+    fn take(&mut self, n: usize) -> io::Result<&'a [u8]> {
+        let buf: &'a [u8] = self.buf;
+        match self.pos.checked_add(n) {
+            Some(end) if end <= buf.len() => {
+                let s = &buf[self.pos..end];
+                self.pos = end;
+                Ok(s)
+            }
+            _ => Err(err_data("fichier tronqué")),
+        }
+    }
+    fn u32_le(&mut self) -> io::Result<u32> {
+        let b = self.take(4)?;
+        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+    fn u64_le(&mut self) -> io::Result<u64> {
+        let b = self.take(8)?;
+        Ok(u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+    }
+}
+impl Model {
+    /// Formes de tous les tenseurs (source unique, partagée par `new` et le chargement).
+    fn shapes() -> Vec<(usize, usize)> {
+        let mut shp = vec![(VOCAB, D)];
+        for _ in 0..NL {
+            shp.extend_from_slice(&[(1, D), (D, D), (D, D), (D, D), (D, D), (1, D), (D, FF), (FF, D)]);
+        }
+        shp.push((1, D));
+        shp.push((D, VOCAB));
+        shp
+    }
+    fn to_bytes(&self, steps: u64) -> io::Result<Vec<u8>> {
+        let mut b: Vec<u8> = Vec::with_capacity(64 + 8 * self.w.len() + 4 * self.count());
+        b.extend_from_slice(&MAGIC);
+        b.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        for (_, val) in arch() {
+            b.extend_from_slice(&(val as u32).to_le_bytes());
+        }
+        b.extend_from_slice(&steps.to_le_bytes());
+        b.extend_from_slice(&(self.w.len() as u32).to_le_bytes());
+        for (i, (v, &(r, c))) in self.w.iter().zip(self.shp.iter()).enumerate() {
+            if v.len() != r * c || !v.iter().all(|x| x.is_finite()) {
+                return Err(err_data(format!(
+                    "tenseur {i} : taille incohérente ou valeurs non finies, sauvegarde refusée"
+                )));
+            }
+            b.extend_from_slice(&(r as u32).to_le_bytes());
+            b.extend_from_slice(&(c as u32).to_le_bytes());
+            for x in v {
+                b.extend_from_slice(&x.to_le_bytes());
+            }
+        }
+        let sum = fnv1a(&b);
+        b.extend_from_slice(&sum.to_le_bytes());
+        Ok(b)
+    }
+    fn from_bytes(buf: &[u8]) -> io::Result<(Model, u64)> {
+        let mut rd = Reader { buf, pos: 0 };
+        if rd.take(4)? != &MAGIC[..] {
+            return Err(err_data("signature invalide : ce n'est pas un fichier .phis"));
+        }
+        let ver = rd.u32_le()?;
+        if ver != FORMAT_VERSION {
+            return Err(err_data(format!("format v{ver} non supporté (ce binaire lit la v{FORMAT_VERSION})")));
+        }
+        let (body, tail) = buf.split_at(buf.len() - 8); // ≥ 8 octets déjà lus ci-dessus
+        let mut t = [0u8; 8];
+        t.copy_from_slice(tail);
+        if fnv1a(body) != u64::from_le_bytes(t) {
+            return Err(err_data("somme de contrôle invalide : fichier corrompu ou tronqué"));
+        }
+        rd.buf = body;
+        for (name, want) in arch() {
+            let got = rd.u32_le()? as usize;
+            if got != want {
+                return Err(err_data(format!(
+                    "architecture incompatible : {name} = {got} dans le fichier, {want} dans ce binaire"
+                )));
+            }
+        }
+        let steps = rd.u64_le()?;
+        let shp = Model::shapes();
+        let nt = rd.u32_le()? as usize;
+        if nt != shp.len() {
+            return Err(err_data(format!("{nt} tenseurs dans le fichier, {} attendus", shp.len())));
+        }
+        let mut w: Vec<Vec<f32>> = Vec::with_capacity(nt);
+        for (i, &(r, c)) in shp.iter().enumerate() {
+            let (fr, fc) = (rd.u32_le()? as usize, rd.u32_le()? as usize);
+            if (fr, fc) != (r, c) {
+                return Err(err_data(format!(
+                    "tenseur {i} : forme {fr}×{fc} dans le fichier, {r}×{c} attendue"
+                )));
+            }
+            let raw = rd.take(4 * r * c)?;
+            let v: Vec<f32> = raw
+                .chunks_exact(4)
+                .map(|q| f32::from_le_bytes([q[0], q[1], q[2], q[3]]))
+                .collect();
+            if !v.iter().all(|x| x.is_finite()) {
+                return Err(err_data(format!("tenseur {i} : valeurs non finies")));
+            }
+            w.push(v);
+        }
+        if rd.pos != body.len() {
+            return Err(err_data("octets superflus après le dernier tenseur"));
+        }
+        Ok((Model { w, shp }, steps))
+    }
+}
+/// Écrit `bytes` dans `path.tmp`, puis renomme : le fichier existant n'est jamais à moitié écrit.
+fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    fn go(tmp: &Path, dst: &Path, bytes: &[u8]) -> io::Result<()> {
+        let mut f = fs::File::create(tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        drop(f); // fermé avant le renommage (requis sous Windows)
+        fs::rename(tmp, dst)
+    }
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        fs::create_dir_all(dir)?;
+    }
+    let mut name = path.as_os_str().to_owned();
+    name.push(".tmp");
+    let tmp = PathBuf::from(name);
+    let res = go(&tmp, path, bytes);
+    if res.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    res
+}
+fn save_model(m: &Model, path: &Path, steps: u64) -> io::Result<usize> {
+    let bytes = m.to_bytes(steps)?;
+    write_atomic(path, &bytes)?;
+    Ok(bytes.len())
+}
+fn load_model(path: &Path) -> io::Result<(Model, u64)> {
+    Model::from_bytes(&fs::read(path)?)
+}
+/// Sauvegarde « au mieux » : un échec est signalé mais n'interrompt pas l'entraînement.
+/// `save=none` (ou `save=`) désactive.
+fn persist(m: &Model, path: &str, steps: u64) {
+    if path.is_empty() || path == "none" {
         return;
     }
-    if a == 0 {
-        if total == 0 {
-            out.push(cur.clone());
-        }
-        return;
-    }
-    if total < a {
-        return;
-    }
-    for sz in 1..=(total - (a - 1)) {
-        if sz >= by.len() {
-            break;
-        }
-        for &t in &by[sz] {
-            cur.push(t);
-            tuples(by, a - 1, total - sz, cur, out, cap);
-            cur.pop();
-            if out.len() > cap {
-                return;
-            }
-        }
-    }
-}
-fn build_pool(ar: &mut Arena, sig: &Sig, cap: usize) -> Pool {
-    let mut by: Vec<Vec<Id>> = vec![Vec::new()];
-    let mut all: Vec<Id> = Vec::new();
-    let mut upto = 0usize;
-    for s in 1..=OMAX {
-        let mut cls: Vec<Id> = Vec::new();
-        let mut ok = true;
-        if s == 1 {
-            for &f in &sig.syms {
-                if sig.arity[f] == 0 {
-                    cls.push(ar.mk(f, Vec::new()));
-                }
-            }
-        } else {
-            for &f in &sig.syms {
-                let a = sig.arity[f];
-                if a == 0 {
-                    continue;
-                }
-                let mut tl: Vec<Vec<Id>> = Vec::new();
-                tuples(&by, a, s - 1, &mut Vec::new(), &mut tl, cap);
-                if tl.len() > cap {
-                    ok = false;
-                    break;
-                }
-                for ks in tl {
-                    cls.push(ar.mk(f, ks));
-                }
-            }
-        }
-        if !ok || all.len() + cls.len() > cap {
-            break;
-        }
-        all.extend(cls.iter().copied());
-        by.push(cls);
-        upto = s;
-    }
-    Pool { terms: all, upto }
-}
-fn pat_size_with(p: &Pat, sz: &[usize; NV]) -> usize {
-    match p {
-        Pat::Var(v) => sz[*v as usize],
-        Pat::App(_, ps) => 1 + ps.iter().map(|q| pat_size_with(q, sz)).sum::<usize>(),
-    }
-}
-
-struct Job<'a> {
-    n: Id,         // terme dont on cherche les antécédents
-    x: Id,         // sous-terme de n produit par le membre droit
-    lhs: &'a Pat,
-    sn: isize,     // taille de n
-    xsz: isize,    // taille de x
-    occ: usize,    // occurrences (positions) de x dans n
-    max_size: isize,
-}
-fn min_cand(job: &Job, tsz: isize) -> isize {
-    let d = tsz - job.xsz;
-    job.sn + if d >= 0 { d } else { d * job.occ.min(30) as isize }
-}
-struct Inv<'a> {
-    rules: &'a [Rule],
-    pool: Pool,
-    left: usize, // budget de candidats
-    trunc: bool,
-}
-impl<'a> Inv<'a> {
-    // antécédents candidats de n : s tel que n = s[cible := rhs], sur un sous-ensemble d'occurrences.
-    // Sur-ensemble exact (hors pool/budget) ; chaque candidat est ensuite vérifié par le pas avant.
-    fn preimages(&mut self, ar: &mut Arena, n: Id, max_size: usize, out: &mut Vec<Id>) {
-        let mut subs = ar.reach(n);
-        subs.sort_unstable();
-        let rules = self.rules;
-        for rule in rules {
-            let mut lv = [false; NV];
-            pat_vars(&rule.lhs, &mut lv);
-            for (_, rhs) in &rule.outs {
-                for &x in &subs {
-                    if self.left == 0 {
-                        self.trunc = true;
-                        return;
-                    }
-                    let mut b0: Bind = [None; NV];
-                    if !ar.matches(rhs, x, &mut b0) {
-                        continue;
-                    }
-                    let fv: Vec<usize> = (0..NV).filter(|&v| lv[v] && b0[v].is_none()).collect();
-                    let job = Job {
-                        n,
-                        x,
-                        lhs: &rule.lhs,
-                        sn: ar.size(n) as isize,
-                        xsz: ar.size(x) as isize,
-                        occ: ar.count_occ(n, x),
-                        max_size: max_size as isize,
-                    };
-                    self.fill(ar, &job, &fv, &mut b0, out);
-                }
-            }
-        }
-    }
-    fn fill(&mut self, ar: &mut Arena, job: &Job, fv: &[usize], b: &mut Bind, out: &mut Vec<Id>) {
-        match fv.split_first() {
-            None => {
-                let target = ar.inst(job.lhs, b);
-                let d = ar.size(target) as isize - job.xsz;
-                let occ = job.occ.min(30);
-                let mut masks: Vec<u32> = Vec::new();
-                if occ <= 8 {
-                    for mk in 1u32..(1u32 << occ) {
-                        masks.push(mk);
-                    }
-                } else {
-                    self.trunc = true; // on ne garde que « tout » et les singletons
-                    masks.push(((1u64 << occ) - 1) as u32);
-                    for i in 0..occ {
-                        masks.push(1u32 << i);
-                    }
-                }
-                for mk in masks {
-                    if job.sn + d * mk.count_ones() as isize > job.max_size {
-                        continue;
-                    }
-                    if self.left == 0 {
-                        self.trunc = true;
-                        return;
-                    }
-                    self.left -= 1;
-                    let s = ar.replace_occ(job.n, job.x, target, mk, &mut 0);
-                    out.push(s);
-                }
-            }
-            Some((&v, rest)) => {
-                let mut szs = [1usize; NV];
-                for u in 0..NV {
-                    if let Some(t) = b[u] {
-                        szs[u] = ar.size(t);
-                    }
-                }
-                let np = self.pool.terms.len();
-                let mut broke = false;
-                for pi in 0..np {
-                    let t = self.pool.terms[pi];
-                    szs[v] = ar.size(t);
-                    if min_cand(job, pat_size_with(job.lhs, &szs) as isize) > job.max_size {
-                        broke = true; // pool trié par taille : les suivants sont plus gros
-                        break;
-                    }
-                    b[v] = Some(t);
-                    self.fill(ar, job, rest, b, out);
-                    if self.left == 0 {
-                        self.trunc = true;
-                        b[v] = None;
-                        return;
-                    }
-                }
-                b[v] = None;
-                if !broke {
-                    szs[v] = self.pool.upto + 1; // un terme plus gros aurait-il tenu ?
-                    if min_cand(job, pat_size_with(job.lhs, &szs) as isize) <= job.max_size {
-                        self.trunc = true;
-                    }
-                }
-            }
-        }
-    }
-}
-
-struct Oracle {
-    valid: Vec<Id>, // causes valides (taille ≤ HMAX, juge ≤ kmax), triées
-    z: f64,         // masse a posteriori non normalisée (prior × vraisemblance), h_vrai inclus
-    map: Option<Id>,
-    map_w: f64,
-    w_true: f64,    // poids de la vraie cause (calcul avant exact)
-    w_back: f64,    // même poids par DP arrière (contrôle)
-    has_true: bool, // h_vrai ∈ V énumérée
-    trunc: bool,    // énumération incomplète ⇒ z sous-estimé ⇒ plancher = borne inférieure
-}
-fn oracle(ep: &mut Episode, cfg: &Cfg, cap: usize) -> Oracle {
-    let kmax = ep.kmax;
-    let pool = build_pool(&mut ep.ar, &ep.sig, POOL_CAP);
-    let mut inv = Inv { rules: &ep.rules, pool, left: cap, trunc: false };
-    // v[j][s] = P(s atteint o en exactement j pas)
-    let mut v: Vec<HashMap<Id, f64>> = vec![HashMap::new(); kmax + 1];
-    v[0].insert(ep.o, 1.0);
-    for j in 1..=kmax {
-        let max_size = if j == kmax { HMAX } else { OMAX };
-        let mut prev: Vec<Id> = v[j - 1].keys().copied().collect();
-        prev.sort_unstable();
-        let mut cand: Vec<Id> = Vec::new();
-        for n in prev {
-            inv.preimages(&mut ep.ar, n, max_size, &mut cand);
-            if inv.left == 0 {
-                break;
-            }
-        }
-        cand.sort_unstable();
-        cand.dedup();
-        let mut cur: HashMap<Id, f64> = HashMap::new();
-        for s in cand {
-            let mut w = 0.0f64;
-            for (n2, p) in succs(&mut ep.ar, &ep.rules, s) {
-                if let Some(&vv) = v[j - 1].get(&n2) {
-                    w += p * vv;
-                }
-            }
-            if w > 0.0 {
-                cur.insert(s, w);
-            }
-        }
-        v[j] = cur;
-    }
-    let mut tot: HashMap<Id, f64> = HashMap::new();
-    for j in 1..=kmax {
-        for (&s, &w) in v[j].iter() {
-            *tot.entry(s).or_insert(0.0) += w;
-        }
-    }
-    let mut ids: Vec<Id> = tot.keys().copied().collect();
-    ids.sort_unstable();
-    let mut pr = Prior::new(&ep.sig, &ep.rules);
-    let mut valid: Vec<Id> = Vec::new();
-    let mut z = 0.0f64;
-    let mut best: Option<(Id, f64)> = None;
-    let mut has_true = false;
-    let mut w_back = 0.0f64;
-    for s in ids {
-        if ep.ar.size(s) > HMAX {
-            continue;
-        }
-        valid.push(s);
-        if s == ep.o {
-            continue; // hors support : le générateur impose o ≠ h
-        }
-        let mut tk: Vec<usize> = Vec::new();
-        ep.ar.ser(s, &mut tk);
-        if ep.plen + tk.len() + 1 > cfg.maxt {
-            continue; // le générateur rejette les séquences trop longues
-        }
-        let w = pr.p(&ep.ar, s, ep.depth) * tot[&s] / kmax as f64;
-        if s == ep.h {
-            has_true = true;
-            w_back = w;
-        }
-        if w <= 0.0 {
-            continue;
-        }
-        z += w;
-        if best.map_or(true, |b| w > b.1) {
-            best = Some((s, w));
-        }
-    }
-    let l_true = likelihood(&mut ep.ar, &ep.rules, ep.h, ep.o, kmax);
-    let w_true = pr.p(&ep.ar, ep.h, ep.depth) * l_true;
-    if !has_true {
-        valid.push(ep.h);
-        z += w_true; // garde z ≥ w_true : le plancher reste une borne inférieure valide
-        if best.map_or(true, |b| w_true > b.1) {
-            best = Some((ep.h, w_true));
-        }
-    }
-    valid.sort_unstable();
-    valid.dedup();
-    Oracle {
-        valid,
-        z,
-        map: best.map(|b| b.0),
-        map_w: best.map_or(0.0, |b| b.1),
-        w_true,
-        w_back,
-        has_true,
-        trunc: inv.trunc,
+    match save_model(m, Path::new(path), steps) {
+        Ok(n) => println!("  ↳ modèle sauvegardé : {path} ({n} octets, {steps} pas cumulés)"),
+        Err(e) => eprintln!("  ↳ ERREUR : sauvegarde de {path} impossible : {e}"),
     }
 }
 fn demo(m: &Model, seed: u64, k: usize) {
@@ -2025,16 +1620,35 @@ fn main() {
     let eval_every: usize = arg(&kv, "eval_every", 1000);
     let eval_n: usize = arg(&kv, "eval_n", 32);
     let ks: usize = arg(&kv, "k", 8);
-    let curriculum: u32 = arg(&kv, "curriculum", 1);
+    // persistance : save=<fichier|none>, save_every=<pas ; 0 = fin seulement>, load=<fichier>
+    let load_path: Option<String> = kv.get("load").cloned();
+    let save_path: String = arg(&kv, "save", DEFAULT_MODEL_PATH.to_string());
+    let save_every: usize = arg(&kv, "save_every", 500);
+    // un modèle chargé a déjà suivi le curriculum : on repart directement au niveau max
+    let curriculum: u32 = arg(&kv, "curriculum", if load_path.is_some() { 0 } else { 1 });
     let mut rng = Rng::new(seed);
-    let mut m = Model::new(&mut rng);
+    let (mut m, steps_done) = match &load_path {
+        Some(p) => match load_model(Path::new(p)) {
+            Ok((m, done)) => {
+                println!("modèle chargé : {p} ({} paramètres, {done} pas déjà effectués)", m.count());
+                // re-semer pour ne pas rejouer exactement les lots de l'entraînement précédent
+                rng = Rng::new(seed ^ done.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+                (m, done)
+            }
+            Err(e) => {
+                eprintln!("chargement de {p} impossible : {e}");
+                std::process::exit(1);
+            }
+        },
+        None => (Model::new(&mut rng), 0u64),
+    };
     let mut adam = Adam::new(&m.w);
     println!(
         "PTGRS-Abducer : {} paramètres | {} threads | lot {} | {} pas | lr {:.1e}",
         m.count(), threads, bs, steps, lr
     );
     let t0 = std::time::Instant::now();
-    let ramp = (steps * 3 / 5).max(1); 
+    let ramp = (steps * 3 / 5).max(1);
     for step in 0..steps {
         let maxlv = if curriculum == 1 { (1 + step * LMAX / ramp).min(LMAX) } else { LMAX };
         let batch = make_batch(&mut rng, bs, maxlv);
@@ -2062,6 +1676,12 @@ fn main() {
         if eval_every > 0 && (step + 1) % eval_every == 0 && step + 1 < steps {
             evaluate(&m, eval_n, ks, threads, seed ^ 0xE5A1);
         }
+        if save_every > 0 && (step + 1) % save_every == 0 && step + 1 < steps {
+            persist(&m, &save_path, steps_done + (step + 1) as u64);
+        }
+    }
+    if steps > 0 {
+        persist(&m, &save_path, steps_done + steps as u64); // avant l'évaluation, qui est longue
     }
     println!("— évaluation finale —");
     evaluate(&m, eval_n.max(64), ks, threads, seed ^ 0xE5A1);
