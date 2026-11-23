@@ -28,7 +28,7 @@ jobs:
       - name: Run Phisharp
         run: |
           #cargo check
-          cargo run --release -- steps=20000 threads=4 struct=1 beam=8 eval_n=128 eval_reps=3 ood=1
+          cargo run --release
           #cargo run --release --bin ask -- --model out/sharp.phis --file perceived.eff
           #cargo run --release --bin phisharp -- train --steps 800 --batch 4 --nodes 16 --dim 16 --max-search 8 --out out/sharp.phis
         env:
