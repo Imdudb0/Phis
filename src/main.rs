@@ -270,15 +270,38 @@ struct Sig {
     arity: [usize; NS],
     has: [bool; NS],
 }
-fn random_sig(rng: &mut Rng) -> Sig {
-    let n = 5 + rng.below(4); 
-    let mut ids: Vec<usize> = (0..NS).collect();
-    for i in (1..NS).rev() {
+#[derive(Clone)]
+struct Cfg {
+    syms: Vec<usize>,
+    nr_max: usize,
+    lhs_bias: f32,
+    depth: usize,
+}
+impl Cfg {
+    fn train() -> Cfg {
+        Cfg { syms: (0..NS).collect(), nr_max: 4, lhs_bias: 0.4, depth: 0 }
+    }
+    fn named(s: &str) -> Cfg {
+        let mut c = Cfg::train();
+        match s {
+            "symheld" => c.syms = (8..NS).collect(),
+            "rules8" => c.nr_max = 8,
+            "noprior" => c.lhs_bias = 0.0,
+            "deep" => c.depth = 4,
+            _ => {}
+        }
+        c
+    }
+}
+fn random_sig(rng: &mut Rng, cfg: &Cfg) -> Sig {
+    let n = (5 + rng.below(4)).min(cfg.syms.len()).max(3);
+    let mut ids = cfg.syms.clone();
+    for i in (1..ids.len()).rev() {
         let j = rng.below(i + 1);
         ids.swap(i, j);
     }
     ids.truncate(n);
-        let ncst = 2 + rng.below(2); 
+    let ncst = (2 + rng.below(2)).min(n - 1);
     let mut sig = Sig { syms: ids.clone(), arity: [0; NS], has: [false; NS] };
     for (i, &s) in ids.iter().enumerate() {
         sig.has[s] = true;
@@ -377,19 +400,19 @@ fn random_rules(rng: &mut Rng, sig: &Sig, nr: usize) -> Vec<Rule> {
     }
     rules
 }
-fn gen_term(ar: &mut Arena, rng: &mut Rng, sig: &Sig, rules: &[Rule], depth: usize) -> Id {
+fn gen_term(ar: &mut Arena, rng: &mut Rng, sig: &Sig, rules: &[Rule], depth: usize, bias: f32) -> Id {
     if depth == 0 || rng.chance(0.15) {
         let c = pick_sym(rng, sig, false);
         return ar.mk(c, Vec::new());
     }
-    if rng.chance(0.4) {
+    if rng.chance(bias) {
         let r = &rules[rng.below(rules.len())];
         let mut seen = [false; NV];
         pat_vars(&r.lhs, &mut seen);
         let mut b: Bind = [None; NV];
         for v in 0..NV {
             if seen[v] {
-                b[v] = Some(gen_term(ar, rng, sig, rules, depth - 1));
+                b[v] = Some(gen_term(ar, rng, sig, rules, depth - 1, bias));
             }
         }
         return ar.inst(&r.lhs, &b);
@@ -397,7 +420,7 @@ fn gen_term(ar: &mut Arena, rng: &mut Rng, sig: &Sig, rules: &[Rule], depth: usi
     let f = pick_sym(rng, sig, true);
     let mut ks = Vec::new();
     for _ in 0..sig.arity[f] {
-        ks.push(gen_term(ar, rng, sig, rules, depth - 1));
+        ks.push(gen_term(ar, rng, sig, rules, depth - 1, bias));
     }
     ar.mk(f, ks)
 }
@@ -442,14 +465,21 @@ fn encode(sig: &Sig, rules: &[Rule], ar: &Arena, o: Id, h: Option<Id>) -> (Vec<u
     }
     (t, plen)
 }
-fn make_episode(rng: &mut Rng, level: usize) -> Episode {
+fn make_episode(rng: &mut Rng, level: usize, cfg: &Cfg) -> Episode {
+    let cap = if cfg.nr_max > 4 { cfg.nr_max } else { (level + 1).min(4) };
+    let tmax = if cfg.nr_max > 4 { 512 } else { MAXT };
+    let mut guard = 0usize;
     loop {
-        let sig = random_sig(rng);
-        let nr = 1 + rng.below((level + 1).min(4));
+        guard += 1;
+        if guard > 200_000 {
+            panic!("make_episode : rejet excessif (cfg trop contraint)");
+        }
+        let sig = random_sig(rng, cfg);
+        let nr = 1 + rng.below(cap);
         let rules = random_rules(rng, &sig, nr);
         let mut ar = Arena::new();
-        let depth = if level >= 3 { 3 } else { 2 };
-        let h = gen_term(&mut ar, rng, &sig, &rules, depth);
+        let depth = if cfg.depth > 0 { cfg.depth } else if level >= 3 { 3 } else { 2 };
+        let h = gen_term(&mut ar, rng, &sig, &rules, depth, cfg.lhs_bias);
         if ar.size(h) > HMAX {
             continue;
         }
@@ -469,7 +499,7 @@ fn make_episode(rng: &mut Rng, level: usize) -> Episode {
             continue;
         }
         let (toks, plen) = encode(&sig, &rules, &ar, o, Some(h));
-        if toks.len() > MAXT {
+        if toks.len() > tmax {
             continue;
         }
         return Episode { sig, rules, ar, h, o, kmax: level, toks, plen };
@@ -816,10 +846,60 @@ const NL: usize = 3;
 const FF: usize = 128; 
 const PL: usize = 8; 
 const NT: usize = 3 + NL * PL; 
+const NSEG: usize = 6;
+const SDEP: usize = 8;
+const SCH: usize = 4;
+
+#[derive(Clone)]
+struct Feat {
+    seg: usize,
+    dep: usize,
+    cnt: [usize; SDEP + 2],
+}
+impl Feat {
+    fn new() -> Feat {
+        Feat { seg: 0, dep: 0, cnt: [0; SDEP + 2] }
+    }
+    fn get(&self, t: usize) -> (usize, usize, usize) {
+        let s = match t {
+            T_BOS | T_SIG => 1,
+            T_RULE => 2,
+            T_ARROW | T_BAR => 3,
+            T_OBS => 4,
+            T_HYP => 5,
+            _ => self.seg,
+        };
+        let (d, c) = if t >= T_SYM { (self.dep, self.cnt[self.dep].min(SCH - 1)) } else { (0, 0) };
+        (s, d, c)
+    }
+    fn adv(&mut self, t: usize) {
+        match t {
+            T_BOS | T_SIG => { self.seg = 1; self.dep = 0; self.cnt = [0; SDEP + 2]; }
+            T_RULE => { self.seg = 2; self.dep = 0; self.cnt = [0; SDEP + 2]; }
+            T_ARROW | T_BAR => { self.seg = 3; self.dep = 0; self.cnt = [0; SDEP + 2]; }
+            T_OBS => { self.seg = 4; self.dep = 0; self.cnt = [0; SDEP + 2]; }
+            T_HYP => { self.seg = 5; self.dep = 0; self.cnt = [0; SDEP + 2]; }
+            T_LP => { self.dep = (self.dep + 1).min(SDEP - 1); self.cnt[self.dep] = 0; }
+            T_RP => { self.dep = self.dep.saturating_sub(1); }
+            _ => { if t >= T_SYM { self.cnt[self.dep] += 1; } }
+        }
+    }
+}
+fn struct_feats(toks: &[usize]) -> (Vec<usize>, Vec<usize>, Vec<usize>) {
+    let mut f = Feat::new();
+    let (mut a, mut b, mut c) = (Vec::with_capacity(toks.len()), Vec::with_capacity(toks.len()), Vec::with_capacity(toks.len()));
+    for &t in toks {
+        let (s, d, ch) = f.get(t);
+        a.push(s); b.push(d); c.push(ch);
+        f.adv(t);
+    }
+    (a, b, c)
+}
 type Seq = (Vec<usize>, usize); 
 struct Model {
     w: Vec<Vec<f32>>,
     shp: Vec<(usize, usize)>,
+    nx: usize,
 }
 impl Model {
     fn new(rng: &mut Rng) -> Model {
@@ -829,6 +909,10 @@ impl Model {
         }
         shp.push((1, D));
         shp.push((D, VOCAB));
+        let nx = if use_struct { 3 } else { 0 };
+        if use_struct {
+            shp.extend_from_slice(&[(NSEG, D), (SDEP, D), (SCH, D)]);
+        }
         let resid = 1.0 / ((2 * NL) as f32).sqrt();
         let mut w: Vec<Vec<f32>> = Vec::with_capacity(NT);
         for (i, &(r, c)) in shp.iter().enumerate() {
@@ -842,9 +926,13 @@ impl Model {
                 let base = 1.0 / (r as f32).sqrt();
                 if matches!((i - 1) % PL, 4 | 7) { base * resid } else { base }
             };
-            w.push((0..r * c).map(|_| if r == 1 { 1.0 } else { sd * rng.normal() }).collect());
+            if i >= NT {
+                w.push(vec![0.0f32; r * c]);
+            } else {
+                w.push((0..r * c).map(|_| if r == 1 { 1.0 } else { sd * rng.normal() }).collect());
+            }
         }
-        Model { w, shp }
+        Model { w, shp, nx }
     }
     fn count(&self) -> usize {
         self.w.iter().map(|v| v.len()).sum()
@@ -857,8 +945,17 @@ impl Model {
         tp
     }
 }
-fn forward(tp: &mut Tape, toks: &[usize]) -> usize {
+fn forward(tp: &mut Tape, toks: &[usize], nx: usize) -> usize {
     let mut x = tp.embed(0, toks);
+    if nx > 0 {
+        let (sg, dp, ch) = struct_feats(toks);
+        let a = tp.embed(NT, &sg);
+        x = tp.add(x, a);
+        let a = tp.embed(NT + 1, &dp);
+        x = tp.add(x, a);
+        let a = tp.embed(NT + 2, &ch);
+        x = tp.add(x, a);
+    }
     for l in 0..NL {
         let b = 1 + l * PL;
         let h = tp.rms(x, b);
@@ -882,7 +979,7 @@ fn forward(tp: &mut Tape, toks: &[usize]) -> usize {
 fn seq_run(m: &Model, toks: &[usize], plen: usize, scale: f32, acc: Option<&mut Vec<Vec<f32>>>) -> f32 {
     let n = toks.len() - 1;
     let mut tp = m.tape();
-    let lg = forward(&mut tp, &toks[..n]);
+    let lg = forward(&mut tp, &toks[..n], m.nx);
     let mask: Vec<bool> = (0..n).map(|i| i + 1 >= plen).collect();
     let loss = tp.xent(lg, toks[1..].to_vec(), mask, scale);
     let val = tp.val[loss][0];
@@ -928,10 +1025,11 @@ fn train_step(m: &Model, batch: &[Seq], nthreads: usize) -> (f32, Vec<Vec<f32>>)
     (loss, grads)
 }
 fn make_batch(rng: &mut Rng, size: usize, maxlv: usize) -> Vec<Seq> {
+    let cfg = Cfg::train();
     (0..size)
         .map(|_| {
             let lv = 1 + rng.below(maxlv);
-            let e = make_episode(rng, lv);
+            let e = make_episode(rng, lv, &cfg);
             (e.toks, e.plen)
         })
         .collect()
@@ -951,7 +1049,7 @@ impl Adam {
         let (b1, b2) = (0.9f32, 0.98f32);
         let (c1, c2) = (1.0 - b1.powi(self.t), 1.0 - b2.powi(self.t));
         for i in 0..w.len() {
-            let dec = if shp[i].0 == 1 { 0.0 } else { wd };
+            let dec = if shp[i].0 == 1 || i >= NT { 0.0 } else { wd };
             for j in 0..w[i].len() {
                 let gj = g[i][j];
                 self.m[i][j] = b1 * self.m[i][j] + (1.0 - b1) * gj;
@@ -975,10 +1073,11 @@ struct Cache {
     k: Vec<Vec<f32>>,
     v: Vec<Vec<f32>>,
     len: usize,
+    ft: Feat,
 }
 impl Cache {
     fn new() -> Cache {
-        Cache { k: vec![Vec::new(); NL], v: vec![Vec::new(); NL], len: 0 }
+        Cache { k: vec![Vec::new(); NL], v: vec![Vec::new(); NL], len: 0, ft: Feat::new() }
     }
 }
 fn rms_row(x: &[f32], g: &[f32]) -> Vec<f32> {
@@ -1003,6 +1102,13 @@ fn infer_step(m: &Model, ca: &mut Cache, tok: usize) -> Vec<f32> {
     let dh = D / NH;
     let sc = 1.0 / (dh as f32).sqrt();
     let mut x = m.w[0][tok * D..(tok + 1) * D].to_vec();
+    if m.nx > 0 {
+        let (sg, dp, ch) = ca.ft.get(tok);
+        for j in 0..D {
+            x[j] += m.w[NT][sg * D + j] + m.w[NT + 1][dp * D + j] + m.w[NT + 2][ch * D + j];
+        }
+    }
+    ca.ft.adv(tok);
     for l in 0..NL {
         let b = 1 + l * PL;
         let h = rms_row(&x, &m.w[b]);
@@ -1062,8 +1168,9 @@ fn prefill(m: &Model, prompt: &[usize]) -> (Cache, Vec<f32>) {
     }
     (ca, lg)
 }
+#[derive(Clone)]
 struct Gram {
-    stack: Vec<usize>, 
+    stack: Vec<usize>,
     nodes: usize,
     lp: bool,
     done: bool,
@@ -1160,6 +1267,63 @@ fn decode(m: &Model, base: &Cache, first: &[f32], sig: &Sig, temp: f32, uniform:
     }
     out
 }
+fn beam_decode(m: &Model, base: &Cache, first: &[f32], sig: &Sig, width: usize) -> Vec<(Vec<usize>, f32)> {
+    struct BN {
+        toks: Vec<usize>,
+        lp: f32,
+        ca: Cache,
+        lg: Vec<f32>,
+        g: Gram,
+    }
+    let mut beam = vec![BN {
+        toks: Vec::new(),
+        lp: 0.0,
+        ca: base.clone(),
+        lg: first.to_vec(),
+        g: Gram::new(),
+    }];
+    let mut fin: Vec<(Vec<usize>, f32)> = Vec::new();
+    for _ in 0..MAXH {
+        if beam.is_empty() {
+            break;
+        }
+        let mut cand: Vec<(usize, usize, f32)> = Vec::new();
+        for (pi, nd) in beam.iter().enumerate() {
+            let al = nd.g.allowed(sig);
+            let mx = al.iter().map(|&t| nd.lg[t]).fold(f32::NEG_INFINITY, f32::max);
+            let lz = mx + al.iter().map(|&t| (nd.lg[t] - mx).exp()).sum::<f32>().ln();
+            for &t in &al {
+                cand.push((pi, t, nd.lp + nd.lg[t] - lz));
+            }
+        }
+        cand.sort_unstable_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        cand.truncate(width);
+        let mut next: Vec<BN> = Vec::with_capacity(cand.len());
+        for (pi, t, sc) in cand {
+            let p = &beam[pi];
+            let mut toks = p.toks.clone();
+            toks.push(t);
+            if t == T_END {
+                fin.push((toks, sc));
+                continue;
+            }
+            let mut g = p.g.clone();
+            g.push(t, sig);
+            let mut ca = p.ca.clone();
+            let lg = infer_step(m, &mut ca, t);
+            next.push(BN { toks, lp: sc, ca, lg, g });
+        }
+        beam = next;
+        fin.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        fin.truncate(width);
+        let best_run = beam.iter().map(|n| n.lp).fold(f32::NEG_INFINITY, f32::max);
+        if fin.len() == width && best_run <= fin[width - 1].1 {
+            break;
+        }
+    }
+    fin.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    fin
+}
 fn parse(ar: &mut Arena, sig: &Sig, t: &[usize], pos: &mut usize) -> Option<Id> {
     let tk = *t.get(*pos)?;
     if tk < T_SYM || tk >= T_SYM + NS || !sig.has[tk - T_SYM] {
@@ -1188,7 +1352,12 @@ fn parse_cause(ar: &mut Arena, sig: &Sig, out: &[usize]) -> Option<Id> {
     let id = parse(ar, sig, out, &mut pos)?;
     if out.get(pos) == Some(&T_END) { Some(id) } else { None }
 }
+const LK_CAP: usize = 8192;
+
 fn likelihood(ar: &mut Arena, rules: &[Rule], h: Id, o: Id, kmax: usize) -> f64 {
+    if h == o || kmax == 0 {
+        return 0.0;
+    }
     let mut cur: HashMap<Id, f64> = HashMap::new();
     cur.insert(h, 1.0);
     let mut total = 0.0f64;
@@ -1211,17 +1380,44 @@ fn likelihood(ar: &mut Arena, rules: &[Rule], h: Id, o: Id, kmax: usize) -> f64 
             }
         }
         total += nxt.get(&o).copied().unwrap_or(0.0);
+        if nxt.len() > LK_CAP {
+            let mut v: Vec<(Id, f64)> = nxt.into_iter().collect();
+            v.sort_unstable_by(|a, b| {
+                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0))
+            });
+            v.truncate(LK_CAP);
+            nxt = v.into_iter().collect();
+            nxt.entry(o).or_insert(0.0);
+        }
         cur = nxt;
+        if cur.is_empty() {
+            break;
+        }
     }
     total / kmax as f64
+}
+
+fn lk_cached(ar: &mut Arena, rules: &[Rule], h: Id, o: Id, kmax: usize, c: &mut HashMap<Id, f64>) -> f64 {
+    if let Some(&v) = c.get(&h) {
+        return v;
+    }
+    let v = likelihood(ar, rules, h, o, kmax);
+    c.insert(h, v);
+    v
 }
 #[derive(Default)]
 struct Stats {
     n: usize,
     nll: f64,
     ntok: usize,
+    unverif: usize,
     g_valid: usize,
     g_exact: usize,
+    g_better: usize,
+    regret: f64,
+    b_valid: usize,
+    b_better: usize,
+    b_any: usize,
     s_valid: usize,
     s_any: usize,
     u_valid: usize,
@@ -1232,8 +1428,14 @@ impl Stats {
         self.n += o.n;
         self.nll += o.nll;
         self.ntok += o.ntok;
+        self.unverif += o.unverif;
         self.g_valid += o.g_valid;
         self.g_exact += o.g_exact;
+        self.g_better += o.g_better;
+        self.regret += o.regret;
+        self.b_valid += o.b_valid;
+        self.b_better += o.b_better;
+        self.b_any += o.b_any;
         self.s_valid += o.s_valid;
         self.s_any += o.s_any;
         self.u_valid += o.u_valid;
@@ -1243,29 +1445,63 @@ impl Stats {
 fn pct(a: usize, b: usize) -> f64 {
     100.0 * a as f64 / b.max(1) as f64
 }
-fn eval_chunk(m: &Model, eps: &mut [Episode], k: usize, seed: u64) -> Stats {
+fn eval_chunk(m: &Model, eps: &mut [Episode], k: usize, seed: u64, bw: usize) -> Stats {
     let mut st = Stats::default();
     let mut rng = Rng::new(seed);
     for ep in eps.iter_mut() {
         st.n += 1;
         st.nll += seq_run(m, &ep.toks, ep.plen, 1.0, None) as f64;
         st.ntok += ep.toks.len() - ep.plen;
+        let mut vc: HashMap<Id, f64> = HashMap::new();
+        let lt = lk_cached(&mut ep.ar, &ep.rules, ep.h, ep.o, LMAX, &mut vc);
+        if lt <= 0.0 {
+            st.unverif += 1;
+        }
         let (base, first) = prefill(m, &ep.toks[..ep.plen]);
+
         let out = decode(m, &base, &first, &ep.sig, 0.0, false, &mut rng);
         if let Some(id) = parse_cause(&mut ep.ar, &ep.sig, &out) {
+            let lp = lk_cached(&mut ep.ar, &ep.rules, id, ep.o, LMAX, &mut vc);
             if id == ep.h {
                 st.g_exact += 1;
             }
-            if likelihood(&mut ep.ar, &ep.rules, id, ep.o, LMAX) > 0.0 {
+            if lp > 0.0 {
                 st.g_valid += 1;
             }
+            if lt > 0.0 {
+                if lp >= lt {
+                    st.g_better += 1;
+                }
+                st.regret += lt.max(1e-12).ln() - lp.max(1e-12).ln();
+            }
         }
+
+        if bw > 0 {
+            let cands = beam_decode(m, &base, &first, &ep.sig, bw);
+            let mut any = false;
+            for (i, (tk, _)) in cands.iter().enumerate() {
+                if let Some(id) = parse_cause(&mut ep.ar, &ep.sig, tk) {
+                    let lp = lk_cached(&mut ep.ar, &ep.rules, id, ep.o, LMAX, &mut vc);
+                    if lp > 0.0 {
+                        any = true;
+                        if i == 0 {
+                            st.b_valid += 1;
+                        }
+                    }
+                    if i == 0 && lt > 0.0 && lp >= lt {
+                        st.b_better += 1;
+                    }
+                }
+            }
+            st.b_any += any as usize;
+        }
+
         for uni in [false, true] {
             let mut any = false;
             for _ in 0..k {
                 let out = decode(m, &base, &first, &ep.sig, 1.0, uni, &mut rng);
                 let ok = match parse_cause(&mut ep.ar, &ep.sig, &out) {
-                    Some(id) => likelihood(&mut ep.ar, &ep.rules, id, ep.o, LMAX) > 0.0,
+                    Some(id) => lk_cached(&mut ep.ar, &ep.rules, id, ep.o, LMAX, &mut vc) > 0.0,
                     None => false,
                 };
                 any |= ok;
@@ -1284,35 +1520,42 @@ fn eval_chunk(m: &Model, eps: &mut [Episode], k: usize, seed: u64) -> Stats {
     }
     st
 }
-fn evaluate(m: &Model, n: usize, k: usize, nthreads: usize, seed: u64) {
+fn evaluate(m: &Model, n: usize, k: usize, nthreads: usize, seed: u64, reps: usize, bw: usize, cfg: &Cfg, label: &str) {
+    println!("— {label} —");
     for level in 1..=LMAX {
-        let mut rng = Rng::new(seed ^ (level as u64).wrapping_mul(7919));
-        let mut eps: Vec<Episode> = (0..n).map(|_| make_episode(&mut rng, level)).collect();
-        let per = ((n + nthreads - 1) / nthreads).max(1);
         let mut st = Stats::default();
-        std::thread::scope(|sc| {
-            let mut hs = Vec::new();
-            for (i, ch) in eps.chunks_mut(per).enumerate() {
-                let sd = seed.wrapping_add(1 + i as u64 + 97 * level as u64);
-                hs.push(sc.spawn(move || eval_chunk(m, ch, k, sd)));
-            }
-            for h in hs {
-                st.add(&h.join().expect("thread d'évaluation"));
-            }
-        });
+        for rep in 0..reps.max(1) {
+            let sd = seed ^ (level as u64).wrapping_mul(7919) ^ (rep as u64).wrapping_mul(104_729);
+            let mut rng = Rng::new(sd);
+            let mut eps: Vec<Episode> = (0..n).map(|_| make_episode(&mut rng, level, cfg)).collect();
+            let per = ((n + nthreads - 1) / nthreads).max(1);
+            std::thread::scope(|sc| {
+                let mut hs = Vec::new();
+                for (i, ch) in eps.chunks_mut(per).enumerate() {
+                    let s2 = sd.wrapping_add(1 + i as u64 + 97 * level as u64);
+                    hs.push(sc.spawn(move || eval_chunk(m, ch, k, s2, bw)));
+                }
+                for h in hs {
+                    st.add(&h.join().expect("thread d'évaluation"));
+                }
+            });
+        }
+        let nden = st.n - st.unverif;
         println!(
-            "  niv {level} │ NLL/tok {:.3} │ glouton : {:.0}% valide, {:.0}% exact │ échantillons : {:.0}% valides, ≥1 sur {k} : {:.0}% │ uniforme : {:.0}% valides, ≥1 sur {k} : {:.0}%",
+            "  niv {level} │ NLL {:.3} │ glouton {:.0}%val {:.0}%exact {:.0}%≥vraie │ beam {:.0}%val {:.0}%≥vraie any {:.0}% │ éch {:.0}%val ≥1/{k} {:.0}% │ unif {:.0}%val │ regret {:+.3} │ non-vérif {}",
             st.nll / st.ntok.max(1) as f64,
-            pct(st.g_valid, st.n), pct(st.g_exact, st.n),
+            pct(st.g_valid, st.n), pct(st.g_exact, st.n), pct(st.g_better, nden),
+            pct(st.b_valid, st.n), pct(st.b_better, nden), pct(st.b_any, st.n),
             pct(st.s_valid, st.n * k), pct(st.s_any, st.n),
-            pct(st.u_valid, st.n * k), pct(st.u_any, st.n)
+            pct(st.u_valid, st.n * k),
+            st.regret / nden.max(1) as f64, st.unverif
         );
     }
 }
 fn consistency(m: &Model, toks: &[usize]) -> f32 {
     let n = toks.len() - 1;
     let mut tp = m.tape();
-    let lg = forward(&mut tp, &toks[..n]);
+    let lg = forward(&mut tp, &toks[..n], m.nx);
     let mut ca = Cache::new();
     let mut worst = 0.0f32;
     for i in 0..n {
@@ -1323,10 +1566,10 @@ fn consistency(m: &Model, toks: &[usize]) -> f32 {
     }
     worst
 }
-fn grad_check(seed: u64) {
+fn grad_check(seed: u64, use_struct: bool) {
     let mut rng = Rng::new(seed);
-    let mut m = Model::new(&mut rng);
-    let ep = make_episode(&mut rng, 2);
+    let mut m = Model::new(&mut rng, use_struct);
+    let ep = make_episode(&mut rng, 2, &Cfg::train());
     let ntgt = ep.toks.len() - ep.plen;
     let scale = 1.0 / ntgt as f32;
     println!("check : {} paramètres, séquence de {} tokens ({} cibles)", m.count(), ep.toks.len(), ntgt);
@@ -1370,7 +1613,7 @@ fn grad_check(seed: u64) {
 }
 fn demo(m: &Model, seed: u64, k: usize) {
     let mut rng = Rng::new(seed ^ 0xDE30);
-    let mut ep = make_episode(&mut rng, 3);
+    let mut ep = make_episode(&mut rng, 3, &Cfg::train());
     println!("— Exemple (niveau 3) —");
     let sg: Vec<String> = ep.sig.syms.iter().map(|&s| format!("s{}/{}", s, ep.sig.arity[s])).collect();
     println!("signature   : {}", sg.join(" "));
@@ -1408,12 +1651,18 @@ fn main() {
             kv.insert(k.to_string(), v.to_string());
         }
     }
+    
     let seed: u64 = arg(&kv, "seed", 1);
     let threads: usize = arg::<usize>(&kv, "threads", default_threads()).max(1);
+    let use_struct = arg::<u32>(&kv, "struct", 0) == 1;
+    let bw: usize = arg(&kv, "beam", 8);
+    let reps: usize = arg::<usize>(&kv, "eval_reps", 3).max(1);
+    let ood: u32 = arg(&kv, "ood", 0);
     if arg::<u32>(&kv, "check", 0) == 1 {
-        grad_check(seed);
+        grad_check(seed, use_struct);
         return;
     }
+    
     let steps: usize = arg(&kv, "steps", 4000);
     let bs: usize = arg(&kv, "batch", 32);
     let lr: f32 = arg(&kv, "lr", 2e-3);
@@ -1425,7 +1674,7 @@ fn main() {
     let ks: usize = arg(&kv, "k", 8);
     let curriculum: u32 = arg(&kv, "curriculum", 1);
     let mut rng = Rng::new(seed);
-    let mut m = Model::new(&mut rng);
+    let mut m = Model::new(&mut rng, use_struct);
     let mut adam = Adam::new(&m.w);
     println!(
         "PTGRS-Abducer : {} paramètres | {} threads | lot {} | {} pas | lr {:.1e}",
@@ -1458,10 +1707,17 @@ fn main() {
             );
         }
         if eval_every > 0 && (step + 1) % eval_every == 0 && step + 1 < steps {
-            evaluate(&m, eval_n, ks, threads, seed ^ 0xE5A1);
+            evaluate(&m, eval_n, ks, threads, seed ^ 0xE5A1, 1, 0, &Cfg::train(), "probe");
         }
     }
     println!("— évaluation finale —");
-    evaluate(&m, eval_n.max(64), ks, threads, seed ^ 0xE5A1);
+    let cfg = Cfg::train();
+    let en = eval_n.max(128);
+    evaluate(&m, en, ks, threads, seed ^ 0xE5A1, reps, bw, &cfg, "in-distribution");
+    if ood == 1 {
+        for name in ["symheld", "rules8", "noprior", "deep"] {
+            evaluate(&m, en, ks, threads, seed ^ 0xE5A1, reps, bw, &Cfg::named(name), name);
+        }
+    }
     demo(&m, seed, ks);
 }
