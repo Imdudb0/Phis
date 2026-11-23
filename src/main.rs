@@ -6,10 +6,9 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::f32::consts::PI;
-
-// ───────────────────────── Vocabulaire ─────────────────────────
-const NV: usize = 4; // variables de règle X0..X3
-const NS: usize = 12; // symboles globaux ; arités ré-tirées à chaque épisode
+const NV: usize = 4;
+const NS: usize = 12; // symboles du vocabulaire
+const NS_TR: usize = 10; // ids tirés à l'entraînement ; NS_TR..NS réservés au hors-distribution
 const T_BOS: usize = 0;
 const T_SIG: usize = 1;
 const T_RULE: usize = 2;
@@ -20,21 +19,20 @@ const T_HYP: usize = 6;
 const T_END: usize = 7;
 const T_LP: usize = 8;
 const T_RP: usize = 9;
-const T_P: usize = 10; // +0..3 : proba quantifiée .25 .5 .75 1
-const T_AR: usize = 14; // +0..3 : arité
-const T_VAR: usize = 18; // +0..NV
-const T_SYM: usize = 22; // +0..NS
+const T_P: usize = 10; // 4 classes de proba : 10..=13
+const T_AR: usize = 14; // arités 0..=4 : 14..=18 (4 jamais vue à l'entraînement)
+const T_VAR: usize = 19; // 19..=22
+const T_SYM: usize = 23;
 const VOCAB: usize = T_SYM + NS;
+const LMAX: usize = 4;
+const HMAX: usize = 12;
+const OMAX: usize = 20;
+const MAXT: usize = 256;
+const MAXH: usize = 48;
+const REACH_CAP: usize = 30_000; // plafond d'états du BFS de validité
+const POOL_CAP: usize = 300; // termes « libres » énumérés par l'oracle
 
-const LMAX: usize = 4; // niveaux = nb max d'étapes de réécriture
-const HMAX: usize = 12; // taille max d'une cause (arbre déplié)
-const OMAX: usize = 20; // taille max d'une observation
-const MAXT: usize = 256; // longueur max d'une séquence
-const MAXH: usize = 48; // longueur max d'une hypothèse décodée
-
-// ───────────────────────── RNG (SplitMix64) ─────────────────────────
 struct Rng(u64);
-
 impl Rng {
     fn new(seed: u64) -> Rng {
         let mut r = Rng(seed.wrapping_mul(0x2545_F491_4F6C_DD1D) ^ 0xDEAD_BEEF_CAFE_F00D);
@@ -63,40 +61,31 @@ impl Rng {
         (-2.0 * u1.ln()).sqrt() * (2.0 * PI * u2).cos()
     }
 }
-
-// ──────────────── Graphe de termes hash-consé + réécriture ────────────────
 type Id = u32;
 type Bind = [Option<Id>; NV];
-
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct Node {
     sym: usize,
     kids: Vec<Id>,
 }
-
 #[derive(Clone, PartialEq)]
 enum Pat {
     Var(u8),
     App(usize, Vec<Pat>),
 }
-
 struct Rule {
     lhs: Pat,
-    outs: Vec<(f32, Pat)>, // (probabilité, membre droit)
+    outs: Vec<(f32, Pat)>, 
 }
-
 struct Arena {
     nodes: Vec<Node>,
-    tsize: Vec<u32>, // taille de l'arbre déplié
+    tsize: Vec<u32>, 
     map: HashMap<Node, Id>,
 }
-
 impl Arena {
     fn new() -> Arena {
         Arena { nodes: Vec::new(), tsize: Vec::new(), map: HashMap::new() }
     }
-
-    /// Partage maximal : égalité structurelle ⇔ égalité d'Id.
     fn mk(&mut self, sym: usize, kids: Vec<Id>) -> Id {
         let n = Node { sym, kids };
         if let Some(&id) = self.map.get(&n) {
@@ -112,12 +101,9 @@ impl Arena {
         self.map.insert(n, id);
         id
     }
-
     fn size(&self, id: Id) -> usize {
         self.tsize[id as usize] as usize
     }
-
-    /// Filtrage d'un motif sur un nœud (variable répétée ⇒ même sous-graphe).
     fn matches(&self, p: &Pat, id: Id, b: &mut Bind) -> bool {
         match p {
             Pat::Var(v) => {
@@ -145,7 +131,6 @@ impl Arena {
             }
         }
     }
-
     fn inst(&mut self, p: &Pat, b: &Bind) -> Id {
         match p {
             Pat::Var(v) => b[*v as usize].expect("variable libre dans un membre droit"),
@@ -158,7 +143,6 @@ impl Arena {
             }
         }
     }
-
     fn reach(&self, root: Id) -> Vec<Id> {
         let mut seen: HashSet<Id> = HashSet::new();
         let mut out = Vec::new();
@@ -172,8 +156,6 @@ impl Arena {
         }
         out
     }
-
-    /// Tous les redex (nœud, règle, liaisons) du graphe enraciné en `root`.
     fn redexes(&self, root: Id, rules: &[Rule]) -> Vec<(Id, usize, Bind)> {
         let mut out = Vec::new();
         let mut ids = self.reach(root);
@@ -188,8 +170,6 @@ impl Arena {
         }
         out
     }
-
-    /// Réécriture de graphe : le nœud `target` est remplacé par `rep` pour tous ses parents.
     fn replace(&mut self, root: Id, target: Id, rep: Id, memo: &mut HashMap<Id, Id>) -> Id {
         if root == target {
             return rep;
@@ -209,8 +189,6 @@ impl Arena {
         memo.insert(root, r);
         r
     }
-
-    /// Un pas stochastique : redex uniforme, issue tirée selon les probabilités de la règle.
     fn step(&mut self, root: Id, rules: &[Rule], rng: &mut Rng) -> Option<Id> {
         let rx = self.redexes(root, rules);
         if rx.is_empty() {
@@ -230,7 +208,6 @@ impl Arena {
         let rep = self.inst(chosen, &b);
         Some(self.replace(root, node, rep, &mut HashMap::new()))
     }
-
     fn ser(&self, id: Id, out: &mut Vec<usize>) {
         let n = &self.nodes[id as usize];
         out.push(T_SYM + n.sym);
@@ -242,7 +219,6 @@ impl Arena {
             out.push(T_RP);
         }
     }
-
     fn show(&self, id: Id) -> String {
         let n = &self.nodes[id as usize];
         if n.kids.is_empty() {
@@ -251,8 +227,31 @@ impl Arena {
         let ks: Vec<String> = n.kids.iter().map(|&k| self.show(k)).collect();
         format!("s{}({})", n.sym, ks.join(","))
     }
+    
+    fn count_occ(&self, root: Id, x: Id) -> usize {
+        if root == x {
+            return 1;
+        }
+        self.nodes[root as usize].kids.iter().map(|&k| self.count_occ(k, x)).sum::<usize>()
+    }
+    // remplace seulement les occurrences de x désignées par `mask` (ordre de parcours)
+    fn replace_occ(&mut self, root: Id, x: Id, t: Id, mask: u32, cnt: &mut usize) -> Id {
+        if root == x {
+            let i = *cnt;
+            *cnt += 1;
+            return if i < 32 && (mask >> i) & 1 == 1 { t } else { root };
+        }
+        let n = self.nodes[root as usize].clone();
+        let mut kids = Vec::with_capacity(n.kids.len());
+        let mut changed = false;
+        for &k in &n.kids {
+            let nk = self.replace_occ(k, x, t, mask, cnt);
+            changed |= nk != k;
+            kids.push(nk);
+        }
+        if changed { self.mk(n.sym, kids) } else { root }
+    }
 }
-
 fn ser_pat(p: &Pat, out: &mut Vec<usize>) {
     match p {
         Pat::Var(v) => out.push(T_VAR + *v as usize),
@@ -268,7 +267,6 @@ fn ser_pat(p: &Pat, out: &mut Vec<usize>) {
         }
     }
 }
-
 fn show_pat(p: &Pat) -> String {
     match p {
         Pat::Var(v) => format!("X{}", v),
@@ -279,14 +277,12 @@ fn show_pat(p: &Pat) -> String {
         }
     }
 }
-
 fn pat_size(p: &Pat) -> usize {
     match p {
         Pat::Var(_) => 1,
         Pat::App(_, ps) => 1 + ps.iter().map(pat_size).sum::<usize>(),
     }
 }
-
 fn pat_vars(p: &Pat, seen: &mut [bool; NV]) {
     match p {
         Pat::Var(v) => seen[*v as usize] = true,
@@ -297,23 +293,32 @@ fn pat_vars(p: &Pat, seen: &mut [bool; NV]) {
         }
     }
 }
-
-// ───────────────────────── Générateur PTGRS ─────────────────────────
-struct Sig {
-    syms: Vec<usize>,
-    arity: [usize; NS],
-    has: [bool; NS],
+#[derive(Clone, Copy)]
+struct Cfg {
+    pool: usize,                   // ids tirables pour la signature : 0..pool
+    force_new: bool,               // impose ≥ 1 symbole d'id ≥ NS_TR
+    force_ar4: bool,               // impose un symbole d'arité 4
+    rules: Option<(usize, usize)>, // nb de règles [lo, hi] ; None = loi d'entraînement
+    maxt: usize,                   // longueur max de séquence
 }
-
-fn random_sig(rng: &mut Rng) -> Sig {
-    let n = 5 + rng.below(4); // 5..=8 symboles
-    let mut ids: Vec<usize> = (0..NS).collect();
-    for i in (1..NS).rev() {
+impl Cfg {
+    fn train() -> Cfg {
+        Cfg { pool: NS_TR, force_new: false, force_ar4: false, rules: None, maxt: MAXT }
+    }
+}
+fn random_sig(rng: &mut Rng, cfg: &Cfg) -> Sig {
+    let n = 5 + rng.below(4);
+    let mut ids: Vec<usize> = (0..cfg.pool).collect();
+    for i in (1..ids.len()).rev() {
         let j = rng.below(i + 1);
         ids.swap(i, j);
     }
     ids.truncate(n);
-        let ncst = 2 + rng.below(2); // 2..=3 constantes
+    if cfg.force_new && !ids.iter().any(|&s| s >= NS_TR) {
+        let k = rng.below(ids.len());
+        ids[k] = NS_TR + rng.below(NS - NS_TR);
+    }
+    let ncst = 2 + rng.below(2);
     let mut sig = Sig { syms: ids.clone(), arity: [0; NS], has: [false; NS] };
     for (i, &s) in ids.iter().enumerate() {
         sig.has[s] = true;
@@ -324,15 +329,108 @@ fn random_sig(rng: &mut Rng) -> Sig {
             if u < 0.3 { 1 } else if u < 0.9 { 2 } else { 3 }
         };
     }
+    if cfg.force_ar4 {
+        let k = ncst + rng.below(n - ncst);
+        sig.arity[ids[k]] = 4;
+    }
     sig.syms.sort_unstable();
     sig
+}
+struct Episode {
+    sig: Sig,
+    rules: Vec<Rule>,
+    ar: Arena,
+    h: Id,
+    o: Id,
+    kmax: usize,
+    depth: usize, // profondeur de gen_term utilisée (pour le prior exact)
+    toks: Vec<usize>,
+    plen: usize,
+    jcache: HashMap<Id, (bool, bool)>, // cache du juge
+    capped: usize,                     // nb de jugements plafonnés par REACH_CAP
+}
+fn encode_raw(sig: &Sig, rules: &[Rule], otoks: &[usize], hyp: Option<(&Arena, Id)>) -> (Vec<usize>, usize) {
+    let mut t = vec![T_BOS, T_SIG];
+    for &s in &sig.syms {
+        t.push(T_SYM + s);
+        t.push(T_AR + sig.arity[s]);
+    }
+    for r in rules {
+        t.push(T_RULE);
+        ser_pat(&r.lhs, &mut t);
+        t.push(T_ARROW);
+        for (i, (p, rhs)) in r.outs.iter().enumerate() {
+            if i > 0 {
+                t.push(T_BAR);
+            }
+            t.push(T_P + ptok(*p));
+            ser_pat(rhs, &mut t);
+        }
+    }
+    t.push(T_OBS);
+    t.extend_from_slice(otoks);
+    t.push(T_HYP);
+    let plen = t.len();
+    if let Some((ar, h)) = hyp {
+        ar.ser(h, &mut t);
+        t.push(T_END);
+    }
+    (t, plen)
+}
+fn encode(sig: &Sig, rules: &[Rule], ar: &Arena, o: Id, h: Option<Id>) -> (Vec<usize>, usize) {
+    let mut ot = Vec::new();
+    ar.ser(o, &mut ot);
+    encode_raw(sig, rules, &ot, h.map(|x| (ar, x)))
+}
+fn make_episode_cfg(rng: &mut Rng, cfg: &Cfg, level: usize) -> Episode {
+    loop {
+        let sig = random_sig(rng, cfg);
+        let nr = match cfg.rules {
+            Some((lo, hi)) => lo + rng.below(hi - lo + 1),
+            None => 1 + rng.below((level + 1).min(4)),
+        };
+        let rules = random_rules(rng, &sig, nr);
+        let mut ar = Arena::new();
+        let depth = if level >= 3 { 3 } else { 2 };
+        let h = gen_term(&mut ar, rng, &sig, &rules, depth);
+        if ar.size(h) > HMAX {
+            continue;
+        }
+        let k = 1 + rng.below(level);
+        let mut o = h;
+        let mut ok = true;
+        for _ in 0..k {
+            match ar.step(o, &rules, rng) {
+                Some(n) if ar.size(n) <= OMAX => o = n,
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if !ok || o == h {
+            continue;
+        }
+        let (toks, plen) = encode(&sig, &rules, &ar, o, Some(h));
+        if toks.len() > cfg.maxt {
+            continue;
+        }
+        return Episode { sig, rules, ar, h, o, kmax: level, depth, toks, plen, jcache: HashMap::new(), capped: 0 };
+    }
+}
+fn make_episode(rng: &mut Rng, level: usize) -> Episode {
+    make_episode_cfg(rng, &Cfg::train(), level)
+}
+struct Sig {
+    syms: Vec<usize>,
+    arity: [usize; NS],
+    has: [bool; NS],
 }
 
 fn pick_sym(rng: &mut Rng, sig: &Sig, compound: bool) -> usize {
     let c: Vec<usize> = sig.syms.iter().copied().filter(|&s| (sig.arity[s] > 0) == compound).collect();
     c[rng.below(c.len())]
 }
-
 fn lhs_slot(rng: &mut Rng, sig: &Sig, depth: usize, nv: &mut usize) -> Pat {
     if depth > 0 && rng.chance(0.3) {
         let comp = rng.chance(0.8);
@@ -350,7 +448,6 @@ fn lhs_slot(rng: &mut Rng, sig: &Sig, depth: usize, nv: &mut usize) -> Pat {
         Pat::Var((*nv - 1) as u8)
     }
 }
-
 fn rand_lhs(rng: &mut Rng, sig: &Sig) -> (Pat, usize) {
     loop {
         let mut nv = 0usize;
@@ -369,7 +466,6 @@ fn rand_lhs(rng: &mut Rng, sig: &Sig) -> (Pat, usize) {
         }
     }
 }
-
 fn rand_rhs(rng: &mut Rng, sig: &Sig, depth: usize, nv: usize, unused: &mut Vec<usize>) -> Pat {
     let pc = if depth == 2 { 0.9 } else { 0.45 };
     if depth > 0 && rng.chance(pc) {
@@ -388,7 +484,6 @@ fn rand_rhs(rng: &mut Rng, sig: &Sig, depth: usize, nv: usize, unused: &mut Vec<
         Pat::App(pick_sym(rng, sig, false), Vec::new())
     }
 }
-
 fn random_rules(rng: &mut Rng, sig: &Sig, nr: usize) -> Vec<Rule> {
     let mut rules: Vec<Rule> = Vec::new();
     while rules.len() < nr {
@@ -417,8 +512,6 @@ fn random_rules(rng: &mut Rng, sig: &Sig, nr: usize) -> Vec<Rule> {
     }
     rules
 }
-
-/// Terme initial aléatoire avec des instances de membres gauches « plantées » (redex garantis).
 fn gen_term(ar: &mut Arena, rng: &mut Rng, sig: &Sig, rules: &[Rule], depth: usize) -> Id {
     if depth == 0 || rng.chance(0.15) {
         let c = pick_sym(rng, sig, false);
@@ -444,87 +537,10 @@ fn gen_term(ar: &mut Arena, rng: &mut Rng, sig: &Sig, rules: &[Rule], depth: usi
     ar.mk(f, ks)
 }
 
-// ───────────────────────── Épisodes ─────────────────────────
-struct Episode {
-    sig: Sig,
-    rules: Vec<Rule>,
-    ar: Arena,
-    h: Id,       // cause vraie
-    o: Id,       // observation
-    kmax: usize, // nb max d'étapes (= niveau)
-    toks: Vec<usize>,
-    plen: usize, // longueur du prompt (finit par HYP)
-}
-
 fn ptok(p: f32) -> usize {
     if p > 0.99 { 3 } else if p > 0.7 { 2 } else if p > 0.4 { 1 } else { 0 }
 }
 
-/// BOS SIG (sym arité)* (RULE lhs ARROW P rhs (BAR P rhs)*)* OBS obs HYP [cause END]
-fn encode(sig: &Sig, rules: &[Rule], ar: &Arena, o: Id, h: Option<Id>) -> (Vec<usize>, usize) {
-    let mut t = vec![T_BOS, T_SIG];
-    for &s in &sig.syms {
-        t.push(T_SYM + s);
-        t.push(T_AR + sig.arity[s]);
-    }
-    for r in rules {
-        t.push(T_RULE);
-        ser_pat(&r.lhs, &mut t);
-        t.push(T_ARROW);
-        for (i, (p, rhs)) in r.outs.iter().enumerate() {
-            if i > 0 {
-                t.push(T_BAR);
-            }
-            t.push(T_P + ptok(*p));
-            ser_pat(rhs, &mut t);
-        }
-    }
-    t.push(T_OBS);
-    ar.ser(o, &mut t);
-    t.push(T_HYP);
-    let plen = t.len();
-    if let Some(h) = h {
-        ar.ser(h, &mut t);
-        t.push(T_END);
-    }
-    (t, plen)
-}
-
-fn make_episode(rng: &mut Rng, level: usize) -> Episode {
-    loop {
-        let sig = random_sig(rng);
-        let nr = 1 + rng.below((level + 1).min(4));
-        let rules = random_rules(rng, &sig, nr);
-        let mut ar = Arena::new();
-        let depth = if level >= 3 { 3 } else { 2 };
-        let h = gen_term(&mut ar, rng, &sig, &rules, depth);
-        if ar.size(h) > HMAX {
-            continue;
-        }
-        let k = 1 + rng.below(level);
-        let mut o = h;
-        let mut ok = true;
-        for _ in 0..k {
-            match ar.step(o, &rules, rng) {
-                Some(n) if ar.size(n) <= OMAX => o = n,
-                _ => {
-                    ok = false;
-                    break;
-                }
-            }
-        }
-        if !ok || o == h {
-            continue;
-        }
-        let (toks, plen) = encode(&sig, &rules, &ar, o, Some(h));
-        if toks.len() > MAXT {
-            continue;
-        }
-        return Episode { sig, rules, ar, h, o, kmax: level, toks, plen };
-    }
-}
-
-// ───────────────────────── Autodiff minimal (tenseurs 2D f32) ─────────────────────────
 fn mm(a: &[f32], b: &[f32], n: usize, k: usize, m: usize) -> Vec<f32> {
     let mut o = vec![0.0f32; n * m];
     for i in 0..n {
@@ -539,8 +555,6 @@ fn mm(a: &[f32], b: &[f32], n: usize, k: usize, m: usize) -> Vec<f32> {
     }
     o
 }
-
-/// RoPE en place ; sign = +1 (avant) ou -1 (rotation inverse = rétropropagation).
 fn rope_apply(x: &mut [f32], t: usize, d: usize, heads: usize, sign: f32) {
     let dh = d / heads;
     let half = dh / 2;
@@ -558,8 +572,6 @@ fn rope_apply(x: &mut [f32], t: usize, d: usize, heads: usize, sign: f32) {
         }
     }
 }
-
-/// Attention causale multi-têtes ; renvoie (sortie, probabilités T×T par tête).
 fn attn_fwd(q: &[f32], k: &[f32], v: &[f32], t: usize, d: usize, heads: usize) -> (Vec<f32>, Vec<f32>) {
     let dh = d / heads;
     let sc = 1.0 / (dh as f32).sqrt();
@@ -598,7 +610,6 @@ fn attn_fwd(q: &[f32], k: &[f32], v: &[f32], t: usize, d: usize, heads: usize) -
     }
     (out, p)
 }
-
 fn attn_bwd(
     q: &[f32], k: &[f32], v: &[f32], p: &[f32], g: &[f32], t: usize, d: usize, heads: usize,
 ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
@@ -633,26 +644,23 @@ fn attn_bwd(
     }
     (dq, dk, dv)
 }
-
 enum Op {
     Leaf,
     MatMul(usize, usize),
     Add(usize, usize),
     Silu(usize),
-    Rms(usize, usize),                         // x, gain
-    Embed(usize, Vec<usize>),                  // table, ids
-    Rope(usize, usize),                        // x, heads
-    Attn(usize, usize, usize, usize, Vec<f32>), // q, k, v, heads, probas
-    Xent(usize, Vec<usize>, Vec<bool>, f32),   // logits, cibles, masque, échelle
+    Rms(usize, usize),                         
+    Embed(usize, Vec<usize>),                  
+    Rope(usize, usize),                        
+    Attn(usize, usize, usize, usize, Vec<f32>), 
+    Xent(usize, Vec<usize>, Vec<bool>, f32),   
 }
-
 struct Tape {
     val: Vec<Vec<f32>>,
     shp: Vec<(usize, usize)>,
     ops: Vec<Op>,
     grad: Vec<Vec<f32>>,
 }
-
 impl Tape {
     fn new() -> Tape {
         Tape { val: Vec::new(), shp: Vec::new(), ops: Vec::new(), grad: Vec::new() }
@@ -718,7 +726,6 @@ impl Tape {
         let (o, p) = attn_fwd(&self.val[q], &self.val[k], &self.val[v], t, d, heads);
         self.push(o, t, d, Op::Attn(q, k, v, heads, p))
     }
-    /// Perte = échelle × Σ_{lignes masquées} NLL(softmax(logits), cible).
     fn xent(&mut self, lg: usize, tg: Vec<usize>, mk: Vec<bool>, sc: f32) -> usize {
         let (n, c) = self.shp[lg];
         let mut loss = 0.0f32;
@@ -733,7 +740,6 @@ impl Tape {
         }
         self.push(vec![loss * sc], 1, 1, Op::Xent(lg, tg, mk, sc))
     }
-
     fn backward(&mut self, root: usize) {
         let Tape { val, shp, ops, grad } = self;
         *grad = val.iter().map(|v| vec![0.0f32; v.len()]).collect();
@@ -870,32 +876,29 @@ impl Tape {
         }
     }
 }
-
-// ═══════════════ SUITE de src/main.rs (à coller après `impl Tape { … }`) ═══════════════
-
-// ───────────────────────── Modèle ─────────────────────────
-const D: usize = 48; // largeur
-const NH: usize = 4; // têtes (D/NH = 12, pair pour RoPE)
-const NL: usize = 3; // couches
-const FF: usize = 128; // largeur du MLP
-const PL: usize = 8; // tenseurs par couche : g1 wq wk wv wo g2 w1 w2
-const NT: usize = 3 + NL * PL; // emb + couches + gain final + tête (≈ 68 k paramètres)
-
-type Seq = (Vec<usize>, usize); // (tokens, longueur du prompt)
-
+const D: usize = 48; 
+const NH: usize = 4; 
+const NL: usize = 3; 
+const FF: usize = 128; 
+const PL: usize = 8; 
+const NT: usize = 3 + NL * PL; 
+type Seq = (Vec<usize>, usize); 
 struct Model {
     w: Vec<Vec<f32>>,
     shp: Vec<(usize, usize)>,
 }
-
 impl Model {
-    fn new(rng: &mut Rng) -> Model {
+        fn shapes() -> Vec<(usize, usize)> {
         let mut shp = vec![(VOCAB, D)];
         for _ in 0..NL {
             shp.extend_from_slice(&[(1, D), (D, D), (D, D), (D, D), (D, D), (1, D), (D, FF), (FF, D)]);
         }
         shp.push((1, D));
         shp.push((D, VOCAB));
+        shp
+    }
+    fn new(rng: &mut Rng) -> Model {
+        let shp = Model::shapes();
         let resid = 1.0 / ((2 * NL) as f32).sqrt();
         let mut w: Vec<Vec<f32>> = Vec::with_capacity(NT);
         for (i, &(r, c)) in shp.iter().enumerate() {
@@ -913,12 +916,80 @@ impl Model {
         }
         Model { w, shp }
     }
-
+    fn header() -> [u32; 10] {
+        [1, VOCAB as u32, D as u32, NH as u32, NL as u32, FF as u32, NT as u32, NS as u32, NS_TR as u32, T_SYM as u32]
+    }
+    // format : "PHIS" | 10×u32 (version + architecture) | pas:u64 | graine:u64
+    //          | pour chaque tenseur : lignes:u32 colonnes:u32 données f32 LE | FNV-1a 64 de tout ce qui précède
+    fn save(&self, path: &str, steps: u64, seed: u64) -> std::io::Result<()> {
+        let mut b: Vec<u8> = Vec::new();
+        b.extend_from_slice(b"PHIS");
+        for x in Model::header().iter() {
+            b.extend_from_slice(&x.to_le_bytes());
+        }
+        b.extend_from_slice(&steps.to_le_bytes());
+        b.extend_from_slice(&seed.to_le_bytes());
+        for (w, &(r, c)) in self.w.iter().zip(self.shp.iter()) {
+            b.extend_from_slice(&(r as u32).to_le_bytes());
+            b.extend_from_slice(&(c as u32).to_le_bytes());
+            for &x in w {
+                b.extend_from_slice(&x.to_le_bytes());
+            }
+        }
+        let ck = fnv(&b);
+        b.extend_from_slice(&ck.to_le_bytes());
+        let tmp = format!("{}.tmp", path);
+        std::fs::write(&tmp, &b)?;
+        std::fs::rename(&tmp, path)
+    }
+    fn load(path: &str) -> Result<(Model, u64, u64), String> {
+        let b = std::fs::read(path).map_err(|e| format!("lecture de {} : {}", path, e))?;
+        if b.len() < 4 + 40 + 16 + 8 {
+            return Err("fichier trop court".to_string());
+        }
+        let (body, tail) = b.split_at(b.len() - 8);
+        let mut c8 = [0u8; 8];
+        c8.copy_from_slice(tail);
+        if fnv(body) != u64::from_le_bytes(c8) {
+            return Err("somme de contrôle invalide (fichier corrompu ou tronqué)".to_string());
+        }
+        if &body[..4] != &b"PHIS"[..] {
+            return Err("ce n'est pas un fichier .phis".to_string());
+        }
+        let mut pos = 4usize;
+        let want = Model::header();
+        let mut got = [0u32; 10];
+        for g in got.iter_mut() {
+            *g = rd_u32(body, &mut pos);
+        }
+        if got != want {
+            return Err(format!("architecture incompatible : fichier {:?} ≠ binaire {:?}", got, want));
+        }
+        let steps = rd_u64(body, &mut pos);
+        let seed = rd_u64(body, &mut pos);
+        let shp = Model::shapes();
+        let need: usize = shp.iter().map(|&(r, c)| 8 + 4 * r * c).sum();
+        if body.len() != pos + need {
+            return Err("taille inattendue".to_string());
+        }
+        let mut w: Vec<Vec<f32>> = Vec::with_capacity(shp.len());
+        for &(r, c) in &shp {
+            let fr = rd_u32(body, &mut pos) as usize;
+            let fc = rd_u32(body, &mut pos) as usize;
+            if (fr, fc) != (r, c) {
+                return Err("forme de tenseur inattendue".to_string());
+            }
+            let mut t = Vec::with_capacity(r * c);
+            for _ in 0..r * c {
+                t.push(rd_f32(body, &mut pos));
+            }
+            w.push(t);
+        }
+        Ok((Model { w, shp }, steps, seed))
+    }
     fn count(&self) -> usize {
         self.w.iter().map(|v| v.len()).sum()
     }
-
-    /// Nouvelle bande d'autodiff : ses NT premiers nœuds sont les paramètres (copiés).
     fn tape(&self) -> Tape {
         let mut tp = Tape::new();
         for (v, &(r, c)) in self.w.iter().zip(self.shp.iter()) {
@@ -927,8 +998,6 @@ impl Model {
         tp
     }
 }
-
-/// Passe avant causale ; renvoie le nœud des logits (T × VOCAB).
 fn forward(tp: &mut Tape, toks: &[usize]) -> usize {
     let mut x = tp.embed(0, toks);
     for l in 0..NL {
@@ -951,8 +1020,6 @@ fn forward(tp: &mut Tape, toks: &[usize]) -> usize {
     let h = tp.rms(x, NT - 2);
     tp.matmul(h, NT - 1)
 }
-
-/// Perte = scale × Σ NLL sur les tokens de la cause (+ END). Avec `acc` : rétropropage et accumule.
 fn seq_run(m: &Model, toks: &[usize], plen: usize, scale: f32, acc: Option<&mut Vec<Vec<f32>>>) -> f32 {
     let n = toks.len() - 1;
     let mut tp = m.tape();
@@ -970,8 +1037,6 @@ fn seq_run(m: &Model, toks: &[usize], plen: usize, scale: f32, acc: Option<&mut 
     }
     val
 }
-
-// ───────────────────────── Entraînement parallèle ─────────────────────────
 fn worker(m: &Model, seqs: &[Seq], scale: f32) -> (f32, Vec<Vec<f32>>) {
     let mut acc: Vec<Vec<f32>> = m.w.iter().map(|v| vec![0.0f32; v.len()]).collect();
     let mut loss = 0.0f32;
@@ -980,8 +1045,6 @@ fn worker(m: &Model, seqs: &[Seq], scale: f32) -> (f32, Vec<Vec<f32>>) {
     }
     (loss, acc)
 }
-
-/// Un lot réparti sur `nthreads` threads ; renvoie (perte moyenne par token cible, gradients sommés).
 fn train_step(m: &Model, batch: &[Seq], nthreads: usize) -> (f32, Vec<Vec<f32>>) {
     let ntgt: usize = batch.iter().map(|(t, p)| t.len() - *p).sum();
     let scale = 1.0 / ntgt as f32;
@@ -1005,7 +1068,6 @@ fn train_step(m: &Model, batch: &[Seq], nthreads: usize) -> (f32, Vec<Vec<f32>>)
     });
     (loss, grads)
 }
-
 fn make_batch(rng: &mut Rng, size: usize, maxlv: usize) -> Vec<Seq> {
     (0..size)
         .map(|_| {
@@ -1015,20 +1077,16 @@ fn make_batch(rng: &mut Rng, size: usize, maxlv: usize) -> Vec<Seq> {
         })
         .collect()
 }
-
 struct Adam {
     m: Vec<Vec<f32>>,
     v: Vec<Vec<f32>>,
     t: i32,
 }
-
 impl Adam {
     fn new(w: &[Vec<f32>]) -> Adam {
         let z = || w.iter().map(|x| vec![0.0f32; x.len()]).collect::<Vec<_>>();
         Adam { m: z(), v: z(), t: 0 }
     }
-
-    /// AdamW (décroissance découplée, sauf sur les gains RMSNorm).
     fn step(&mut self, w: &mut [Vec<f32>], g: &[Vec<f32>], shp: &[(usize, usize)], lr: f32, wd: f32) {
         self.t += 1;
         let (b1, b2) = (0.9f32, 0.98f32);
@@ -1045,8 +1103,6 @@ impl Adam {
         }
     }
 }
-
-/// Échauffement linéaire puis cosinus jusqu'à 10 % du taux de base.
 fn lr_at(step: usize, total: usize, base: f32) -> f32 {
     let warm = (total / 20).clamp(10, 200);
     if step < warm {
@@ -1055,26 +1111,21 @@ fn lr_at(step: usize, total: usize, base: f32) -> f32 {
     let pr = (step - warm) as f32 / total.saturating_sub(warm).max(1) as f32;
     base * (0.1 + 0.45 * (1.0 + (PI * pr).cos()))
 }
-
-// ───────────────────────── Inférence incrémentale (cache K/V) ─────────────────────────
 #[derive(Clone)]
 struct Cache {
     k: Vec<Vec<f32>>,
     v: Vec<Vec<f32>>,
     len: usize,
 }
-
 impl Cache {
     fn new() -> Cache {
         Cache { k: vec![Vec::new(); NL], v: vec![Vec::new(); NL], len: 0 }
     }
 }
-
 fn rms_row(x: &[f32], g: &[f32]) -> Vec<f32> {
     let r = (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32 + 1e-5).sqrt();
     x.iter().zip(g).map(|(a, b)| a * b / r).collect()
 }
-
 fn rope_row(x: &mut [f32], pos: usize) {
     let dh = D / NH;
     let half = dh / 2;
@@ -1088,8 +1139,6 @@ fn rope_row(x: &mut [f32], pos: usize) {
         }
     }
 }
-
-/// Consomme un token, met à jour le cache, renvoie les logits du token suivant.
 fn infer_step(m: &Model, ca: &mut Cache, tok: usize) -> Vec<f32> {
     let pos = ca.len;
     let dh = D / NH;
@@ -1146,7 +1195,6 @@ fn infer_step(m: &Model, ca: &mut Cache, tok: usize) -> Vec<f32> {
     let h = rms_row(&x, &m.w[NT - 2]);
     mm(&h, &m.w[NT - 1], 1, D, VOCAB)
 }
-
 fn prefill(m: &Model, prompt: &[usize]) -> (Cache, Vec<f32>) {
     let mut ca = Cache::new();
     let mut lg = Vec::new();
@@ -1155,25 +1203,19 @@ fn prefill(m: &Model, prompt: &[usize]) -> (Cache, Vec<f32>) {
     }
     (ca, lg)
 }
-
-// ───────────────────────── Décodage contraint par grammaire ─────────────────────────
-/// terme := SYM | SYM '(' terme^arité ')'. Taille d'arbre bornée par HMAX (comme les vraies causes).
 struct Gram {
-    stack: Vec<usize>, // enfants restant à commencer, par compound ouvert
+    stack: Vec<usize>, 
     nodes: usize,
     lp: bool,
     done: bool,
 }
-
 impl Gram {
     fn new() -> Gram {
         Gram { stack: Vec::new(), nodes: 0, lp: false, done: false }
     }
-
     fn need(&self) -> usize {
         self.stack.iter().sum::<usize>() + if self.nodes == 0 { 1 } else { 0 }
     }
-
     fn allowed(&self, sig: &Sig) -> Vec<usize> {
         if self.done {
             return vec![T_END];
@@ -1191,7 +1233,6 @@ impl Gram {
             .map(|&s| T_SYM + s)
             .collect()
     }
-
     fn push(&mut self, tok: usize, sig: &Sig) {
         if tok == T_LP {
             self.lp = false;
@@ -1215,7 +1256,6 @@ impl Gram {
         }
     }
 }
-
 fn pick(lg: &[f32], allowed: &[usize], temp: f32, uniform: bool, rng: &mut Rng) -> usize {
     if allowed.len() == 1 {
         return allowed[0];
@@ -1243,8 +1283,6 @@ fn pick(lg: &[f32], allowed: &[usize], temp: f32, uniform: bool, rng: &mut Rng) 
     }
     allowed[allowed.len() - 1]
 }
-
-/// temp = 0 : glouton ; temp = 1 : échantillon du postérieur appris ; `uniform` : référence sans réseau.
 fn decode(m: &Model, base: &Cache, first: &[f32], sig: &Sig, temp: f32, uniform: bool, rng: &mut Rng) -> Vec<usize> {
     let mut ca = base.clone();
     let mut lg = first.to_vec();
@@ -1263,7 +1301,6 @@ fn decode(m: &Model, base: &Cache, first: &[f32], sig: &Sig, temp: f32, uniform:
     }
     out
 }
-
 fn parse(ar: &mut Arena, sig: &Sig, t: &[usize], pos: &mut usize) -> Option<Id> {
     let tk = *t.get(*pos)?;
     if tk < T_SYM || tk >= T_SYM + NS || !sig.has[tk - T_SYM] {
@@ -1287,17 +1324,11 @@ fn parse(ar: &mut Arena, sig: &Sig, t: &[usize], pos: &mut usize) -> Option<Id> 
     }
     Some(ar.mk(s, kids))
 }
-
 fn parse_cause(ar: &mut Arena, sig: &Sig, out: &[usize]) -> Option<Id> {
     let mut pos = 0;
     let id = parse(ar, sig, out, &mut pos)?;
     if out.get(pos) == Some(&T_END) { Some(id) } else { None }
 }
-
-// ───────────────────────── Vérificateur exact ─────────────────────────
-/// P(obs | cause) = 1/kmax · Σ_{k=1..kmax} P(X_k = obs | X_0 = cause), en propageant la loi de la chaîne
-/// de Markov du PTGRS (états = racines du graphe hash-consé ; redex uniforme ; issue selon les probas
-/// de la règle). Même rejet de taille (OMAX) que le générateur ; les états bloqués perdent leur masse.
 fn likelihood(ar: &mut Arena, rules: &[Rule], h: Id, o: Id, kmax: usize) -> f64 {
     let mut cur: HashMap<Id, f64> = HashMap::new();
     cur.insert(h, 1.0);
@@ -1325,8 +1356,100 @@ fn likelihood(ar: &mut Arena, rules: &[Rule], h: Id, o: Id, kmax: usize) -> f64 
     }
     total / kmax as f64
 }
-
-// ───────────────────────── Évaluation ─────────────────────────
+// successeurs d'un état avec leurs probabilités (mêmes règles que `likelihood`)
+fn succs(ar: &mut Arena, rules: &[Rule], s: Id) -> Vec<(Id, f64)> {
+    let rx = ar.redexes(s, rules);
+    if rx.is_empty() {
+        return Vec::new();
+    }
+    let pr = 1.0 / rx.len() as f64;
+    let mut acc: HashMap<Id, f64> = HashMap::new();
+    for (node, ri, b) in rx {
+        for (q, rhs) in &rules[ri].outs {
+            let rep = ar.inst(rhs, &b);
+            let n = ar.replace(s, node, rep, &mut HashMap::new());
+            if ar.size(n) <= OMAX {
+                *acc.entry(n).or_insert(0.0) += pr * *q as f64;
+            }
+        }
+    }
+    let mut v: Vec<(Id, f64)> = acc.into_iter().collect();
+    v.sort_by_key(|e| e.0);
+    v
+}
+// distance minimale (≥ 1 pas, ≤ kmax) de h à o ; équivaut à likelihood > 0
+fn reach_min(ar: &mut Arena, rules: &[Rule], h: Id, o: Id, kmax: usize, capped: &mut bool) -> Option<usize> {
+    let mut seen: HashSet<Id> = HashSet::new();
+    seen.insert(h);
+    let mut cur = vec![h];
+    for d in 1..=kmax {
+        let mut nxt = Vec::new();
+        for &s in &cur {
+            for (n, _) in succs(ar, rules, s) {
+                if n == o {
+                    return Some(d);
+                }
+                if seen.insert(n) {
+                    nxt.push(n);
+                }
+            }
+        }
+        if nxt.is_empty() {
+            return None;
+        }
+        if seen.len() > REACH_CAP {
+            *capped = true;
+            return None;
+        }
+        cur = nxt;
+    }
+    None
+}
+// (valide ≤ kmax de l'épisode, valide ≤ LMAX) — toujours contre le vrai épisode
+fn judge(ep: &mut Episode, c: Option<Id>) -> (bool, bool) {
+    let id = match c {
+        Some(id) => id,
+        None => return (false, false),
+    };
+    if let Some(&r) = ep.jcache.get(&id) {
+        return r;
+    }
+    let mut capped = false;
+    let hz = ep.kmax.max(LMAX);
+    let r = match reach_min(&mut ep.ar, &ep.rules, id, ep.o, hz, &mut capped) {
+        Some(d) => (d <= ep.kmax, d <= LMAX),
+        None => (false, false),
+    };
+    if capped {
+        ep.capped += 1;
+    }
+    ep.jcache.insert(id, r);
+    r
+}
+fn fnv(bytes: &[u8]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    h
+}
+fn rd_u32(b: &[u8], p: &mut usize) -> u32 {
+    let v = u32::from_le_bytes([b[*p], b[*p + 1], b[*p + 2], b[*p + 3]]);
+    *p += 4;
+    v
+}
+fn rd_f32(b: &[u8], p: &mut usize) -> f32 {
+    let v = f32::from_le_bytes([b[*p], b[*p + 1], b[*p + 2], b[*p + 3]]);
+    *p += 4;
+    v
+}
+fn rd_u64(b: &[u8], p: &mut usize) -> u64 {
+    let mut a = [0u8; 8];
+    a.copy_from_slice(&b[*p..*p + 8]);
+    *p += 8;
+    u64::from_le_bytes(a)
+}
 #[derive(Default)]
 struct Stats {
     n: usize,
@@ -1339,7 +1462,6 @@ struct Stats {
     u_valid: usize,
     u_any: usize,
 }
-
 impl Stats {
     fn add(&mut self, o: &Stats) {
         self.n += o.n;
@@ -1353,12 +1475,9 @@ impl Stats {
         self.u_any += o.u_any;
     }
 }
-
 fn pct(a: usize, b: usize) -> f64 {
     100.0 * a as f64 / b.max(1) as f64
 }
-
-/// « Valide » = la cause proposée explique l'observation avec probabilité > 0 en ≤ LMAX pas.
 fn eval_chunk(m: &Model, eps: &mut [Episode], k: usize, seed: u64) -> Stats {
     let mut st = Stats::default();
     let mut rng = Rng::new(seed);
@@ -1400,7 +1519,6 @@ fn eval_chunk(m: &Model, eps: &mut [Episode], k: usize, seed: u64) -> Stats {
     }
     st
 }
-
 fn evaluate(m: &Model, n: usize, k: usize, nthreads: usize, seed: u64) {
     for level in 1..=LMAX {
         let mut rng = Rng::new(seed ^ (level as u64).wrapping_mul(7919));
@@ -1426,9 +1544,6 @@ fn evaluate(m: &Model, n: usize, k: usize, nthreads: usize, seed: u64) {
         );
     }
 }
-
-// ───────────────────────── Vérifications numériques ─────────────────────────
-/// Écart max entre les logits de la passe complète (autodiff) et ceux du chemin incrémental (cache K/V).
 fn consistency(m: &Model, toks: &[usize]) -> f32 {
     let n = toks.len() - 1;
     let mut tp = m.tape();
@@ -1443,7 +1558,6 @@ fn consistency(m: &Model, toks: &[usize]) -> f32 {
     }
     worst
 }
-
 fn grad_check(seed: u64) {
     let mut rng = Rng::new(seed);
     let mut m = Model::new(&mut rng);
@@ -1457,7 +1571,7 @@ fn grad_check(seed: u64) {
     let eps = 2e-2f32;
     let (mut bad, mut tot, mut worst) = (0usize, 0usize, 0.0f32);
     for i in 0..m.w.len() {
-        let mut idx = vec![0usize]; // plus gros gradient + 3 indices au hasard
+        let mut idx = vec![0usize]; 
         for j in 0..acc[i].len() {
             if acc[i][j].abs() > acc[i][idx[0]].abs() {
                 idx[0] = j;
@@ -1489,8 +1603,373 @@ fn grad_check(seed: u64) {
     println!("cache K/V vs passe complète : écart max des logits {diff:.2e}");
     println!("{}", if bad == 0 && diff < 1e-3 { "OK" } else { "ATTENTION : voir ci-dessus" });
 }
+// P(gen_term(depth) = t) exact, pour la signature et les règles de l'épisode
+struct Prior<'a> {
+    sig: &'a Sig,
+    rules: &'a [Rule],
+    nc: f64,
+    nf: f64,
+    memo: HashMap<(Id, usize), f64>,
+}
+impl<'a> Prior<'a> {
+    fn new(sig: &'a Sig, rules: &'a [Rule]) -> Prior<'a> {
+        let nc = sig.syms.iter().filter(|&&s| sig.arity[s] == 0).count() as f64;
+        let nf = sig.syms.iter().filter(|&&s| sig.arity[s] > 0).count() as f64;
+        Prior { sig, rules, nc, nf, memo: HashMap::new() }
+    }
+    fn p(&mut self, ar: &Arena, t: Id, d: usize) -> f64 {
+        if let Some(&v) = self.memo.get(&(t, d)) {
+            return v;
+        }
+        let sym = ar.nodes[t as usize].sym;
+        let kids = ar.nodes[t as usize].kids.clone();
+        let known = self.sig.has[sym];
+        let mut pr = 0.0f64;
+        if d == 0 {
+            if known && kids.is_empty() {
+                pr = 1.0 / self.nc;
+            }
+        } else {
+            if known && kids.is_empty() {
+                pr += 0.15 / self.nc;
+            }
+            let rules = self.rules;
+            let mut rs = 0.0f64;
+            for r in rules {
+                let mut b: Bind = [None; NV];
+                if ar.matches(&r.lhs, t, &mut b) {
+                    let mut seen = [false; NV];
+                    pat_vars(&r.lhs, &mut seen);
+                    let mut prod = 1.0f64;
+                    for v in 0..NV {
+                        if seen[v] {
+                            if let Some(x) = b[v] {
+                                prod *= self.p(ar, x, d - 1);
+                            }
+                        }
+                    }
+                    rs += prod / rules.len() as f64;
+                }
+            }
+            pr += 0.85 * 0.4 * rs;
+            if known && !kids.is_empty() && self.sig.arity[sym] == kids.len() {
+                let mut prod = 1.0 / self.nf;
+                for &k in &kids {
+                    prod *= self.p(ar, k, d - 1);
+                }
+                pr += 0.85 * 0.6 * prod;
+            }
+        }
+        self.memo.insert((t, d), pr);
+        pr
+    }
+}
 
-// ───────────────────────── Démo qualitative ─────────────────────────
+// pool de petits termes (tous les termes de taille ≤ upto) pour les variables effacées
+struct Pool {
+    terms: Vec<Id>,
+    upto: usize,
+}
+fn tuples(by: &[Vec<Id>], a: usize, total: usize, cur: &mut Vec<Id>, out: &mut Vec<Vec<Id>>, cap: usize) {
+    if out.len() > cap {
+        return;
+    }
+    if a == 0 {
+        if total == 0 {
+            out.push(cur.clone());
+        }
+        return;
+    }
+    if total < a {
+        return;
+    }
+    for sz in 1..=(total - (a - 1)) {
+        if sz >= by.len() {
+            break;
+        }
+        for &t in &by[sz] {
+            cur.push(t);
+            tuples(by, a - 1, total - sz, cur, out, cap);
+            cur.pop();
+            if out.len() > cap {
+                return;
+            }
+        }
+    }
+}
+fn build_pool(ar: &mut Arena, sig: &Sig, cap: usize) -> Pool {
+    let mut by: Vec<Vec<Id>> = vec![Vec::new()];
+    let mut all: Vec<Id> = Vec::new();
+    let mut upto = 0usize;
+    for s in 1..=OMAX {
+        let mut cls: Vec<Id> = Vec::new();
+        let mut ok = true;
+        if s == 1 {
+            for &f in &sig.syms {
+                if sig.arity[f] == 0 {
+                    cls.push(ar.mk(f, Vec::new()));
+                }
+            }
+        } else {
+            for &f in &sig.syms {
+                let a = sig.arity[f];
+                if a == 0 {
+                    continue;
+                }
+                let mut tl: Vec<Vec<Id>> = Vec::new();
+                tuples(&by, a, s - 1, &mut Vec::new(), &mut tl, cap);
+                if tl.len() > cap {
+                    ok = false;
+                    break;
+                }
+                for ks in tl {
+                    cls.push(ar.mk(f, ks));
+                }
+            }
+        }
+        if !ok || all.len() + cls.len() > cap {
+            break;
+        }
+        all.extend(cls.iter().copied());
+        by.push(cls);
+        upto = s;
+    }
+    Pool { terms: all, upto }
+}
+fn pat_size_with(p: &Pat, sz: &[usize; NV]) -> usize {
+    match p {
+        Pat::Var(v) => sz[*v as usize],
+        Pat::App(_, ps) => 1 + ps.iter().map(|q| pat_size_with(q, sz)).sum::<usize>(),
+    }
+}
+
+struct Job<'a> {
+    n: Id,         // terme dont on cherche les antécédents
+    x: Id,         // sous-terme de n produit par le membre droit
+    lhs: &'a Pat,
+    sn: isize,     // taille de n
+    xsz: isize,    // taille de x
+    occ: usize,    // occurrences (positions) de x dans n
+    max_size: isize,
+}
+fn min_cand(job: &Job, tsz: isize) -> isize {
+    let d = tsz - job.xsz;
+    job.sn + if d >= 0 { d } else { d * job.occ.min(30) as isize }
+}
+struct Inv<'a> {
+    rules: &'a [Rule],
+    pool: Pool,
+    left: usize, // budget de candidats
+    trunc: bool,
+}
+impl<'a> Inv<'a> {
+    // antécédents candidats de n : s tel que n = s[cible := rhs], sur un sous-ensemble d'occurrences.
+    // Sur-ensemble exact (hors pool/budget) ; chaque candidat est ensuite vérifié par le pas avant.
+    fn preimages(&mut self, ar: &mut Arena, n: Id, max_size: usize, out: &mut Vec<Id>) {
+        let mut subs = ar.reach(n);
+        subs.sort_unstable();
+        let rules = self.rules;
+        for rule in rules {
+            let mut lv = [false; NV];
+            pat_vars(&rule.lhs, &mut lv);
+            for (_, rhs) in &rule.outs {
+                for &x in &subs {
+                    if self.left == 0 {
+                        self.trunc = true;
+                        return;
+                    }
+                    let mut b0: Bind = [None; NV];
+                    if !ar.matches(rhs, x, &mut b0) {
+                        continue;
+                    }
+                    let fv: Vec<usize> = (0..NV).filter(|&v| lv[v] && b0[v].is_none()).collect();
+                    let job = Job {
+                        n,
+                        x,
+                        lhs: &rule.lhs,
+                        sn: ar.size(n) as isize,
+                        xsz: ar.size(x) as isize,
+                        occ: ar.count_occ(n, x),
+                        max_size: max_size as isize,
+                    };
+                    self.fill(ar, &job, &fv, &mut b0, out);
+                }
+            }
+        }
+    }
+    fn fill(&mut self, ar: &mut Arena, job: &Job, fv: &[usize], b: &mut Bind, out: &mut Vec<Id>) {
+        match fv.split_first() {
+            None => {
+                let target = ar.inst(job.lhs, b);
+                let d = ar.size(target) as isize - job.xsz;
+                let occ = job.occ.min(30);
+                let mut masks: Vec<u32> = Vec::new();
+                if occ <= 8 {
+                    for mk in 1u32..(1u32 << occ) {
+                        masks.push(mk);
+                    }
+                } else {
+                    self.trunc = true; // on ne garde que « tout » et les singletons
+                    masks.push(((1u64 << occ) - 1) as u32);
+                    for i in 0..occ {
+                        masks.push(1u32 << i);
+                    }
+                }
+                for mk in masks {
+                    if job.sn + d * mk.count_ones() as isize > job.max_size {
+                        continue;
+                    }
+                    if self.left == 0 {
+                        self.trunc = true;
+                        return;
+                    }
+                    self.left -= 1;
+                    let s = ar.replace_occ(job.n, job.x, target, mk, &mut 0);
+                    out.push(s);
+                }
+            }
+            Some((&v, rest)) => {
+                let mut szs = [1usize; NV];
+                for u in 0..NV {
+                    if let Some(t) = b[u] {
+                        szs[u] = ar.size(t);
+                    }
+                }
+                let np = self.pool.terms.len();
+                let mut broke = false;
+                for pi in 0..np {
+                    let t = self.pool.terms[pi];
+                    szs[v] = ar.size(t);
+                    if min_cand(job, pat_size_with(job.lhs, &szs) as isize) > job.max_size {
+                        broke = true; // pool trié par taille : les suivants sont plus gros
+                        break;
+                    }
+                    b[v] = Some(t);
+                    self.fill(ar, job, rest, b, out);
+                    if self.left == 0 {
+                        self.trunc = true;
+                        b[v] = None;
+                        return;
+                    }
+                }
+                b[v] = None;
+                if !broke {
+                    szs[v] = self.pool.upto + 1; // un terme plus gros aurait-il tenu ?
+                    if min_cand(job, pat_size_with(job.lhs, &szs) as isize) <= job.max_size {
+                        self.trunc = true;
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct Oracle {
+    valid: Vec<Id>, // causes valides (taille ≤ HMAX, juge ≤ kmax), triées
+    z: f64,         // masse a posteriori non normalisée (prior × vraisemblance), h_vrai inclus
+    map: Option<Id>,
+    map_w: f64,
+    w_true: f64,    // poids de la vraie cause (calcul avant exact)
+    w_back: f64,    // même poids par DP arrière (contrôle)
+    has_true: bool, // h_vrai ∈ V énumérée
+    trunc: bool,    // énumération incomplète ⇒ z sous-estimé ⇒ plancher = borne inférieure
+}
+fn oracle(ep: &mut Episode, cfg: &Cfg, cap: usize) -> Oracle {
+    let kmax = ep.kmax;
+    let pool = build_pool(&mut ep.ar, &ep.sig, POOL_CAP);
+    let mut inv = Inv { rules: &ep.rules, pool, left: cap, trunc: false };
+    // v[j][s] = P(s atteint o en exactement j pas)
+    let mut v: Vec<HashMap<Id, f64>> = vec![HashMap::new(); kmax + 1];
+    v[0].insert(ep.o, 1.0);
+    for j in 1..=kmax {
+        let max_size = if j == kmax { HMAX } else { OMAX };
+        let mut prev: Vec<Id> = v[j - 1].keys().copied().collect();
+        prev.sort_unstable();
+        let mut cand: Vec<Id> = Vec::new();
+        for n in prev {
+            inv.preimages(&mut ep.ar, n, max_size, &mut cand);
+            if inv.left == 0 {
+                break;
+            }
+        }
+        cand.sort_unstable();
+        cand.dedup();
+        let mut cur: HashMap<Id, f64> = HashMap::new();
+        for s in cand {
+            let mut w = 0.0f64;
+            for (n2, p) in succs(&mut ep.ar, &ep.rules, s) {
+                if let Some(&vv) = v[j - 1].get(&n2) {
+                    w += p * vv;
+                }
+            }
+            if w > 0.0 {
+                cur.insert(s, w);
+            }
+        }
+        v[j] = cur;
+    }
+    let mut tot: HashMap<Id, f64> = HashMap::new();
+    for j in 1..=kmax {
+        for (&s, &w) in v[j].iter() {
+            *tot.entry(s).or_insert(0.0) += w;
+        }
+    }
+    let mut ids: Vec<Id> = tot.keys().copied().collect();
+    ids.sort_unstable();
+    let mut pr = Prior::new(&ep.sig, &ep.rules);
+    let mut valid: Vec<Id> = Vec::new();
+    let mut z = 0.0f64;
+    let mut best: Option<(Id, f64)> = None;
+    let mut has_true = false;
+    let mut w_back = 0.0f64;
+    for s in ids {
+        if ep.ar.size(s) > HMAX {
+            continue;
+        }
+        valid.push(s);
+        if s == ep.o {
+            continue; // hors support : le générateur impose o ≠ h
+        }
+        let mut tk: Vec<usize> = Vec::new();
+        ep.ar.ser(s, &mut tk);
+        if ep.plen + tk.len() + 1 > cfg.maxt {
+            continue; // le générateur rejette les séquences trop longues
+        }
+        let w = pr.p(&ep.ar, s, ep.depth) * tot[&s] / kmax as f64;
+        if s == ep.h {
+            has_true = true;
+            w_back = w;
+        }
+        if w <= 0.0 {
+            continue;
+        }
+        z += w;
+        if best.map_or(true, |b| w > b.1) {
+            best = Some((s, w));
+        }
+    }
+    let l_true = likelihood(&mut ep.ar, &ep.rules, ep.h, ep.o, kmax);
+    let w_true = pr.p(&ep.ar, ep.h, ep.depth) * l_true;
+    if !has_true {
+        valid.push(ep.h);
+        z += w_true; // garde z ≥ w_true : le plancher reste une borne inférieure valide
+        if best.map_or(true, |b| w_true > b.1) {
+            best = Some((ep.h, w_true));
+        }
+    }
+    valid.sort_unstable();
+    valid.dedup();
+    Oracle {
+        valid,
+        z,
+        map: best.map(|b| b.0),
+        map_w: best.map_or(0.0, |b| b.1),
+        w_true,
+        w_back,
+        has_true,
+        trunc: inv.trunc,
+    }
+}
 fn demo(m: &Model, seed: u64, k: usize) {
     let mut rng = Rng::new(seed ^ 0xDE30);
     let mut ep = make_episode(&mut rng, 3);
@@ -1518,16 +1997,12 @@ fn demo(m: &Model, seed: u64, k: usize) {
         }
     }
 }
-
-// ───────────────────────── main ─────────────────────────
 fn arg<T: std::str::FromStr>(kv: &HashMap<String, String>, key: &str, def: T) -> T {
     kv.get(key).and_then(|v| v.parse().ok()).unwrap_or(def)
 }
-
 fn default_threads() -> usize {
     std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
 }
-
 fn main() {
     let mut kv: HashMap<String, String> = HashMap::new();
     for a in env::args().skip(1) {
@@ -1551,7 +2026,6 @@ fn main() {
     let eval_n: usize = arg(&kv, "eval_n", 32);
     let ks: usize = arg(&kv, "k", 8);
     let curriculum: u32 = arg(&kv, "curriculum", 1);
-
     let mut rng = Rng::new(seed);
     let mut m = Model::new(&mut rng);
     let mut adam = Adam::new(&m.w);
@@ -1560,7 +2034,7 @@ fn main() {
         m.count(), threads, bs, steps, lr
     );
     let t0 = std::time::Instant::now();
-    let ramp = (steps * 3 / 5).max(1); // curriculum : un niveau de plus tous les ~15 % du budget
+    let ramp = (steps * 3 / 5).max(1); 
     for step in 0..steps {
         let maxlv = if curriculum == 1 { (1 + step * LMAX / ramp).min(LMAX) } else { LMAX };
         let batch = make_batch(&mut rng, bs, maxlv);
