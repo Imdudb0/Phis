@@ -3,3 +3,5 @@ pub mod ptgrs;
 pub mod rng;
 pub mod percept;
 pub mod phi;
+pub mod net;
+pub mod search;
