@@ -2,3 +2,4 @@
 pub mod ptgrs;
 pub mod rng;
 pub mod percept;
+pub mod phi;
