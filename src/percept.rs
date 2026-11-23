@@ -3,11 +3,12 @@
 //! - champ de surprise octet-niveau sous le nul « octets i.i.d. à la fréquence de E » ;
 //! - ancres : débuts de répétitions maximales (tableau de suffixes + LCP) ;
 //! - canaux de relation entre ancres : identité, proximité avant, proximité arrière,
-//!   isomorphie des motifs d'égalité.
+//!   isomorphie des motifs d'égalité entre cycles de la suite des ancres.
 //!
 //! Tout est dérivé de E seul : aucun paramètre, aucun séparateur supposé.
-//! Coûts : tableau de suffixes O(n log n) ; LCP et répétitions O(n) ;
-//! relations O(n log n + somme des longueurs d'ancres).
+//! Coûts : tableau de suffixes O(n log n) ; LCP et répétitions O(n) ; relations O(m log m)
+//! pour m ancres, plus la vérification exacte (linéaire en la longueur du cycle) des seuls
+//! cycles dont l'empreinte coïncide.
 
 const NONE: usize = usize::MAX;
 
@@ -99,9 +100,13 @@ pub struct Relations {
     /// De l'ancre vers l'ancre qui se termine au plus près avant son début (la plus longue
     /// à égalité) ; w = écart en octets.
     pub backward: Vec<Edge>,
-    /// Ancres de contenus distincts, de même longueur, dont les motifs d'égalité sont
-    /// isomorphes (même motif à renommage bijectif des octets près), chaînées dans l'ordre
-    /// du texte ; w = nombre de positions répétées du motif.
+    /// Isomorphie des motifs d'égalité entre cycles. Le cycle d'une ancre `k` est la suite
+    /// des classes des ancres de `k` (incluse) à sa prochaine occurrence d'identité (exclue) ;
+    /// il n'existe que si `k` a un successeur d'identité. Deux cycles sont isomorphes quand
+    /// une bijection entre classes superpose leurs suites, quels que soient les contenus.
+    /// Un cycle où aucune classe ne se répète n'a pas de motif et n'entre pas dans le canal.
+    /// Les ancres de départ des cycles isomorphes sont chaînées dans l'ordre du texte ;
+    /// w = nombre de positions répétées du motif.
     pub iso: Vec<Edge>,
 }
 
@@ -157,7 +162,7 @@ impl Percept {
                 anchors.push(Anchor { pos: p, len: repeats[c].len, class: c });
             }
         }
-        let rel = relate(eff, &sa, &repeats, &anchors);
+        let rel = relate(&repeats, &anchors);
         Percept { eff: eff.to_vec(), null, surprise, cum, sa, lcp, repeats, anchors, rel }
     }
 
@@ -330,71 +335,38 @@ fn window<'a>(eff: &'a [u8], sa: &[usize], r: &Repeat) -> &'a [u8] {
     &eff[p..p + r.len]
 }
 
-/// Nombre de positions dont l'octet a déjà paru plus tôt dans la fenêtre.
-fn repeated(w: &[u8]) -> usize {
-    let mut seen = [false; 256];
-    let mut r = 0;
-    for &b in w {
-        if seen[b as usize] {
-            r += 1;
-        } else {
-            seen[b as usize] = true;
-        }
-    }
-    r
+/// Encodage d'une position t dans le cycle qui débute à l'ancre a : distance à l'occurrence
+/// précédente de la même classe dans le cycle, 0 si c'est la première.
+fn code(prev: &[usize], a: usize, t: usize) -> usize {
+    let p = prev[t];
+    if p != NONE && p >= a { t - p } else { 0 }
 }
 
-/// Empreinte du motif d'égalité (indices de première apparition) ; None s'il n'y a
-/// aucune égalité interne, c'est-à-dire pas de motif.
-fn pattern_hash(w: &[u8]) -> Option<u64> {
-    let mut id = [u16::MAX; 256];
-    let mut next = 0u16;
-    let mut h = 0xcbf2_9ce4_8422_2325u64;
-    for &b in w {
-        let slot = &mut id[b as usize];
-        if *slot == u16::MAX {
-            *slot = next;
-            next += 1;
-        }
-        h = (h ^ u64::from(*slot)).wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    if usize::from(next) < w.len() { Some(h) } else { None }
+/// Les cycles `[a1, a1 + len)` et `[a2, a2 + len)` ont des encodages égaux, c'est-à-dire
+/// qu'une bijection entre classes superpose leurs suites (équivalence de Baker).
+fn same_cycle(prev: &[usize], a1: usize, a2: usize, len: usize) -> bool {
+    (0..len).all(|d| code(prev, a1, a1 + d) == code(prev, a2, a2 + d))
 }
 
-/// Isomorphie exacte des motifs d'égalité : il existe une bijection d'octets de a vers b.
-fn same_pattern(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut ia = [u16::MAX; 256];
-    let mut ib = [u16::MAX; 256];
-    let mut next = 0u16;
-    for t in 0..a.len() {
-        let (x, y) = (a[t] as usize, b[t] as usize);
-        let (new_a, new_b) = (ia[x] == u16::MAX, ib[y] == u16::MAX);
-        if new_a != new_b {
-            return false;
-        }
-        if new_a {
-            ia[x] = next;
-            ib[y] = next;
-            next += 1;
-        } else if ia[x] != ib[y] {
-            return false;
-        }
-    }
-    true
+/// Nombre de positions du cycle `[a, b)` dont la classe a déjà paru dans le cycle.
+fn repeated_in(prev: &[usize], a: usize, b: usize) -> usize {
+    (a..b).filter(|&t| code(prev, a, t) != 0).count()
 }
 
-fn relate(eff: &[u8], sa: &[usize], repeats: &[Repeat], anchors: &[Anchor]) -> Relations {
+fn relate(repeats: &[Repeat], anchors: &[Anchor]) -> Relations {
     let m = anchors.len();
     let mut rel = Relations::default();
 
     // Identité : chaînage des occurrences successives de la même classe, dans les deux sens.
+    // prev[k] / next[k] : ancre précédente / suivante de même classe (NONE aux extrémités).
+    let mut prev = vec![NONE; m];
+    let mut next = vec![NONE; m];
     let mut last = vec![NONE; repeats.len()];
     for (k, a) in anchors.iter().enumerate() {
         let j = last[a.class];
         if j != NONE {
+            prev[k] = j;
+            next[j] = k;
             let w = repeats[a.class].bits as f32;
             rel.identity.push(Edge { from: j, to: k, w });
             rel.identity.push(Edge { from: k, to: j, w });
@@ -426,31 +398,72 @@ fn relate(eff: &[u8], sa: &[usize], repeats: &[Repeat], anchors: &[Anchor]) -> R
         }
     }
 
-    // Isomorphie des motifs d'égalité. Ancres de chaque classe (CSR, indices croissants).
-    let mut first = vec![0usize; repeats.len() + 1];
-    for a in anchors {
-        first[a.class + 1] += 1;
+    rel.iso = iso_edges(&prev, &next);
+    rel
+}
+
+/// Isomorphie des motifs d'égalité au niveau des ancres.
+///
+/// Le cycle d'une ancre `a` ayant un successeur d'identité `b = next[a]` est la suite des
+/// classes des ancres `a..b`. Deux cycles de même longueur sont isomorphes ssi une bijection
+/// entre classes les superpose, ssi leurs encodages coïncident (voir `code`). Un cycle sans
+/// classe répétée n'a pas de motif et est écarté.
+fn iso_edges(prev: &[usize], next: &[usize]) -> Vec<Edge> {
+    const BASE: u64 = 0x9E37_79B9_7F4A_7C15; // impair, donc inversible modulo 2^64
+    let m = prev.len();
+    let mut out: Vec<Edge> = Vec::new();
+
+    // q[k] = min des next[p] pour p >= k. Une classe se répète dans [k, b) ssi q[k] < b,
+    // donc le cycle de k a un motif d'égalité ssi q[k] < next[k].
+    let mut q = vec![NONE; m + 1];
+    for k in (0..m).rev() {
+        q[k] = q[k + 1].min(next[k]);
     }
-    for c in 0..repeats.len() {
-        first[c + 1] += first[c];
+
+    // inv = BASE^-1 modulo 2^64 (Newton : la précision double à chaque tour, 3 bits au départ).
+    let mut inv = BASE;
+    for _ in 0..6 {
+        inv = inv.wrapping_mul(2u64.wrapping_sub(BASE.wrapping_mul(inv)));
     }
-    let mut fill = first.clone();
-    let mut by_class = vec![0usize; m];
-    for (k, a) in anchors.iter().enumerate() {
-        by_class[fill[a.class]] = k;
-        fill[a.class] += 1;
+    let mut pw = vec![1u64; m + 1];
+    let mut ipw = vec![1u64; m + 1];
+    for t in 1..=m {
+        pw[t] = pw[t - 1].wrapping_mul(BASE);
+        ipw[t] = ipw[t - 1].wrapping_mul(inv);
     }
-    // Classes portant des ancres et un motif, triées par (longueur, empreinte).
-    let mut keyed: Vec<(usize, u64, usize)> = Vec::new();
-    for c in 0..repeats.len() {
-        if first[c] == first[c + 1] {
+
+    // Empreinte du cycle [a, b) = somme sur t de d_t * BASE^(b-1-t), où d_t = t - prev[t]
+    // si prev[t] >= a et 0 sinon (l'encodage). Pour un départ a, les t à d_t non nul sont
+    // les next[p] avec p >= a : en balayant a de m-1 à 0, un seul t s'active par pas
+    // (t = next[a]), et la somme sur t < b se lit dans un arbre de Fenwick portant
+    // d_t * BASE^-t. Coût O(log m) par cycle, quelle que soit sa longueur.
+    let mut fen = vec![0u64; m + 1];
+    let mut keyed: Vec<(usize, u64, usize)> = Vec::new(); // (longueur, empreinte, départ)
+    for a in (0..m).rev() {
+        let b = next[a];
+        if b == NONE {
             continue;
         }
-        if let Some(h) = pattern_hash(window(eff, sa, &repeats[c])) {
-            keyed.push((repeats[c].len, h, c));
+        let v = ((b - a) as u64).wrapping_mul(ipw[b]);
+        let mut i = b + 1;
+        while i <= m {
+            fen[i] = fen[i].wrapping_add(v);
+            i += i & i.wrapping_neg();
+        }
+        if q[a] < b {
+            let mut s = 0u64;
+            let mut j = b;
+            while j > 0 {
+                s = s.wrapping_add(fen[j]);
+                j -= j & j.wrapping_neg();
+            }
+            keyed.push((b - a, pw[b - 1].wrapping_mul(s), a));
         }
     }
     keyed.sort_unstable();
+
+    // Chaque série de (longueur, empreinte) égales est vérifiée exactement : aucune
+    // collision ne fusionne. Dans une série, les départs sont déjà croissants (ordre du texte).
     let mut i = 0;
     while i < keyed.len() {
         let (len, hash, _) = keyed[i];
@@ -458,34 +471,27 @@ fn relate(eff: &[u8], sa: &[usize], repeats: &[Repeat], anchors: &[Anchor]) -> R
         while e < keyed.len() && keyed[e].0 == len && keyed[e].1 == hash {
             e += 1;
         }
-        // Vérification exacte des empreintes égales (aucune collision ne fusionne).
-        let mut groups: Vec<Vec<usize>> = Vec::new();
-        for &(_, _, c) in &keyed[i..e] {
-            let wc = window(eff, sa, &repeats[c]);
-            let home = groups
-                .iter()
-                .position(|g| same_pattern(window(eff, sa, &repeats[g[0]]), wc));
-            match home {
-                Some(g) => groups[g].push(c),
-                None => groups.push(vec![c]),
+        if e - i >= 2 {
+            let mut groups: Vec<Vec<usize>> = Vec::new();
+            for &(_, _, a) in &keyed[i..e] {
+                let home = groups.iter().position(|g| same_cycle(prev, g[0], a, len));
+                match home {
+                    Some(g) => groups[g].push(a),
+                    None => groups.push(vec![a]),
+                }
             }
-        }
-        for g in groups {
-            if g.len() < 2 {
-                continue;
-            }
-            let w = repeated(window(eff, sa, &repeats[g[0]])) as f32;
-            let mut members: Vec<usize> = Vec::new();
-            for &c in &g {
-                members.extend_from_slice(&by_class[first[c]..first[c + 1]]);
-            }
-            members.sort_unstable();
-            for p in members.windows(2) {
-                rel.iso.push(Edge { from: p[0], to: p[1], w });
-                rel.iso.push(Edge { from: p[1], to: p[0], w });
+            for g in &groups {
+                if g.len() < 2 {
+                    continue;
+                }
+                let w = repeated_in(prev, g[0], g[0] + len) as f32;
+                for p in g.windows(2) {
+                    out.push(Edge { from: p[0], to: p[1], w });
+                    out.push(Edge { from: p[1], to: p[0], w });
+                }
             }
         }
         i = e;
     }
-    rel
+    out
 }
