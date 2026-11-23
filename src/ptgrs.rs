@@ -1,0 +1,567 @@
+//! PTGRS : Probabilistic Term Graph Rewriting System.
+//!
+//! Le système fabrique E (octets). La cause cachée (`Cause`) n'est jamais
+//! montrée au modèle ; elle ne sert qu'à l'évaluation a posteriori.
+//!
+//! Hiérarchie de symboles (niveau 0 = terminaux) ; règles à variables,
+//! RHS en graphe orienté acyclique (partage de sous-termes) ; réécriture
+//! en place du radical (les parents voient le remplacement) ; choix du
+//! radical et de la règle probabilistes. E = lignes-règles (dictionnaire,
+//! utiles ou non) + bruit + leurres + énoncés issus de la réécriture.
+//! Alphabet, séparateurs et mots sont retirés au hasard à chaque échantillon.
+
+use crate::rng::Rng;
+use std::collections::HashSet;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    Used,     // règle appliquée dans une dérivation
+    Unused,   // règle du dictionnaire jamais appliquée
+    Instance, // énoncé produit par réécriture
+    Noise,    // mots frais, sans répétition
+    Decoy,    // répétitions sans lien causal
+}
+
+#[derive(Clone, Debug)]
+pub struct Line {
+    pub start: usize,
+    pub end: usize, // exclu ; le séparateur de ligne est à `end`
+    pub role: Role,
+}
+
+/// Cause cachée : évaluation a posteriori uniquement.
+#[derive(Clone, Debug, Default)]
+pub struct Cause {
+    pub lines: Vec<Line>,
+    /// Adjacences de provenance entre lignes (a < b, triées).
+    pub links: Vec<(usize, usize)>,
+    /// Lignes des règles appliquées aux termes de départ.
+    pub tops: Vec<usize>,
+    pub steps: usize,
+}
+
+impl Cause {
+    /// Ligne contenant l'octet `pos` (hors séparateur de fin de ligne).
+    pub fn line_of(&self, pos: usize) -> Option<usize> {
+        let i = self.lines.partition_point(|l| l.start <= pos);
+        if i == 0 {
+            return None;
+        }
+        let l = &self.lines[i - 1];
+        if pos < l.end { Some(i - 1) } else { None }
+    }
+
+    pub fn linked(&self, a: usize, b: usize) -> bool {
+        let p = if a < b { (a, b) } else { (b, a) };
+        self.links.contains(&p)
+    }
+
+    /// Ligne faisant partie de la cause (règle utilisée ou énoncé).
+    pub fn is_cause_line(&self, i: usize) -> bool {
+        matches!(self.lines[i].role, Role::Used | Role::Instance)
+    }
+}
+
+pub struct Sample {
+    pub eff: Vec<u8>,
+    pub cause: Cause,
+}
+
+#[derive(Clone, Debug)]
+pub struct Cfg {
+    pub levels: usize,
+    pub width: usize,
+    pub terminals: usize,
+    pub max_arity: usize,
+    pub alt_max: usize,
+    pub rhs_min: usize,
+    pub rhs_max: usize,
+    pub instances: usize,
+    pub noise: usize,
+    pub decoys: usize,
+    pub word_min: usize,
+    pub word_max: usize,
+    pub alpha_min: usize,
+    pub alpha_max: usize,
+    pub max_words: usize,
+}
+
+impl Cfg {
+    /// Difficulté croissante avec `scale` dans [0, 1].
+    pub fn at_scale(rng: &mut Rng, scale: f64) -> Cfg {
+        let s = scale.clamp(0.0, 1.0);
+        Cfg {
+            levels: 2 + usize::from(s > 0.5),
+            width: 3 + (s * 4.0) as usize + rng.below(2),
+            terminals: 6 + (s * 10.0) as usize + rng.below(4),
+            max_arity: if s < 0.25 { 1 } else { 2 },
+            alt_max: 2,
+            rhs_min: 2,
+            rhs_max: 3 + usize::from(s > 0.6),
+            instances: 1 + usize::from(s > 0.7 && rng.chance(0.5)),
+            noise: (s * 4.0) as usize + rng.below(2),
+            decoys: (s * 2.0) as usize + usize::from(rng.chance(0.3)),
+            word_min: 3,
+            word_max: 7,
+            alpha_min: 12,
+            alpha_max: 36,
+            max_words: 48 + (s * 48.0) as usize,
+        }
+    }
+}
+
+struct Sym {
+    level: usize,
+    arity: usize,
+}
+
+enum Tpl {
+    Var(usize),
+    App(usize, Vec<usize>), // symbole, enfants (indices < courant)
+}
+
+struct Rule {
+    head: usize,
+    nodes: Vec<Tpl>, // DAG ; la racine est le dernier nœud
+    vars: Vec<Vec<u8>>,
+    weight: f64,
+}
+
+#[derive(Clone)]
+struct GNode {
+    sym: usize,
+    args: Vec<usize>,
+    born: Option<usize>, // règle qui a créé ce nœud
+}
+
+struct Deriv {
+    g: Vec<GNode>,
+    root: usize,
+    applied: Vec<usize>,
+    prov: Vec<(usize, usize)>, // (règle parente, règle enfant)
+    tops: Vec<usize>,
+    steps: usize,
+}
+
+fn make_word(
+    rng: &mut Rng,
+    alpha: &[u8],
+    lo: usize,
+    hi: usize,
+    used: &mut HashSet<Vec<u8>>,
+) -> Vec<u8> {
+    loop {
+        let len = rng.range(lo, hi + 1);
+        let w: Vec<u8> = (0..len).map(|_| alpha[rng.below(alpha.len())]).collect();
+        if used.insert(w.clone()) {
+            return w;
+        }
+    }
+}
+
+fn join(tokens: &[&[u8]], sep: u8) -> Vec<u8> {
+    let mut v = Vec::new();
+    for (i, t) in tokens.iter().enumerate() {
+        if i > 0 {
+            v.push(sep);
+        }
+        v.extend_from_slice(t);
+    }
+    v
+}
+
+/// Alphabet et séparateurs aléatoires : aucun octet n'a de sens a priori.
+fn surface(rng: &mut Rng, cfg: &Cfg) -> (u8, u8, u8, Vec<u8>) {
+    let mut cand: Vec<u8> = Vec::with_capacity(96);
+    cand.push(b'\n');
+    cand.extend(0x20u8..=0x7e);
+    let w: u8;
+    let h: u8;
+    let l: u8;
+    if rng.chance(0.5) {
+        w = b' ';
+        h = b':';
+        l = b'\n';
+        cand.retain(|&b| b != w && b != h && b != l);
+    } else {
+        rng.shuffle(&mut cand);
+        w = cand[0];
+        h = cand[1];
+        l = cand[2];
+        cand.drain(0..3);
+    }
+    rng.shuffle(&mut cand);
+    let a = rng.range(cfg.alpha_min, cfg.alpha_max + 1).min(cand.len());
+    cand.truncate(a);
+    (w, h, l, cand)
+}
+
+fn build_rhs(
+    rng: &mut Rng,
+    syms: &[Sym],
+    by_level: &[Vec<usize>],
+    head: usize,
+    cfg: &Cfg,
+) -> Vec<Tpl> {
+    let m = syms[head].arity;
+    let lvl = syms[head].level;
+    let mut nodes: Vec<Tpl> = (0..m).map(Tpl::Var).collect();
+    let mut unused: Vec<usize> = (0..m).collect();
+    let n_app = rng.range(cfg.rhs_min, cfg.rhs_max + 1);
+    for _ in 0..n_app {
+        let tl = if lvl > 1 && rng.chance(0.7) { lvl - 1 } else { rng.below(lvl) };
+        let s = by_level[tl][rng.below(by_level[tl].len())];
+        let mut ch = Vec::with_capacity(syms[s].arity);
+        for _ in 0..syms[s].arity {
+            let c = if !unused.is_empty() && rng.chance(0.8) {
+                let u = rng.below(unused.len());
+                unused.swap_remove(u)
+            } else if !nodes.is_empty() {
+                rng.below(nodes.len()) // partage d'un nœud existant
+            } else {
+                let t = by_level[0][rng.below(by_level[0].len())];
+                nodes.push(Tpl::App(t, Vec::new()));
+                nodes.len() - 1
+            };
+            ch.push(c);
+        }
+        nodes.push(Tpl::App(s, ch));
+        unused.push(nodes.len() - 1);
+    }
+    nodes
+}
+
+fn reachable(g: &[GNode], root: usize) -> Vec<usize> {
+    let mut seen = vec![false; g.len()];
+    let mut out = Vec::new();
+    let mut stack = vec![root];
+    while let Some(n) = stack.pop() {
+        if seen[n] {
+            continue;
+        }
+        seen[n] = true;
+        out.push(n);
+        for &a in &g[n].args {
+            stack.push(a);
+        }
+    }
+    out
+}
+
+fn unfolded(g: &[GNode], id: usize, memo: &mut [usize]) -> usize {
+    if memo[id] != usize::MAX {
+        return memo[id];
+    }
+    let mut n = 1usize;
+    for &a in &g[id].args {
+        n = n.saturating_add(unfolded(g, a, memo));
+    }
+    memo[id] = n;
+    n
+}
+
+fn emit_graph<'a>(g: &[GNode], id: usize, words: &'a [Vec<u8>], out: &mut Vec<&'a [u8]>) {
+    out.push(&words[g[id].sym]);
+    for &a in &g[id].args {
+        emit_graph(g, a, words, out);
+    }
+}
+
+fn emit_tpl<'a>(
+    nodes: &[Tpl],
+    idx: usize,
+    words: &'a [Vec<u8>],
+    vars: &'a [Vec<u8>],
+    out: &mut Vec<&'a [u8]>,
+) {
+    match &nodes[idx] {
+        Tpl::Var(i) => out.push(&vars[*i]),
+        Tpl::App(s, ch) => {
+            out.push(&words[*s]);
+            for &c in ch {
+                emit_tpl(nodes, c, words, vars, out);
+            }
+        }
+    }
+}
+
+/// Une dérivation : réécriture probabiliste d'un graphe de termes.
+fn derive(
+    rng: &mut Rng,
+    cfg: &Cfg,
+    syms: &[Sym],
+    rules: &[Rule],
+    by_head: &[Vec<usize>],
+    terminals: &[usize],
+    top_syms: &[usize],
+) -> Deriv {
+    let top = top_syms[rng.below(top_syms.len())];
+    let mut g: Vec<GNode> = Vec::new();
+    let mut args: Vec<usize> = Vec::new();
+    for _ in 0..syms[top].arity {
+        if !args.is_empty() && rng.chance(0.3) {
+            let a = args[rng.below(args.len())];
+            args.push(a);
+        } else {
+            let t = terminals[rng.below(terminals.len())];
+            g.push(GNode { sym: t, args: Vec::new(), born: None });
+            args.push(g.len() - 1);
+        }
+    }
+    g.push(GNode { sym: top, args, born: None });
+    let root = g.len() - 1;
+    let max_steps = if rng.chance(0.55) {
+        usize::MAX
+    } else {
+        1 + rng.below(2 * cfg.levels + 2)
+    };
+    let (mut applied, mut prov, mut tops) = (Vec::new(), Vec::new(), Vec::new());
+    let mut steps = 0usize;
+    while steps < max_steps {
+        let redexes: Vec<usize> = reachable(&g, root)
+            .into_iter()
+            .filter(|&n| !by_head[g[n].sym].is_empty())
+            .collect();
+        if redexes.is_empty() {
+            break;
+        }
+        let mut memo = vec![usize::MAX; g.len()];
+        if unfolded(&g, root, &mut memo) > cfg.max_words {
+            break;
+        }
+        let r = redexes[rng.below(redexes.len())];
+        let cands = &by_head[g[r].sym];
+        let w: Vec<f64> = cands.iter().map(|&i| rules[i].weight).collect();
+        let ri = cands[rng.weighted(&w)];
+        match g[r].born {
+            Some(p) => prov.push((p, ri)),
+            None => tops.push(ri),
+        }
+        let rule = &rules[ri];
+        let bound = g[r].args.clone();
+        let last = rule.nodes.len() - 1;
+        let mut map = vec![usize::MAX; rule.nodes.len()];
+        for (ti, t) in rule.nodes.iter().enumerate() {
+            match t {
+                Tpl::Var(i) => map[ti] = bound[*i],
+                Tpl::App(s, ch) => {
+                    let cargs: Vec<usize> = ch.iter().map(|&c| map[c]).collect();
+                    if ti == last {
+                        // réécriture en place : les parents voient le remplacement
+                        g[r] = GNode { sym: *s, args: cargs, born: Some(ri) };
+                        map[ti] = r;
+                    } else {
+                        g.push(GNode { sym: *s, args: cargs, born: Some(ri) });
+                        map[ti] = g.len() - 1;
+                    }
+                }
+            }
+        }
+        applied.push(ri);
+        steps += 1;
+    }
+    Deriv { g, root, applied, prov, tops, steps }
+}
+
+fn add_link(links: &mut Vec<(usize, usize)>, a: usize, b: usize) {
+    if a == b {
+        return;
+    }
+    let p = if a < b { (a, b) } else { (b, a) };
+    if !links.contains(&p) {
+        links.push(p);
+    }
+}
+
+pub struct Ptgrs {
+    pub cfg: Cfg,
+}
+
+impl Ptgrs {
+    pub fn new(cfg: Cfg) -> Self {
+        Ptgrs { cfg }
+    }
+
+    pub fn at_scale(rng: &mut Rng, scale: f64) -> Sample {
+        let cfg = Cfg::at_scale(rng, scale);
+        Ptgrs::new(cfg).sample(rng)
+    }
+
+    pub fn sample(&self, rng: &mut Rng) -> Sample {
+        let cfg = &self.cfg;
+        let (w_sep, h_sep, l_sep, alpha) = surface(rng, cfg);
+        let mut used_words: HashSet<Vec<u8>> = HashSet::new();
+
+        // Signature : niveau 0 = terminaux.
+        let mut syms: Vec<Sym> = Vec::new();
+        let mut by_level: Vec<Vec<usize>> = vec![Vec::new(); cfg.levels + 1];
+        for _ in 0..cfg.terminals {
+            syms.push(Sym { level: 0, arity: 0 });
+            by_level[0].push(syms.len() - 1);
+        }
+        let wts: Vec<f64> = (0..=cfg.max_arity)
+            .map(|a| if a == 0 { 1.0 } else { 3.0 / a as f64 })
+            .collect();
+        for lv in 1..=cfg.levels {
+            for _ in 0..cfg.width {
+                let ar = rng.weighted(&wts);
+                syms.push(Sym { level: lv, arity: ar });
+                by_level[lv].push(syms.len() - 1);
+            }
+        }
+        let words: Vec<Vec<u8>> = (0..syms.len())
+            .map(|_| make_word(rng, &alpha, cfg.word_min, cfg.word_max, &mut used_words))
+            .collect();
+
+        // Règles probabilistes.
+        let mut rules: Vec<Rule> = Vec::new();
+        let mut by_head: Vec<Vec<usize>> = vec![Vec::new(); syms.len()];
+        for s in 0..syms.len() {
+            if syms[s].level == 0 {
+                continue;
+            }
+            let alts = 1 + rng.below(cfg.alt_max);
+            for _ in 0..alts {
+                let nodes = build_rhs(rng, &syms, &by_level, s, cfg);
+                let mut vars: Vec<Vec<u8>> = Vec::new();
+                for _ in 0..syms[s].arity {
+                    vars.push(make_word(rng, &alpha, cfg.word_min, cfg.word_max, &mut used_words));
+                }
+                let weight = 0.2 + rng.unit();
+                by_head[s].push(rules.len());
+                rules.push(Rule { head: s, nodes, vars, weight });
+            }
+        }
+
+        // Dérivations (la cause cachée).
+        let top_syms: Vec<usize> = by_level[cfg.levels].clone();
+        let mut derivs: Vec<Deriv> = Vec::new();
+        for _ in 0..cfg.instances {
+            derivs.push(derive(rng, cfg, &syms, &rules, &by_head, &by_level[0], &top_syms));
+        }
+        let mut applied = vec![false; rules.len()];
+        for d in &derivs {
+            for &r in &d.applied {
+                applied[r] = true;
+            }
+        }
+
+        // Surface textuelle.
+        struct Entry {
+            text: Vec<u8>,
+            role: Role,
+            rule: Option<usize>,
+            inst: Option<usize>,
+        }
+        let mut entries: Vec<Entry> = Vec::new();
+        for (ri, r) in rules.iter().enumerate() {
+            let mut head: Vec<&[u8]> = Vec::new();
+            head.push(&words[r.head]);
+            for v in &r.vars {
+                head.push(v);
+            }
+            let mut body: Vec<&[u8]> = Vec::new();
+            emit_tpl(&r.nodes, r.nodes.len() - 1, &words, &r.vars, &mut body);
+            let mut text = join(&head, w_sep);
+            text.push(h_sep);
+            text.push(w_sep);
+            text.extend(join(&body, w_sep));
+            let role = if applied[ri] { Role::Used } else { Role::Unused };
+            entries.push(Entry { text, role, rule: Some(ri), inst: None });
+        }
+        for _ in 0..cfg.noise {
+            let n = rng.range(4, 11);
+            let mut toks: Vec<Vec<u8>> = Vec::new();
+            for _ in 0..n {
+                toks.push(make_word(rng, &alpha, cfg.word_min, cfg.word_max, &mut used_words));
+            }
+            let refs: Vec<&[u8]> = toks.iter().map(|t| t.as_slice()).collect();
+            entries.push(Entry { text: join(&refs, w_sep), role: Role::Noise, rule: None, inst: None });
+        }
+        for _ in 0..cfg.decoys {
+            let nsh = rng.range(2, 4);
+            let lo = cfg.word_max.max(5);
+            let mut shared: Vec<Vec<u8>> = Vec::new();
+            for _ in 0..nsh {
+                shared.push(make_word(rng, &alpha, lo, lo + 2, &mut used_words));
+            }
+            for _ in 0..2 {
+                let mut toks: Vec<Vec<u8>> = Vec::new();
+                for w in &shared {
+                    if rng.chance(0.6) {
+                        toks.push(make_word(rng, &alpha, cfg.word_min, cfg.word_max, &mut used_words));
+                    }
+                    toks.push(w.clone());
+                }
+                toks.push(make_word(rng, &alpha, cfg.word_min, cfg.word_max, &mut used_words));
+                let refs: Vec<&[u8]> = toks.iter().map(|t| t.as_slice()).collect();
+                entries.push(Entry { text: join(&refs, w_sep), role: Role::Decoy, rule: None, inst: None });
+            }
+        }
+        rng.shuffle(&mut entries);
+
+        // Requête implicite ou explicite (marqueur répété sur les énoncés).
+        let marker: Option<Vec<u8>> = if rng.chance(0.5) {
+            Some(make_word(rng, &alpha, cfg.word_min, cfg.word_max, &mut used_words))
+        } else {
+            None
+        };
+        for (k, d) in derivs.iter().enumerate() {
+            let mut toks: Vec<&[u8]> = Vec::new();
+            emit_graph(&d.g, d.root, &words, &mut toks);
+            let mut text: Vec<u8> = Vec::new();
+            if let Some(m) = &marker {
+                text.extend_from_slice(m);
+                text.push(h_sep);
+                text.push(w_sep);
+            }
+            text.extend(join(&toks, w_sep));
+            entries.push(Entry { text, role: Role::Instance, rule: None, inst: Some(k) });
+        }
+
+        // Mise en page de E.
+        let mut eff: Vec<u8> = Vec::new();
+        let mut lines: Vec<Line> = Vec::new();
+        let mut rule_line = vec![usize::MAX; rules.len()];
+        let mut inst_line = vec![usize::MAX; derivs.len()];
+        for e in &entries {
+            let start = eff.len();
+            eff.extend_from_slice(&e.text);
+            let end = eff.len();
+            eff.push(l_sep);
+            let li = lines.len();
+            lines.push(Line { start, end, role: e.role });
+            if let Some(r) = e.rule {
+                rule_line[r] = li;
+            }
+            if let Some(k) = e.inst {
+                inst_line[k] = li;
+            }
+        }
+
+        // Provenance : qui a engendré quoi, projeté sur les lignes de E.
+        let mut links: Vec<(usize, usize)> = Vec::new();
+        let mut tops: Vec<usize> = Vec::new();
+        let mut steps = 0usize;
+        for (k, d) in derivs.iter().enumerate() {
+            steps += d.steps;
+            for &(a, b) in &d.prov {
+                add_link(&mut links, rule_line[a], rule_line[b]);
+            }
+            for &t in &d.tops {
+                let l = rule_line[t];
+                if !tops.contains(&l) {
+                    tops.push(l);
+                }
+            }
+            for n in reachable(&d.g, d.root) {
+                if let Some(r) = d.g[n].born {
+                    add_link(&mut links, inst_line[k], rule_line[r]);
+                }
+            }
+        }
+        links.sort();
+
+        Sample { eff, cause: Cause { lines, links, tops, steps } }
+    }
+}
