@@ -1,4 +1,7 @@
 #![forbid(unsafe_code)]
+//! PTGRS-Abducer — abduction « universelle » méta-apprise en contexte.
+//! Générateur : Probabilistic Term Graph Rewriting System (graphe hash-consé, règles probabilistes).
+//! Réseau : petit Transformer causal (RMSNorm, RoPE, SiLU) + autodiff maison. Rust 2024, std seule.
 
 use std::collections::{HashMap, HashSet};
 use std::env;
