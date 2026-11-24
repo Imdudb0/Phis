@@ -5,6 +5,8 @@ use crate::rng::Rng;
 use std::collections::HashMap;
 const NONE: usize = usize::MAX;
 const TOL: f64 = 1e-9;
+const RIVALS: usize = 8;
+
 #[derive(Clone, Copy, Debug)]
 pub struct Budget {
     pub evals: usize,
@@ -57,10 +59,22 @@ pub struct Step {
     pub size: usize,
     pub cause: usize,
 }
+
+fn draw_rival(rng: &mut Rng, f: &Field, size: usize) -> Vec<bool> {
+    let mut ids = f.cands.clone();
+    rng.shuffle(&mut ids);
+    let mut sel = vec![false; f.nc];
+    for &c in ids.iter().take(size) {
+        sel[c] = true;
+    }
+    sel
+}
+
 #[derive(Clone, Debug)]
 pub struct Outcome {
     pub r: usize,
     pub phi: f64,
+    pub rival: f64,
     pub cause: usize,
     pub effect: usize,
     pub sia: Option<Sia>,
@@ -68,6 +82,11 @@ pub struct Outcome {
     pub residual: Residual,
     pub evals: usize,
     pub trace: Vec<Step>,
+}
+impl Outcome {
+    pub fn gain(&self) -> f64 {
+        self.phi - self.rival
+    }
 }
 struct Judged {
     tpm: Tpm,
@@ -226,6 +245,14 @@ pub fn run(
         on_step(&step);
         trace.push(step);
     }
+    let size = count(&field, &sel);
+    let mut rivals = 0.0f64;
+    for _ in 0..RIVALS {
+        let alt = draw_rival(rng, &field, size);
+        rivals += judge(net, &field, &alt, state).phi;
+    }
+    let rival = rivals / RIVALS as f64;
+    evals += RIVALS;
     let found = cur.sia.is_some();
     let explanation = if found {
         explain(p, &field, &sel, unit_gap(p))
@@ -240,6 +267,7 @@ pub fn run(
     Outcome {
         r: state,
         phi: cur.phi,
+        rival,
         cause,
         effect,
         sia: cur.sia,
