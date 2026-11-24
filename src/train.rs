@@ -400,7 +400,7 @@ pub fn session(plan: &Plan, on_epoch: &mut dyn FnMut(&Epoch)) -> Session {
             })
             .collect();
         nets.push(instantiate(&start, &m));
-        let scores = if oracle { fitness_oracle(&nets, &batch, &percepts) } else { fitness(&nets, &batch, &percepts) };
+        let scores = if oracle { fitness_oracle(&nets, &batch, &percepts) } else { fitness(&nets, &percepts) };
         let center = scores[plan.lambda].0;
         let mut order: Vec<usize> = (0..plan.lambda).collect();
         order.sort_by(|&p, &q| {
