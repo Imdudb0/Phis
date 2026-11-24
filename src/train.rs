@@ -140,16 +140,33 @@ fn by_net(cells: Vec<(f64, usize)>, b: usize) -> Vec<(f64, usize)> {
         .collect()
 }
 
-fn fitness(nets: &[Net], percepts: &[Percept]) -> Vec<(f64, usize)> {
+fn null_eff(s: &Sample) -> Vec<u8> {
+    let eff = &s.eff; let mut out = eff.clone();
+    let mut rng = Rng::new(model::seed(eff) ^ NULL_SALT);
+    for l in &s.cause.lines {
+        let line = &eff[l.start..l.end];
+        let mut cnt = [0usize; 256];
+        for &b in line { cnt[b as usize] += 1; }
+        let sep = (0..256).max_by_key(|&b| cnt[b]).unwrap() as u8;
+        let mut toks: Vec<&[u8]> = line.split(|&b| b==sep).filter(|t| !t.is_empty()).collect();
+        rng.shuffle(&mut toks);
+        let mut rb = Vec::new();
+        for (i,t) in toks.iter().enumerate() { if i>0 { rb.push(sep); } rb.extend_from_slice(t); }
+        let n = line.len().min(rb.len());
+        out[l.start..l.start+n].copy_from_slice(&rb[..n]);
+    }
+    out
+}
+
+fn fitness(nets: &[Net], batch: &[Sample], percepts: &[Percept]) -> Vec<(f64, usize)> {
+    let nulls: Vec<Percept> = batch.iter().map(|s| Percept::new(&null_eff(s))).collect();
     let b = percepts.len();
-    by_net(
-        par_map(nets.len() * b, |t| {
-            let p = &percepts[t % b];
-            let o = quiet(&nets[t / b], p, search::Budget::measured(p));
-            (o.phi - o.chance, o.evals)
-        }),
-        b,
-    )
+    by_net(par_map(nets.len()*b, |t| {
+        let (p, q) = (&percepts[t % b], &nulls[t % b]);
+        let o = quiet(&nets[t/b], p, search::Budget::measured(p));
+        let n = quiet(&nets[t/b], q, search::Budget::measured(p));
+        (o.phi - n.phi, o.evals + n.evals)   // le signal est le CONTRASTE de contenu
+    }), b)
 }
 
 // DIAGNOSTIC seulement : F1 contre la cause cachée comme fitness
