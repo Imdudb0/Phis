@@ -260,9 +260,7 @@ pub fn run(
         let next = judge(net, &field, &sel, state);
         evals += 1;
         let tried = next.phi;
-        // maximal, pas minimal : un ajout est accepté tant que φ_sharp ne baisse pas ;
-        // un retrait doit faire monter φ_sharp.
-        let ok = if adding { tried >= cur.phi - TOL } else { tried > cur.phi + TOL };
+        let ok = tried > cur.phi + TOL;
         if ok {
             cur = next;
             tabu.fill(false);
