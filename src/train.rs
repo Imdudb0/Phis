@@ -144,16 +144,15 @@ fn null_eff(s: &Sample) -> Vec<u8> {
     let eff = &s.eff; let mut out = eff.clone();
     let mut rng = Rng::new(model::seed(eff) ^ NULL_SALT);
     for l in &s.cause.lines {
-        let line = &eff[l.start..l.end];
-        let mut cnt = [0usize; 256];
-        for &b in line { cnt[b as usize] += 1; }
-        let sep = (0..256).max_by_key(|&b| cnt[b]).unwrap() as u8;
-        let mut toks: Vec<&[u8]> = line.split(|&b| b==sep).filter(|t| !t.is_empty()).collect();
-        rng.shuffle(&mut toks);
-        let mut rb = Vec::new();
-        for (i,t) in toks.iter().enumerate() { if i>0 { rb.push(sep); } rb.extend_from_slice(t); }
-        let n = line.len().min(rb.len());
-        out[l.start..l.start+n].copy_from_slice(&rb[..n]);
+        let mut seen = [false; 256]; let mut bs: Vec<u8> = Vec::new();
+        for i in l.start..l.end {
+            let b = eff[i];
+            if !seen[b as usize] { seen[b as usize] = true; bs.push(b); }
+        }
+        let mut img = bs.clone(); rng.shuffle(&mut img);
+        let mut map = [0u8; 256];
+        for (i, &b) in bs.iter().enumerate() { map[b as usize] = img[i]; }
+        for i in l.start..l.end { out[i] = map[eff[i] as usize]; }
     }
     out
 }
