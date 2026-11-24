@@ -116,11 +116,14 @@ pub fn residual(p: &Percept, o: &Outcome) -> Vec<u8> {
     out
 }
 pub fn report(p: &Percept, o: &Outcome) -> Vec<u8> {
-    let mut out = explanation(p, o);
+    let mut out = if o.gain() > 0.0 { explanation(p, o) } else { Vec::new() };
     if out.is_empty() {
         out.extend_from_slice("Aucun sens trouvé.".as_bytes());
     }
-    let head = format!("\n\nφ_sharp = {:.6} ({} évaluations)\n", o.phi, o.evals);
+    let head = format!(
+        "\n\nφ_sharp = {:.6} (φ {:.6} − rivaux {:.6}, {} évaluations)\n",
+        o.gain(), o.phi, o.rival, o.evals
+    );
     out.extend_from_slice(head.as_bytes());
     out.extend_from_slice(&residual(p, o));
     out
