@@ -1,47 +1,27 @@
-//! PTGRS : Probabilistic Term Graph Rewriting System.
-//!
-//! Le système fabrique E (octets). La cause cachée (`Cause`) n'est jamais
-//! montrée au modèle ; elle ne sert qu'à l'évaluation a posteriori.
-//!
-//! Hiérarchie de symboles (niveau 0 = terminaux) ; règles à variables,
-//! RHS en graphe orienté acyclique (partage de sous-termes) ; réécriture
-//! en place du radical (les parents voient le remplacement) ; choix du
-//! radical et de la règle probabilistes. E = lignes-règles (dictionnaire,
-//! utiles ou non) + bruit + leurres + énoncés issus de la réécriture.
-//! Alphabet, séparateurs et mots sont retirés au hasard à chaque échantillon.
-
 use crate::rng::Rng;
 use std::collections::HashSet;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
-    Used,     // règle appliquée dans une dérivation
-    Unused,   // règle du dictionnaire jamais appliquée
-    Instance, // énoncé produit par réécriture
-    Noise,    // mots frais, sans répétition
-    Decoy,    // répétitions sans lien causal
+    Used,     
+    Unused,   
+    Instance, 
+    Noise,    
+    Decoy,    
 }
-
 #[derive(Clone, Debug)]
 pub struct Line {
     pub start: usize,
-    pub end: usize, // exclu ; le séparateur de ligne est à `end`
+    pub end: usize, 
     pub role: Role,
 }
-
-/// Cause cachée : évaluation a posteriori uniquement.
 #[derive(Clone, Debug, Default)]
 pub struct Cause {
     pub lines: Vec<Line>,
-    /// Adjacences de provenance entre lignes (a < b, triées).
     pub links: Vec<(usize, usize)>,
-    /// Lignes des règles appliquées aux termes de départ.
     pub tops: Vec<usize>,
     pub steps: usize,
 }
-
 impl Cause {
-    /// Ligne contenant l'octet `pos` (hors séparateur de fin de ligne).
     pub fn line_of(&self, pos: usize) -> Option<usize> {
         let i = self.lines.partition_point(|l| l.start <= pos);
         if i == 0 {
@@ -50,23 +30,18 @@ impl Cause {
         let l = &self.lines[i - 1];
         if pos < l.end { Some(i - 1) } else { None }
     }
-
     pub fn linked(&self, a: usize, b: usize) -> bool {
         let p = if a < b { (a, b) } else { (b, a) };
         self.links.contains(&p)
     }
-
-    /// Ligne faisant partie de la cause (règle utilisée ou énoncé).
     pub fn is_cause_line(&self, i: usize) -> bool {
         matches!(self.lines[i].role, Role::Used | Role::Instance)
     }
 }
-
 pub struct Sample {
     pub eff: Vec<u8>,
     pub cause: Cause,
 }
-
 #[derive(Clone, Debug)]
 pub struct Cfg {
     pub levels: usize,
@@ -85,9 +60,7 @@ pub struct Cfg {
     pub alpha_max: usize,
     pub max_words: usize,
 }
-
 impl Cfg {
-    /// Difficulté croissante avec `scale` dans [0, 1].
     pub fn at_scale(rng: &mut Rng, scale: f64) -> Cfg {
         let s = scale.clamp(0.0, 1.0);
         Cfg {
@@ -109,40 +82,34 @@ impl Cfg {
         }
     }
 }
-
 struct Sym {
     level: usize,
     arity: usize,
 }
-
 enum Tpl {
     Var(usize),
-    App(usize, Vec<usize>), // symbole, enfants (indices < courant)
+    App(usize, Vec<usize>), 
 }
-
 struct Rule {
     head: usize,
-    nodes: Vec<Tpl>, // DAG ; la racine est le dernier nœud
+    nodes: Vec<Tpl>, 
     vars: Vec<Vec<u8>>,
     weight: f64,
 }
-
 #[derive(Clone)]
 struct GNode {
     sym: usize,
     args: Vec<usize>,
-    born: Option<usize>, // règle qui a créé ce nœud
+    born: Option<usize>, 
 }
-
 struct Deriv {
     g: Vec<GNode>,
     root: usize,
     applied: Vec<usize>,
-    prov: Vec<(usize, usize)>, // (règle parente, règle enfant)
+    prov: Vec<(usize, usize)>, 
     tops: Vec<usize>,
     steps: usize,
 }
-
 fn make_word(
     rng: &mut Rng,
     alpha: &[u8],
@@ -158,7 +125,6 @@ fn make_word(
         }
     }
 }
-
 fn join(tokens: &[&[u8]], sep: u8) -> Vec<u8> {
     let mut v = Vec::new();
     for (i, t) in tokens.iter().enumerate() {
@@ -169,8 +135,6 @@ fn join(tokens: &[&[u8]], sep: u8) -> Vec<u8> {
     }
     v
 }
-
-/// Alphabet et séparateurs aléatoires : aucun octet n'a de sens a priori.
 fn surface(rng: &mut Rng, cfg: &Cfg) -> (u8, u8, u8, Vec<u8>) {
     let mut cand: Vec<u8> = Vec::with_capacity(96);
     cand.push(b'\n');
@@ -195,7 +159,6 @@ fn surface(rng: &mut Rng, cfg: &Cfg) -> (u8, u8, u8, Vec<u8>) {
     cand.truncate(a);
     (w, h, l, cand)
 }
-
 fn build_rhs(
     rng: &mut Rng,
     syms: &[Sym],
@@ -217,7 +180,7 @@ fn build_rhs(
                 let u = rng.below(unused.len());
                 unused.swap_remove(u)
             } else if !nodes.is_empty() {
-                rng.below(nodes.len()) // partage d'un nœud existant
+                rng.below(nodes.len()) 
             } else {
                 let t = by_level[0][rng.below(by_level[0].len())];
                 nodes.push(Tpl::App(t, Vec::new()));
@@ -230,7 +193,6 @@ fn build_rhs(
     }
     nodes
 }
-
 fn reachable(g: &[GNode], root: usize) -> Vec<usize> {
     let mut seen = vec![false; g.len()];
     let mut out = Vec::new();
@@ -247,7 +209,6 @@ fn reachable(g: &[GNode], root: usize) -> Vec<usize> {
     }
     out
 }
-
 fn unfolded(g: &[GNode], id: usize, memo: &mut [usize]) -> usize {
     if memo[id] != usize::MAX {
         return memo[id];
@@ -259,14 +220,12 @@ fn unfolded(g: &[GNode], id: usize, memo: &mut [usize]) -> usize {
     memo[id] = n;
     n
 }
-
 fn emit_graph<'a>(g: &[GNode], id: usize, words: &'a [Vec<u8>], out: &mut Vec<&'a [u8]>) {
     out.push(&words[g[id].sym]);
     for &a in &g[id].args {
         emit_graph(g, a, words, out);
     }
 }
-
 fn emit_tpl<'a>(
     nodes: &[Tpl],
     idx: usize,
@@ -284,8 +243,6 @@ fn emit_tpl<'a>(
         }
     }
 }
-
-/// Une dérivation : réécriture probabiliste d'un graphe de termes.
 fn derive(
     rng: &mut Rng,
     cfg: &Cfg,
@@ -347,7 +304,6 @@ fn derive(
                 Tpl::App(s, ch) => {
                     let cargs: Vec<usize> = ch.iter().map(|&c| map[c]).collect();
                     if ti == last {
-                        // réécriture en place : les parents voient le remplacement
                         g[r] = GNode { sym: *s, args: cargs, born: Some(ri) };
                         map[ti] = r;
                     } else {
@@ -362,7 +318,6 @@ fn derive(
     }
     Deriv { g, root, applied, prov, tops, steps }
 }
-
 fn add_link(links: &mut Vec<(usize, usize)>, a: usize, b: usize) {
     if a == b {
         return;
@@ -372,27 +327,21 @@ fn add_link(links: &mut Vec<(usize, usize)>, a: usize, b: usize) {
         links.push(p);
     }
 }
-
 pub struct Ptgrs {
     pub cfg: Cfg,
 }
-
 impl Ptgrs {
     pub fn new(cfg: Cfg) -> Self {
         Ptgrs { cfg }
     }
-
     pub fn at_scale(rng: &mut Rng, scale: f64) -> Sample {
         let cfg = Cfg::at_scale(rng, scale);
         Ptgrs::new(cfg).sample(rng)
     }
-
     pub fn sample(&self, rng: &mut Rng) -> Sample {
         let cfg = &self.cfg;
         let (w_sep, h_sep, l_sep, alpha) = surface(rng, cfg);
         let mut used_words: HashSet<Vec<u8>> = HashSet::new();
-
-        // Signature : niveau 0 = terminaux.
         let mut syms: Vec<Sym> = Vec::new();
         let mut by_level: Vec<Vec<usize>> = vec![Vec::new(); cfg.levels + 1];
         for _ in 0..cfg.terminals {
@@ -412,8 +361,6 @@ impl Ptgrs {
         let words: Vec<Vec<u8>> = (0..syms.len())
             .map(|_| make_word(rng, &alpha, cfg.word_min, cfg.word_max, &mut used_words))
             .collect();
-
-        // Règles probabilistes.
         let mut rules: Vec<Rule> = Vec::new();
         let mut by_head: Vec<Vec<usize>> = vec![Vec::new(); syms.len()];
         for s in 0..syms.len() {
@@ -432,8 +379,6 @@ impl Ptgrs {
                 rules.push(Rule { head: s, nodes, vars, weight });
             }
         }
-
-        // Dérivations (la cause cachée).
         let top_syms: Vec<usize> = by_level[cfg.levels].clone();
         let mut derivs: Vec<Deriv> = Vec::new();
         for _ in 0..cfg.instances {
@@ -445,8 +390,6 @@ impl Ptgrs {
                 applied[r] = true;
             }
         }
-
-        // Surface textuelle.
         struct Entry {
             text: Vec<u8>,
             role: Role,
@@ -499,8 +442,6 @@ impl Ptgrs {
             }
         }
         rng.shuffle(&mut entries);
-
-        // Requête implicite ou explicite (marqueur répété sur les énoncés).
         let marker: Option<Vec<u8>> = if rng.chance(0.5) {
             Some(make_word(rng, &alpha, cfg.word_min, cfg.word_max, &mut used_words))
         } else {
@@ -518,8 +459,6 @@ impl Ptgrs {
             text.extend(join(&toks, w_sep));
             entries.push(Entry { text, role: Role::Instance, rule: None, inst: Some(k) });
         }
-
-        // Mise en page de E.
         let mut eff: Vec<u8> = Vec::new();
         let mut lines: Vec<Line> = Vec::new();
         let mut rule_line = vec![usize::MAX; rules.len()];
@@ -538,8 +477,6 @@ impl Ptgrs {
                 inst_line[k] = li;
             }
         }
-
-        // Provenance : qui a engendré quoi, projeté sur les lignes de E.
         let mut links: Vec<(usize, usize)> = Vec::new();
         let mut tops: Vec<usize> = Vec::new();
         let mut steps = 0usize;
@@ -561,7 +498,6 @@ impl Ptgrs {
             }
         }
         links.sort();
-
         Sample { eff, cause: Cause { lines, links, tops, steps } }
     }
 }
