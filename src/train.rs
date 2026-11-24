@@ -185,7 +185,8 @@ fn fitness(nets: &[Net], percepts: &[Percept]) -> Vec<(f64, usize)> {
         let p = &percepts[t % b];
         let mut rng = Rng::new(model::seed(&p.eff));
         let o = search::ask(&nets[t / b], p, &mut rng);
-        (o.phi, o.evals)
+        
+        (o.gain() * (1.0 - o.residual.inexpressive), o.evals)
     });
     cells
         .chunks(b)
