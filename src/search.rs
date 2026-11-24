@@ -97,13 +97,21 @@ struct Judged {
     tpm: Tpm,
     sia: Option<Sia>,
     phi: f64,
+    unjust: f64,
 }
 
 fn judge(net: &Net, f: &Field, sel: &[bool], state: usize) -> Judged {
     let tpm = net.tpm(&Evidence::of(f, sel));
     let sia = complex(&tpm, state);
     let phi = sia.as_ref().map_or(0.0, |s| s.phi);
-    Judged { tpm, sia, phi }
+    let unjust = match &sia {
+        Some(s) => {
+            let z = (state & !s.units) | s.global(s.cause_state);
+            (1.0 - tpm.effect_at(z, state)).clamp(0.0, 1.0)
+        }
+        None => 1.0,
+    };
+    Judged { tpm, sia, phi, unjust }
 }
 
 // Abduction créative : on tire la cause dans le répertoire-cause de R (complexe si φ > 0,
