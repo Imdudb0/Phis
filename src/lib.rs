@@ -1,10 +1,8 @@
-//! Phisharp : compréhension par abduction. Zéro dépendance.
+pub mod abduction;
+pub mod baselines;
+pub mod eval;
+pub mod math;
+pub mod phi_sharp;
 pub mod ptgrs;
-pub mod rng;
-pub mod percept;
-pub mod phi;
-pub mod net;
-pub mod search;
-pub mod explain;
-pub mod model;
+pub mod substrate;
 pub mod train;
