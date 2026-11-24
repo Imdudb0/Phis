@@ -260,10 +260,10 @@ pub fn run(
 ) -> Outcome {
     let field = Field::new(net, p);
     let state = field.response();
+    let mut chance_rng = rng.fork();   // + flux dédié : mêmes tirages pour tous les réseaux
     let curve = chance_curve(net, &field, &mut chance_rng, state);
     let mut cur = judge(net, &field, &sel, state);
     let mut cur_obj = cur.phi - curve.at(mass_of(&field, &sel));
-    let mut chance_rng = rng.fork();   // + flux dédié : mêmes tirages pour tous les réseaux
     let mut sel = field.region(state);
     let beta = net.sharpness();
     let mut evals = 1usize;
