@@ -28,7 +28,7 @@ jobs:
       - name: Run Phisharp
         run: |
           #cargo check
-          cargo run --release PHIS_ORACLE=1 PHIS_EPOCHS=40 --bin train --k 5 --out out/oracle.phis
+          PHIS_ORACLE=1 PHIS_EPOCHS=40 cargo run --release --bin train --k 5 --out out/oracle.phis
           #cargo run --release --bin ask -- --model out/sharp.phis --file perceived.eff
           #cargo run --release --bin phisharp -- train --steps 800 --batch 4 --nodes 16 --dim 16 --max-search 8 --out out/sharp.phis
         env:
