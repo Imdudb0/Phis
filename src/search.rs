@@ -1,7 +1,3 @@
-//! Recherche abductive de R vers l'effet intentionnel.
-//! L'état R est fixé par la perception ; l'hypothèse S (classes de répétitions) évolue. À chaque
-//! pas : abduction (tirage d'une cause dans le répertoire-cause du complexe), recrutement ou
-//! retrait d'une classe selon l'alignement de rôle avec cette cause, jugement par φ_sharp seul.
 use crate::net::{Evidence, Field, Net};
 use crate::percept::Percept;
 use crate::phi::{complex, Sia, Tpm};
@@ -10,6 +6,7 @@ use std::collections::HashMap;
 
 const NONE: usize = usize::MAX;
 const TOL: f64 = 1e-9;
+const CHANCE_DRAWS: usize = 4;                     
 
 /// Budget mesuré sur le percept : une évaluation de φ_sharp par classe de répétitions.
 #[derive(Clone, Copy, Debug)]
@@ -85,6 +82,7 @@ pub struct Outcome {
     /// R : état des unités déclenché par la perception.
     pub r: usize,
     pub phi: f64,
+    pub chance: f64,   // + φ moyen de sélections aléatoires de même taille
     /// Cause et effet spécifiés par le complexe (bits positionnés sur `sia.units`).
     pub cause: usize,
     pub effect: usize,
@@ -119,6 +117,20 @@ fn abduce(rng: &mut Rng, cur: &Judged, state: usize) -> usize {
 
 fn count(f: &Field, sel: &[bool]) -> usize {
     f.cands.iter().filter(|&&c| sel[c]).count()
+}
+
+fn baseline(net: &Net, f: &Field, rng: &mut Rng, state: usize, size: usize) -> f64 {
+    let mut pool: Vec<usize> = f.cands.clone();
+    let mut sum = 0.0f64;
+    for _ in 0..CHANCE_DRAWS {
+        rng.shuffle(&mut pool);
+        let mut sel = vec![false; f.nc];
+        for &c in pool.iter().take(size) {
+            sel[c] = true;
+        }
+        sum += judge(net, f, &sel, state).phi;
+    }
+    sum / CHANCE_DRAWS as f64
 }
 
 // Échelle de séparation propre à E : écart positif le plus fréquent entre ancres consécutives.
@@ -197,6 +209,7 @@ pub fn run(
 ) -> Outcome {
     let field = Field::new(net, p);
     let state = field.response();
+    let mut chance_rng = rng.fork();   // + flux dédié : mêmes tirages pour tous les réseaux
     let mut sel = field.region(state);
     let mut cur = judge(net, &field, &sel, state);
     let beta = net.sharpness();
@@ -272,6 +285,7 @@ pub fn run(
         Explanation::default()
     };
     let residual = leftover(p, &cur, state, &explanation);
+    let chance = baseline(net, &field, &mut chance_rng, state, count(&field, &sel)); // +
     let (cause, effect) = match &cur.sia {
         Some(s) => (s.global(s.cause_state), s.global(s.effect_state)),
         None => (0, 0),
@@ -279,6 +293,7 @@ pub fn run(
     Outcome {
         r: state,
         phi: cur.phi,
+        chance,                        
         cause,
         effect,
         sia: cur.sia,
