@@ -157,15 +157,12 @@ fn null_eff(s: &Sample) -> Vec<u8> {
     out
 }
 
-fn fitness(nets: &[Net], batch: &[Sample], percepts: &[Percept]) -> Vec<(f64, usize)> {
-    let nulls: Vec<Percept> = batch.iter().map(|s| Percept::new(&null_eff(s))).collect();
+fn fitness(nets: &[Net], percepts: &[Percept]) -> Vec<(f64, usize)> {
     let b = percepts.len();
-    by_net(par_map(nets.len()*b, |t| {
-        let (p, q) = (&percepts[t % b], &nulls[t % b]);
-        let o = quiet(&nets[t/b], p, search::Budget::measured(p));
-        let n = quiet(&nets[t/b], q, search::Budget::measured(p));
-        let just = 1.0 - o.residual.unjust;
-        ((o.phi - n.phi) * just, o.evals + n.evals)
+    by_net(par_map(nets.len() * b, |t| {
+        let p = &percepts[t % b];
+        let o = quiet(&nets[t / b], p, search::Budget::measured(p));
+        (o.phi - o.chance, o.evals)
     }), b)
 }
 
