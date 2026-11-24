@@ -164,7 +164,8 @@ fn fitness(nets: &[Net], batch: &[Sample], percepts: &[Percept]) -> Vec<(f64, us
         let (p, q) = (&percepts[t % b], &nulls[t % b]);
         let o = quiet(&nets[t/b], p, search::Budget::measured(p));
         let n = quiet(&nets[t/b], q, search::Budget::measured(p));
-        (o.phi - n.phi, o.evals + n.evals)   // le signal est le CONTRASTE de contenu
+        let just = 1.0 - o.residual.unjust;
+        ((o.phi - n.phi) * just, o.evals + n.evals)
     }), b)
 }
 
