@@ -20,11 +20,13 @@ pub const F: usize = 3 + 2 * C;
 pub const K_MIN: usize = 3;
 pub const K_DEFAULT: usize = 7;
 pub const K_MAX: usize = 12;
+
 const PMIN: f64 = 1.0 / 256.0;
 const GATE_EPS: f64 = 1e-9;
 const MAGIC: [u8; 4] = *b"PHIS";
 const VERSION: u32 = 1;
 const HEADER: usize = 20;
+const GAIN: f64 = 6.0;
 
 pub fn sigmoid(z: f64) -> f64 {
     1.0 / (1.0 + (-z).exp())
@@ -142,32 +144,25 @@ impl Net {
         sigmoid(z)
     }
 
-    /// TPM des K unités sous l'évidence d'une hypothèse :
-    /// P(i=1 | x) = σ(θ_i + Σ_j x_j · Σ_c W_c[j→i] · G_c[j][i]).
-    pub fn tpm(&self, ev: &Evidence) -> Tpm {
-        let k = self.k;
-        let na = self.arrows.len();
-        let ow = self.o_w();
-        let th = self.o_th();
-        let mut t = vec![0.0f64; k * k];
-        for (ai, &(from, to)) in self.arrows.iter().enumerate() {
-            let mut s = 0.0f64;
-            for c in 0..C {
-                s += f64::from(self.g[ow + c * na + ai]) * ev.gate(c, from, to);
-            }
-            t[from * k + to] = s;
-        }
-        Tpm::from_fn(k, |x, i| {
-            let mut z = f64::from(self.g[th + i]);
-            for j in 0..k {
-                if x >> j & 1 == 1 {
-                    z += t[j * k + i];
-                }
-            }
-            let p = sigmoid(z);
-            if p.is_nan() { 0.5 } else { p.clamp(PMIN, 1.0 - PMIN) }
-        })
+pub fn tpm(&self, ev: &Evidence) -> Tpm {
+    let (k, na, ow) = (self.k, self.arrows.len(), self.o_w());
+    let mut t = vec![0.0f64; k * k];
+    for (ai, &(from, to)) in self.arrows.iter().enumerate() {
+        let mut lg = [0.0f64; C]; let mut mx = f64::NEG_INFINITY;
+        for c in 0..C { lg[c] = f64::from(self.g[ow + c*na + ai]); mx = mx.max(lg[c]); }
+        let mut w = [0.0f64; C]; let mut sum = 0.0;
+        for c in 0..C { w[c] = (lg[c]-mx).exp(); sum += w[c]; }
+        let mut s = 0.0;
+        for c in 0..C { s += (GAIN * w[c] / sum) * ev.gate(c, from, to); }
+        t[from*k + to] = s;
     }
+    let th = -GAIN / 2.0;
+    Tpm::from_fn(k, |x, i| {
+        let mut z = th;
+        for j in 0..k { if x>>j & 1 == 1 { z += t[j*k + i]; } }
+        sigmoid(z).clamp(PMIN, 1.0 - PMIN)
+    })
+}
 
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut b = Vec::with_capacity(HEADER + 4 * self.g.len());
