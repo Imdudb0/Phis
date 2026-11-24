@@ -119,16 +119,23 @@ fn count(f: &Field, sel: &[bool]) -> usize {
     f.cands.iter().filter(|&&c| sel[c]).count()
 }
 
-fn baseline(net: &Net, f: &Field, rng: &mut Rng, state: usize, size: usize) -> f64 {
+fn baseline(net: &Net, f: &Field, rng: &mut Rng, state: usize, sel: &[bool]) -> f64 {
+    let weight = |c: usize| f.by_class[c].len();
+    let target: usize = f.cands.iter().filter(|&&c| sel[c]).map(|&c| weight(c)).sum();
     let mut pool: Vec<usize> = f.cands.clone();
     let mut sum = 0.0f64;
     for _ in 0..CHANCE_DRAWS {
         rng.shuffle(&mut pool);
-        let mut sel = vec![false; f.nc];
-        for &c in pool.iter().take(size) {
-            sel[c] = true;
+        let mut pick = vec![false; f.nc];
+        let mut got = 0usize;
+        for &c in &pool {
+            if got >= target {
+                break;
+            }
+            pick[c] = true;
+            got += weight(c);
         }
-        sum += judge(net, f, &sel, state).phi;
+        sum += judge(net, f, &pick, state).phi;
     }
     sum / CHANCE_DRAWS as f64
 }
@@ -285,7 +292,7 @@ pub fn run(
         Explanation::default()
     };
     let residual = leftover(p, &cur, state, &explanation);
-    let chance = baseline(net, &field, &mut chance_rng, state, count(&field, &sel)); // +
+    let chance = baseline(net, &field, &mut chance_rng, state, &sel);
     let (cause, effect) = match &cur.sia {
         Some(s) => (s.global(s.cause_state), s.global(s.effect_state)),
         None => (0, 0),
