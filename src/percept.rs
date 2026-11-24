@@ -107,9 +107,11 @@ impl Percept {
         let sa = suffix_array(eff);
         let lcp = lcp_array(eff, &sa);
         let (repeats, owner) = maximal_repeats(eff, &sa, &lcp, &cum);
+        let thr = (repeats.len().max(2) as f64).log2(); // Chernoff : ≲ 1 fausse classe attendue
+        let keep: Vec<bool> = repeats.iter().map(|r| chance_surprise(n, r) >= thr).collect();
         let mut anchors: Vec<Anchor> = Vec::new();
         for (p, &c) in owner.iter().enumerate() {
-            if c != NONE {
+            if c != NONE && keep[c] {
                 anchors.push(Anchor { pos: p, len: repeats[c].len, class: c });
             }
         }
@@ -265,6 +267,17 @@ fn maximal_repeats(
 fn window<'a>(eff: &'a [u8], sa: &[usize], r: &Repeat) -> &'a [u8] {
     let p = sa[r.lb];
     &eff[p..p + r.len]
+}
+fn chance_surprise(n: usize, r: &Repeat) -> f64 {
+    let lam = (n + 1 - r.len) as f64 * (-r.bits).exp2(); // occurrences attendues sous le nul
+    let obs = r.count() as f64;
+    if lam <= 0.0 {
+        f64::INFINITY
+    } else if obs <= lam {
+        0.0
+    } else {
+        obs * (obs / lam).log2() - (obs - lam) * std::f64::consts::LOG2_E
+    }
 }
 fn code(prev: &[usize], a: usize, t: usize) -> usize {
     let p = prev[t];
