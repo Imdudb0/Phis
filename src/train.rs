@@ -32,7 +32,8 @@ impl Plan {
         let dim = Net::new(k, &mut Rng::new(seed)).params().len();
         let lambda = 4 + (3.0 * (dim as f64).ln()) as usize;
         let mu = lambda / 2;
-        Plan { k, seed, dim, lambda, mu, batch: mu, epochs: dim, holdout: 2 * lambda }
+        let epochs: usize = std::env::var("PHIS_EPOCHS").ok().and_then(|v| v.parse().ok()).unwrap_or(dim);
+        Plan { k, seed, dim, lambda, mu, batch: mu, epochs, holdout: 2 * lambda }
     }
 }
 #[derive(Clone, Copy, Debug)]
@@ -62,6 +63,7 @@ pub struct Eval {
     pub phi_f1: f64,
     pub phi_steps: f64,
     pub evals: usize,
+    pub purity: f64,
 }
 #[derive(Clone, Debug)]
 pub struct Session {
@@ -131,10 +133,40 @@ fn quiet(net: &Net, p: &Percept, budget: search::Budget) -> search::Outcome {
     search::run(net, p, &mut rng, budget, &mut |_: &search::Step| {})
 }
 
-// variante plus stricte possible : own - null.max(chance)
-fn excess(own: f64, null: f64, chance: f64) -> f64 {
-    own - 0.5 * (null + chance)
+fn by_net(cells: Vec<(f64, usize)>, b: usize) -> Vec<(f64, usize)> {
+    cells
+        .chunks(b)
+        .map(|r| (r.iter().map(|c| c.0).sum::<f64>() / b as f64, r.iter().map(|c| c.1).sum::<usize>()))
+        .collect()
 }
+
+fn fitness(nets: &[Net], percepts: &[Percept]) -> Vec<(f64, usize)> {
+    let b = percepts.len();
+    by_net(
+        par_map(nets.len() * b, |t| {
+            let p = &percepts[t % b];
+            let o = quiet(&nets[t / b], p, search::Budget::measured(p));
+            (o.phi - o.chance, o.evals)
+        }),
+        b,
+    )
+}
+
+// DIAGNOSTIC seulement : F1 contre la cause cachée comme fitness
+fn fitness_oracle(nets: &[Net], batch: &[Sample], percepts: &[Percept]) -> Vec<(f64, usize)> {
+    let b = percepts.len();
+    by_net(
+        par_map(nets.len() * b, |t| {
+            let (p, s) = (&percepts[t % b], &batch[t % b]);
+            let outcome = quiet(&nets[t / b], p, search::Budget::measured(p));
+            let evals = outcome.evals;
+            let a = Answer { percept: p.clone(), outcome };
+            (mark(&s.cause, &a, 0.0).f1, evals)
+        }),
+        b,
+    )
+}
+
 fn par_map<R, F>(n: usize, f: F) -> Vec<R>
 where
     R: Send + 'static,
@@ -288,6 +320,10 @@ impl Eval {
         );
         let nul: Vec<f64> = rows.iter().map(|r| r.null).collect();
         let cha: Vec<f64> = rows.iter().map(|r| r.chance).collect();
+        let pur: Vec<f64> = rows
+            .iter()
+            .map(|r| quot(r.cover[0] + r.cover[1] + r.cover[2], r.cover.iter().sum::<f64>()))
+            .collect();
         Eval {
             samples: rows.len(),
             phi: mean(&phi),
@@ -303,6 +339,7 @@ impl Eval {
             phi_f1: pearson(&phi, &f1),
             phi_steps: pearson(&phi, &steps),
             evals: rows.iter().map(|r| r.evals).sum(),
+            purity: mean(&pur),
         }
     }
 }
@@ -348,10 +385,10 @@ pub fn session(plan: &Plan, on_epoch: &mut dyn FnMut(&Epoch)) -> Session {
     let mut path = vec![0.0f64; dim];
     let mut trace: Vec<Epoch> = Vec::with_capacity(plan.epochs);
     let mut total = 0usize;
+    let oracle = std::env::var_os("PHIS_ORACLE").is_some();
     for epoch in 1..=plan.epochs {
         let batch = draw(&mut r_data, plan.batch);
         let percepts: Vec<Percept> = batch.iter().map(|s| Percept::new(&s.eff)).collect();
-        let nulls: Vec<Percept> = batch.iter().map(|s| Percept::new(&control(&s.eff))).collect();
         let mut z: Vec<Vec<f64>> = Vec::with_capacity(plan.lambda);
         for _ in 0..plan.lambda {
             let mut v = Vec::with_capacity(dim);
@@ -368,7 +405,7 @@ pub fn session(plan: &Plan, on_epoch: &mut dyn FnMut(&Epoch)) -> Session {
             })
             .collect();
         nets.push(instantiate(&start, &m));
-        let scores = fitness(&nets, &percepts, &nulls);
+        let scores = if oracle { fitness_oracle(&nets, &batch, &percepts) } else { fitness(&nets, &percepts) };
         let center = scores[plan.lambda].0;
         let mut order: Vec<usize> = (0..plan.lambda).collect();
         order.sort_by(|&p, &q| {
@@ -461,5 +498,6 @@ pub fn report(s: &Session) -> String {
         b.evals as f64 / b.samples.max(1) as f64,
         a.evals as f64 / a.samples.max(1) as f64,
     );
+    row("pureté (grammaire / expliqué)", b.purity, a.purity);
     out
 }
