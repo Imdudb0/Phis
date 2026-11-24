@@ -189,13 +189,7 @@ fn leftover(p: &Percept, cur: &Judged, state: usize, ex: &Explanation) -> Residu
     let n = p.eff.len();
     let total = p.cum[n];
     let (unclear, unjust) = match &cur.sia {
-        Some(s) => {
-            let z = (state & !s.units) | s.global(s.cause_state);
-            (
-                (1.0 - s.cause[s.cause_state]).clamp(0.0, 1.0),
-                (1.0 - cur.tpm.effect_at(z, state)).clamp(0.0, 1.0),
-            )
-        }
+        Some(s) => ((1.0 - s.cause[s.cause_state]).clamp(0.0, 1.0), cur.unjust),
         None => (1.0, 1.0),
     };
     let covered: f64 = ex.spans.iter().map(|s| s.bits).sum();
@@ -268,8 +262,9 @@ pub fn run(
         let next = judge(net, &field, &sel, state);
         evals += 1;
         let tried = next.phi;
+let tried = next.phi;
 let ok = tried > cur.phi + TOL
-    || (adding && (tried - cur.phi).abs() <= TOL && unjust_next < unjust_cur - TOL);
+    || (adding && (tried - cur.phi).abs() <= TOL && next.unjust < cur.unjust - TOL);
         if ok {
             cur = next;
             tabu.fill(false);
