@@ -15,6 +15,7 @@ const NAMES: [&str; ROLES] = [
     "leurres",
 ];
 const SIGMA0: f64 = 0.3;
+const NULL_SALT: u64 = 0x4e55_4c4c;
 #[derive(Clone, Copy, Debug)]
 pub struct Plan {
     pub k: usize,
@@ -49,6 +50,9 @@ pub struct Epoch {
 pub struct Eval {
     pub samples: usize,
     pub phi: f64,
+    pub null_phi: f64,    // + φ sur E permuté
+    pub chance_phi: f64,  // + φ d'une sélection aléatoire
+    pub phi_sd: f64,      // + écart-type entre contenus (0 = effondré)
     pub precision: f64,
     pub recall: f64,
     pub f1: f64,
@@ -70,6 +74,8 @@ pub struct Session {
 }
 struct Row {
     phi: f64,
+    null: f64,      // +
+    chance: f64,
     steps: f64,
     evals: usize,
     precision: f64,
@@ -107,6 +113,27 @@ fn pearson(x: &[f64], y: &[f64]) -> f64 {
         syy += db * db;
     }
     quot(sxy, (sxx * syy).sqrt())
+}
+fn spread(x: &[f64]) -> f64 {
+    let m = mean(x);
+    let v: Vec<f64> = x.iter().map(|a| (a - m) * (a - m)).collect();
+    mean(&v).sqrt()
+}
+
+fn control(eff: &[u8]) -> Vec<u8> {
+    let mut v = eff.to_vec();
+    Rng::new(model::seed(eff) ^ NULL_SALT).shuffle(&mut v);
+    v
+}
+
+fn quiet(net: &Net, p: &Percept, budget: search::Budget) -> search::Outcome {
+    let mut rng = Rng::new(model::seed(&p.eff));
+    search::run(net, p, &mut rng, budget, &mut |_: &search::Step| {})
+}
+
+// variante plus stricte possible : own - null.max(chance)
+fn excess(own: f64, null: f64, chance: f64) -> f64 {
+    own - 0.5 * (null + chance)
 }
 fn par_map<R, F>(n: usize, f: F) -> Vec<R>
 where
@@ -162,24 +189,26 @@ fn instantiate(template: &Net, x: &[f64]) -> Net {
     }
     net
 }
-fn fitness(nets: &[Net], percepts: &[Percept]) -> Vec<(f64, usize)> {
+fn fitness(nets: &[Net], percepts: &[Percept], nulls: &[Percept]) -> Vec<(f64, usize)> {
     let b = percepts.len();
     let cells: Vec<(f64, usize)> = par_map(nets.len() * b, |t| {
-        let p = &percepts[t % b];
-        let mut rng = Rng::new(model::seed(&p.eff));
-        let o = search::ask(&nets[t / b], p, &mut rng);
-        (o.phi, o.evals)
+        let net = &nets[t / b];
+        let (p, q) = (&percepts[t % b], &nulls[t % b]);
+        let budget = search::Budget::measured(p); // même effort pour E et son témoin
+        let own = quiet(net, p, budget);
+        let nul = quiet(net, q, budget);
+        (excess(own.phi, nul.phi, own.chance), own.evals + nul.evals)
     });
     cells
         .chunks(b)
         .map(|row| {
-            let phi = row.iter().map(|c| c.0).sum::<f64>() / b as f64;
+            let score = row.iter().map(|c| c.0).sum::<f64>() / b as f64;
             let evals = row.iter().map(|c| c.1).sum::<usize>();
-            (phi, evals)
+            (score, evals)
         })
         .collect()
 }
-fn mark(cause: &Cause, a: &Answer) -> Row {
+fn mark(cause: &Cause, a: &Answer, null: f64) -> Row {
     let p = &a.percept;
     let spans = &a.outcome.explanation.spans;
     let mut cover = [0.0f64; ROLES];
@@ -218,6 +247,8 @@ fn mark(cause: &Cause, a: &Answer) -> Row {
     }
     Row {
         phi: a.outcome.phi,
+        null,
+        chance: a.outcome.chance,
         steps: cause.steps as f64,
         evals: a.outcome.evals,
         precision,
@@ -255,9 +286,14 @@ impl Eval {
             rows.iter().map(|r| r.tops).sum::<f64>(),
             rows.iter().map(|r| r.ntops).sum::<usize>() as f64,
         );
+        let nul: Vec<f64> = rows.iter().map(|r| r.null).collect();
+        let cha: Vec<f64> = rows.iter().map(|r| r.chance).collect();
         Eval {
             samples: rows.len(),
             phi: mean(&phi),
+            null_phi: mean(&nul),
+            chance_phi: mean(&cha),
+            phi_sd: spread(&phi),
             precision: mean(&prec),
             recall: mean(&rec),
             f1: mean(&f1),
@@ -273,7 +309,10 @@ impl Eval {
 pub fn evaluate(model: &Model, samples: &[Sample]) -> Eval {
     let rows = par_map(samples.len(), |i| {
         let s = &samples[i];
-        mark(&s.cause, &model.ask(&s.eff))
+        let a = model.ask(&s.eff);
+        let q = Percept::new(&control(&s.eff));
+        let n = quiet(&model.net, &q, search::Budget::measured(&a.percept));
+        mark(&s.cause, &a, n.phi)
     });
     Eval::of(&rows)
 }
@@ -310,10 +349,9 @@ pub fn session(plan: &Plan, on_epoch: &mut dyn FnMut(&Epoch)) -> Session {
     let mut trace: Vec<Epoch> = Vec::with_capacity(plan.epochs);
     let mut total = 0usize;
     for epoch in 1..=plan.epochs {
-        let percepts: Vec<Percept> = draw(&mut r_data, plan.batch)
-            .iter()
-            .map(|s| Percept::new(&s.eff))
-            .collect();
+        let batch = draw(&mut r_data, plan.batch);
+        let percepts: Vec<Percept> = batch.iter().map(|s| Percept::new(&s.eff)).collect();
+        let nulls: Vec<Percept> = batch.iter().map(|s| Percept::new(&control(&s.eff))).collect();
         let mut z: Vec<Vec<f64>> = Vec::with_capacity(plan.lambda);
         for _ in 0..plan.lambda {
             let mut v = Vec::with_capacity(dim);
@@ -330,7 +368,7 @@ pub fn session(plan: &Plan, on_epoch: &mut dyn FnMut(&Epoch)) -> Session {
             })
             .collect();
         nets.push(instantiate(&start, &m));
-        let scores = fitness(&nets, &percepts);
+        let scores = fitness(&nets, &percepts, &nulls);
         let center = scores[plan.lambda].0;
         let mut order: Vec<usize> = (0..plan.lambda).collect();
         order.sort_by(|&p, &q| {
@@ -405,6 +443,9 @@ pub fn report(s: &Session) -> String {
         out.push_str(&format!("{label:<38}{x:>12.6}{y:>12.6}\n"));
     };
     row("φ_sharp moyen", b.phi, a.phi);
+    row("φ_sharp contrôle (E permuté)", b.null_phi, a.null_phi);
+    row("φ_sharp hasard (même taille)", b.chance_phi, a.chance_phi);
+    row("écart-type φ_sharp (0 = effondré)", b.phi_sd, a.phi_sd);
     row("précision (masse en bits)", b.precision, a.precision);
     row("rappel (masse en bits)", b.recall, a.recall);
     row("F1", b.f1, a.f1);
