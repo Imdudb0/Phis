@@ -2,11 +2,13 @@
 name = "phisharp"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
 
 [dependencies]
 
-[profile.release]
-opt-level = 3
-lto = true
-codegen-units = 1
+[[bin]]
+name = "ask"
+path = "src/bin/ask.rs"
+
+[[bin]]
+name = "phisharp"
+path = "src/bin/phisharp.rs"
