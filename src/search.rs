@@ -261,10 +261,10 @@ pub fn run(
     let field = Field::new(net, p);
     let state = field.response();
     let mut chance_rng = rng.fork();   // + flux dédié : mêmes tirages pour tous les réseaux
+    let mut sel = field.region(state);
     let curve = chance_curve(net, &field, &mut chance_rng, state);
     let mut cur = judge(net, &field, &sel, state);
     let mut cur_obj = cur.phi - curve.at(mass_of(&field, &sel));
-    let mut sel = field.region(state);
     let beta = net.sharpness();
     let mut evals = 1usize;
     let mut since = 0usize;
@@ -304,20 +304,20 @@ pub fn run(
         let adding = !sel[c];
         sel[c] = adding;
         let next = judge(net, &field, &sel, state);
-        
+
         evals += 1;
-        
-        /*let tried = next.phi;
-        let ok = tried > cur.phi + TOL
+
+        let tried = next.phi;
+        /*let ok = tried > cur.phi + TOL
             || (adding && (tried - cur.phi).abs() <= TOL && next.unjust < cur.unjust - TOL);*/
-            
+
         let next = judge(net, &field, &sel, state);
         let next_obj = next.phi - curve.at(mass_of(&field, &sel));
         let ok = next_obj > cur_obj + TOL
             || (adding && (next_obj - cur_obj).abs() <= TOL && next.unjust < cur.unjust - TOL);
-            
+
         if ok { cur = next; cur_obj = next_obj; tabu.fill(false); since = 0; } else { sel[c] = !adding; tabu[i] = true; since += 1; }
-        
+
         let step = Step {
             eval: evals - 1,
             class: c,
