@@ -54,6 +54,9 @@ pub struct Epoch {
 pub struct Eval {
     pub samples: usize,
     pub phi: f64,
+    pub gain: f64,
+    pub phi_std: f64,
+    pub trivial: f64,
     pub precision: f64,
     pub recall: f64,
     pub f1: f64,
@@ -77,6 +80,8 @@ pub struct Session {
 
 struct Row {
     phi: f64,
+    gain: f64,
+    trivial: f64,
     steps: f64,
     evals: usize,
     precision: f64,
@@ -117,7 +122,13 @@ fn pearson(x: &[f64], y: &[f64]) -> f64 {
         sxx += da * da;
         syy += db * db;
     }
-    quot(sxy, (sxx * syy).sqrt())
+    let d = (sxx * syy).sqrt();
+    if d > 0.0 { sxy / d } else { f64::NAN }
+}
+
+fn spread(v: &[f64]) -> f64 {
+    let m = mean(v);
+    quot(v.iter().map(|x| (x - m) * (x - m)).sum::<f64>(), v.len() as f64).sqrt()
 }
 
 fn par_map<R, F>(n: usize, f: F) -> Vec<R>
@@ -185,7 +196,7 @@ fn fitness(nets: &[Net], percepts: &[Percept]) -> Vec<(f64, usize)> {
         let p = &percepts[t % b];
         let mut rng = Rng::new(model::seed(&p.eff));
         let o = search::ask(&nets[t / b], p, &mut rng);
-        
+
         (o.gain() * (1.0 - o.residual.inexpressive), o.evals)
     });
     cells
@@ -236,8 +247,11 @@ fn mark(cause: &Cause, a: &Answer) -> Row {
     for &t in &cause.tops {
         tops += frac[t];
     }
+    let base = quot(want, p.mass(0, p.eff.len()));
     Row {
         phi: a.outcome.phi,
+        gain: a.outcome.gain(),
+        trivial: quot(2.0 * base, 1.0 + base),
         steps: cause.steps as f64,
         evals: a.outcome.evals,
         precision,
@@ -276,17 +290,23 @@ impl Eval {
             rows.iter().map(|r| r.tops).sum::<f64>(),
             rows.iter().map(|r| r.ntops).sum::<usize>() as f64,
         );
+        let gain: Vec<f64> = rows.iter().map(|r| r.gain).collect();
+        let triv: Vec<f64> = rows.iter().map(|r| r.trivial).collect();
+
         Eval {
             samples: rows.len(),
             phi: mean(&phi),
+            gain: mean(&gain),
+            phi_std: spread(&phi),
+            trivial: mean(&triv),
             precision: mean(&prec),
             recall: mean(&rec),
             f1: mean(&f1),
             roles,
             links,
             tops,
-            phi_f1: pearson(&phi, &f1),
-            phi_steps: pearson(&phi, &steps),
+            phi_f1: pearson(&gain, &f1),
+            phi_steps: pearson(&gain, &steps),
             evals: rows.iter().map(|r| r.evals).sum(),
         }
     }
@@ -334,6 +354,7 @@ pub fn session(plan: &Plan, on_epoch: &mut dyn FnMut(&Epoch)) -> Session {
     let mut path = vec![0.0f64; dim];
     let mut trace: Vec<Epoch> = Vec::with_capacity(plan.epochs);
     let mut total = 0usize;
+    let mut flat = 0usize;
 
     for epoch in 1..=plan.epochs {
         // Seul `eff` entre dans la boucle : la cause cachée est écartée ici.
@@ -392,6 +413,11 @@ pub fn session(plan: &Plan, on_epoch: &mut dyn FnMut(&Epoch)) -> Session {
         };
         on_epoch(&rec);
         trace.push(rec);
+        let tied = (rec.best - rec.parents).abs() < 1e-9 && (rec.best - rec.center).abs() < 1e-9;
+        flat = if tied { flat + 1 } else { 0 };
+        if sigma < floor || (epoch > plan.epochs / 4 && flat >= 10) {
+            break;
+        }
         if sigma < floor {
             break;
         }
@@ -437,10 +463,13 @@ pub fn report(s: &Session) -> String {
     let mut row = |label: &str, x: f64, y: f64| {
         out.push_str(&format!("{label:<38}{x:>12.6}{y:>12.6}\n"));
     };
-    row("φ_sharp moyen", b.phi, a.phi);
+    row("φ_sharp = φ − rivaux", b.gain, a.gain);
+    row("φ brut", b.phi, a.phi);
+    row("écart-type du φ brut", b.phi_std, a.phi_std);
     row("précision (masse en bits)", b.precision, a.precision);
     row("rappel (masse en bits)", b.recall, a.recall);
     row("F1", b.f1, a.f1);
+    row("F1 triviale (renvoyer tout E)", b.trivial, a.trivial);
     for r in 0..ROLES {
         row(&format!("couverture : {}", NAMES[r]), b.roles[r], a.roles[r]);
     }
