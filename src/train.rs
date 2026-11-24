@@ -221,25 +221,6 @@ fn instantiate(template: &Net, x: &[f64]) -> Net {
     }
     net
 }
-fn fitness(nets: &[Net], percepts: &[Percept], nulls: &[Percept]) -> Vec<(f64, usize)> {
-    let b = percepts.len();
-    let cells: Vec<(f64, usize)> = par_map(nets.len() * b, |t| {
-        let net = &nets[t / b];
-        let (p, q) = (&percepts[t % b], &nulls[t % b]);
-        let budget = search::Budget::measured(p); // même effort pour E et son témoin
-        let own = quiet(net, p, budget);
-        let nul = quiet(net, q, budget);
-        (excess(own.phi, nul.phi, own.chance), own.evals + nul.evals)
-    });
-    cells
-        .chunks(b)
-        .map(|row| {
-            let score = row.iter().map(|c| c.0).sum::<f64>() / b as f64;
-            let evals = row.iter().map(|c| c.1).sum::<usize>();
-            (score, evals)
-        })
-        .collect()
-}
 fn mark(cause: &Cause, a: &Answer, null: f64) -> Row {
     let p = &a.percept;
     let spans = &a.outcome.explanation.spans;
