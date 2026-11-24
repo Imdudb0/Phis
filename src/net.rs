@@ -1,13 +1,7 @@
-//! Substrat : K unités binaires stochastiques ; C = 5 matrices K×K de poids (une par canal de
-//! relation du percept) fondamentalement non-réciproques : les unités forment un tournoi circulaire,
-//! chaque paire {i,j} n'admet qu'un seul sens d'influence, tous canaux confondus.
-//! Le percept ne fixe pas les poids, il gate la connectivité efficace (Evidence) : la TPM, donc
-//! φ_sharp, est toujours relative à E.
 use crate::percept::{Chan, Percept};
 use crate::phi::Tpm;
 use crate::rng::Rng;
 use std::path::Path;
-
 pub const CHANS: [Chan; 5] = [
     Chan::Identity,
     Chan::Forward,
@@ -20,26 +14,20 @@ pub const F: usize = 3 + 2 * C;
 pub const K_MIN: usize = 3;
 pub const K_DEFAULT: usize = 7;
 pub const K_MAX: usize = 12;
-
 const PMIN: f64 = 1.0 / 256.0;
 const GATE_EPS: f64 = 1e-9;
 const MAGIC: [u8; 4] = *b"PHIS";
 const VERSION: u32 = 1;
 const HEADER: usize = 20;
-const GAIN: f64 = 6.0;
-
 pub fn sigmoid(z: f64) -> f64 {
     1.0 / (1.0 + (-z).exp())
 }
-
 fn maxof(v: &[f64]) -> f64 {
     v.iter().copied().fold(0.0f64, f64::max)
 }
-
 fn unit(v: f64, mx: f64) -> f64 {
     if mx > 0.0 { v / mx } else { 0.0 }
 }
-
 fn strength(c: usize, w: f32) -> f64 {
     let w = f64::from(w).max(0.0);
     match CHANS[c] {
@@ -47,8 +35,6 @@ fn strength(c: usize, w: f32) -> f64 {
         Chan::Identity | Chan::Iso | Chan::IsoBytes => (1.0 + w).ln(),
     }
 }
-
-// Tournoi circulaire : pour toute paire {i,j}, exactement un des deux arcs existe.
 fn orient(k: usize) -> Vec<(usize, usize)> {
     let mut v = Vec::with_capacity(k * (k - 1) / 2);
     for i in 0..k {
@@ -63,15 +49,12 @@ fn orient(k: usize) -> Vec<(usize, usize)> {
     }
     v
 }
-
 #[derive(Clone, Debug)]
 pub struct Net {
     pub k: usize,
     arrows: Vec<(usize, usize)>,
-    // [profils K×F | biais d'appartenance K | poids C×arcs | seuils K | netteté 1]
     g: Vec<f32>,
 }
-
 impl Net {
     fn dim(k: usize) -> usize {
         k * F + k + C * (k * (k - 1) / 2) + k + 1
@@ -88,7 +71,6 @@ impl Net {
     fn o_beta(&self) -> usize {
         self.o_th() + self.k
     }
-
     pub fn new(k: usize, rng: &mut Rng) -> Net {
         assert!((K_MIN..=K_MAX).contains(&k));
         let mut net = Net { k, arrows: orient(k), g: vec![0.0; Net::dim(k)] };
@@ -107,7 +89,6 @@ impl Net {
         }
         net
     }
-
     pub fn params(&self) -> &[f32] {
         &self.g
     }
@@ -117,8 +98,6 @@ impl Net {
     pub fn arrows(&self) -> &[(usize, usize)] {
         &self.arrows
     }
-
-    /// Matrice dense K×K du canal c (ligne = source, colonne = cible) ; W[i][j]·W[j][i] = 0.
     pub fn matrix(&self, c: usize) -> Vec<f32> {
         assert!(c < C);
         let k = self.k;
@@ -130,12 +109,9 @@ impl Net {
         }
         m
     }
-
-    /// Netteté de la politique de recrutement, dans (0, 16).
     pub fn sharpness(&self) -> f64 {
         16.0 * sigmoid(f64::from(self.g[self.o_beta()]))
     }
-
     fn member(&self, i: usize, feat: &[f64]) -> f64 {
         let mut z = f64::from(self.g[self.o_bm() + i]);
         for f in 0..F {
@@ -143,27 +119,30 @@ impl Net {
         }
         sigmoid(z)
     }
-
-pub fn tpm(&self, ev: &Evidence) -> Tpm {
-    let (k, na, ow) = (self.k, self.arrows.len(), self.o_w());
-    let mut t = vec![0.0f64; k * k];
-    for (ai, &(from, to)) in self.arrows.iter().enumerate() {
-        let mut lg = [0.0f64; C]; let mut mx = f64::NEG_INFINITY;
-        for c in 0..C { lg[c] = f64::from(self.g[ow + c*na + ai]); mx = mx.max(lg[c]); }
-        let mut w = [0.0f64; C]; let mut sum = 0.0;
-        for c in 0..C { w[c] = (lg[c]-mx).exp(); sum += w[c]; }
-        let mut s = 0.0;
-        for c in 0..C { s += (GAIN * w[c] / sum) * ev.gate(c, from, to); }
-        t[from*k + to] = s;
+    pub fn tpm(&self, ev: &Evidence) -> Tpm {
+        let k = self.k;
+        let na = self.arrows.len();
+        let ow = self.o_w();
+        let th = self.o_th();
+        let mut t = vec![0.0f64; k * k];
+        for (ai, &(from, to)) in self.arrows.iter().enumerate() {
+            let mut s = 0.0f64;
+            for c in 0..C {
+                s += f64::from(self.g[ow + c * na + ai]) * ev.gate(c, from, to);
+            }
+            t[from * k + to] = s;
+        }
+        Tpm::from_fn(k, |x, i| {
+            let mut z = f64::from(self.g[th + i]);
+            for j in 0..k {
+                if x >> j & 1 == 1 {
+                    z += t[j * k + i];
+                }
+            }
+            let p = sigmoid(z);
+            if p.is_nan() { 0.5 } else { p.clamp(PMIN, 1.0 - PMIN) }
+        })
     }
-    let th = -GAIN / 2.0;
-    Tpm::from_fn(k, |x, i| {
-        let mut z = th;
-        for j in 0..k { if x>>j & 1 == 1 { z += t[j*k + i]; } }
-        sigmoid(z).clamp(PMIN, 1.0 - PMIN)
-    })
-}
-
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut b = Vec::with_capacity(HEADER + 4 * self.g.len());
         b.extend_from_slice(&MAGIC);
@@ -175,7 +154,6 @@ pub fn tpm(&self, ev: &Evidence) -> Tpm {
         }
         b
     }
-
     pub fn from_bytes(b: &[u8]) -> Result<Net, String> {
         if b.len() < HEADER || b[..4] != MAGIC[..] {
             return Err("fichier .phis invalide".into());
@@ -203,7 +181,6 @@ pub fn tpm(&self, ev: &Evidence) -> Tpm {
         }
         Ok(Net { k, arrows: orient(k), g })
     }
-
     pub fn save<P: AsRef<Path>>(&self, path: P) -> std::io::Result<()> {
         if let Some(dir) = path.as_ref().parent() {
             if !dir.as_os_str().is_empty() {
@@ -212,15 +189,11 @@ pub fn tpm(&self, ev: &Evidence) -> Tpm {
         }
         std::fs::write(path, self.to_bytes())
     }
-
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Net, String> {
         let b = std::fs::read(path.as_ref()).map_err(|e| e.to_string())?;
         Net::from_bytes(&b)
     }
 }
-
-/// Lecture du percept par le substrat : appartenance de chaque ancre à chaque unité (rôle),
-/// calculée à partir de traits purement relationnels/informationnels de l'ancre.
 #[derive(Clone, Debug)]
 pub struct Field {
     pub k: usize,
@@ -235,7 +208,6 @@ pub struct Field {
     ostr: Vec<f64>,
     edges: Vec<Vec<(usize, usize, f64)>>,
 }
-
 impl Field {
     pub fn new(net: &Net, p: &Percept) -> Field {
         let k = net.k;
@@ -304,9 +276,6 @@ impl Field {
         }
         Field { k, na, nc, class_of, by_class, cands, m, mbar, sal: lb, ostr, edges }
     }
-
-    /// R : état des K unités déclenché par la perception (réponse poolée, pondérée par la
-    /// surprise des ancres, au moins égale à la moyenne des unités).
     pub fn response(&self) -> usize {
         let k = self.k;
         let tot: f64 = self.sal.iter().sum();
@@ -330,8 +299,6 @@ impl Field {
         }
         s
     }
-
-    /// Alignement de rôle ∈ [-1, 1] entre une classe de répétitions et un état d'unités z.
     pub fn align(&self, class: usize, z: usize) -> f64 {
         let k = self.k;
         let mut s = 0.0f64;
@@ -341,8 +308,6 @@ impl Field {
         }
         s / k as f64
     }
-
-    /// Région de E déclenchée par R : classes dont l'alignement avec R dépasse la moyenne.
     pub fn region(&self, r: usize) -> Vec<bool> {
         let mut sel = vec![false; self.nc];
         if self.cands.is_empty() {
@@ -358,18 +323,12 @@ impl Field {
         sel
     }
 }
-
-/// Évidence relationnelle d'une hypothèse S (ensemble de classes de répétitions) :
-/// flow[c][j][i] = force des relations du canal c allant d'une ancre de S de rôle j vers une ancre
-/// de S de rôle i ; mass[c][j] = force sortante totale (y compris hors de S) des ancres de rôle j.
-/// Les relations qui quittent S ne sont pas expliquées : elles diluent le couplage.
 #[derive(Clone, Debug)]
 pub struct Evidence {
     k: usize,
     flow: Vec<f64>,
     mass: Vec<f64>,
 }
-
 impl Evidence {
     pub fn of(f: &Field, sel: &[bool]) -> Evidence {
         let k = f.k;
@@ -403,8 +362,6 @@ impl Evidence {
         }
         Evidence { k, flow, mass }
     }
-
-    /// G_c[from][to] ∈ [0, 1].
     pub fn gate(&self, c: usize, from: usize, to: usize) -> f64 {
         self.flow[(c * self.k + from) * self.k + to] / (self.mass[c * self.k + from] + GATE_EPS)
     }
