@@ -128,14 +128,14 @@ fn count(f: &Field, sel: &[bool]) -> usize {
 }
 
 fn baseline(net: &Net, f: &Field, rng: &mut Rng, state: usize, sel: &[bool]) -> f64 {
-    let weight = |c: usize| f.by_class[c].len();
-    let target: usize = f.cands.iter().filter(|&&c| sel[c]).map(|&c| weight(c)).sum();
+    let weight = |c: usize| -> f64 { f.by_class[c].iter().map(|&a| f.sal[a]).sum() };
+    let target: f64 = f.cands.iter().filter(|&&c| sel[c]).map(|&c| weight(c)).sum();
     let mut pool: Vec<usize> = f.cands.clone();
     let mut sum = 0.0f64;
     for _ in 0..CHANCE_DRAWS {
         rng.shuffle(&mut pool);
         let mut pick = vec![false; f.nc];
-        let mut got = 0usize;
+        let mut got = 0.0_f64;
         for &c in &pool {
             if got >= target {
                 break;
@@ -146,6 +146,48 @@ fn baseline(net: &Net, f: &Field, rng: &mut Rng, state: usize, sel: &[bool]) -> 
         sum += judge(net, f, &pick, state).phi;
     }
     sum / CHANCE_DRAWS as f64
+}
+
+fn mass_of(f: &Field, sel: &[bool]) -> f64 {
+    (0..f.na).filter(|&a| sel[f.class_of[a]]).map(|a| f.sal[a]).sum()
+}
+
+struct Curve(Vec<(f64, f64)>); // (masse, phi) trié
+impl Curve {
+    fn at(&self, m: f64) -> f64 {
+        let p = &self.0;
+        if p.is_empty() { return 0.0; }
+        if m <= p[0].0 { return p[0].1; }
+        for w in p.windows(2) {
+            if m <= w[1].0 {
+                let t = (m - w[0].0) / (w[1].0 - w[0].0).max(1e-9);
+                return w[0].1 + t * (w[1].1 - w[0].1);
+            }
+        }
+        p.last().unwrap().1
+    }
+}
+
+fn chance_curve(net: &Net, f: &Field, rng: &mut Rng, state: usize) -> Curve {
+    let total: f64 = f.sal.iter().sum();
+    let mut pts = Vec::new();
+    for i in 0..=10 {
+        let target = total * i as f64 / 10.0;
+        for _ in 0..2 {
+            let mut pool = f.cands.clone();
+            rng.shuffle(&mut pool);
+            let mut pick = vec![false; f.nc];
+            let mut got = 0.0;
+            for &c in &pool {
+                if got >= target { break; }
+                pick[c] = true;
+                got += f.by_class[c].iter().map(|&a| f.sal[a]).sum::<f64>();
+            }
+            pts.push((mass_of(f, &pick), judge(net, f, &pick, state).phi));
+        }
+    }
+    pts.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    Curve(pts)
 }
 
 // Échelle de séparation propre à E : écart positif le plus fréquent entre ancres consécutives.
@@ -218,9 +260,11 @@ pub fn run(
 ) -> Outcome {
     let field = Field::new(net, p);
     let state = field.response();
+    let curve = chance_curve(net, &field, &mut chance_rng, state);
+    let mut cur = judge(net, &field, &sel, state);
+    let mut cur_obj = cur.phi - curve.at(mass_of(&field, &sel));
     let mut chance_rng = rng.fork();   // + flux dédié : mêmes tirages pour tous les réseaux
     let mut sel = field.region(state);
-    let mut cur = judge(net, &field, &sel, state);
     let beta = net.sharpness();
     let mut evals = 1usize;
     let mut since = 0usize;
@@ -260,20 +304,20 @@ pub fn run(
         let adding = !sel[c];
         sel[c] = adding;
         let next = judge(net, &field, &sel, state);
+        
         evals += 1;
-        let tried = next.phi;
-let tried = next.phi;
-let ok = tried > cur.phi + TOL
-    || (adding && (tried - cur.phi).abs() <= TOL && next.unjust < cur.unjust - TOL);
-        if ok {
-            cur = next;
-            tabu.fill(false);
-            since = 0;
-        } else {
-            sel[c] = !adding;
-            tabu[i] = true;
-            since += 1;
-        }
+        
+        /*let tried = next.phi;
+        let ok = tried > cur.phi + TOL
+            || (adding && (tried - cur.phi).abs() <= TOL && next.unjust < cur.unjust - TOL);*/
+            
+        let next = judge(net, &field, &sel, state);
+        let next_obj = next.phi - curve.at(mass_of(&field, &sel));
+        let ok = next_obj > cur_obj + TOL
+            || (adding && (next_obj - cur_obj).abs() <= TOL && next.unjust < cur.unjust - TOL);
+            
+        if ok { cur = next; cur_obj = next_obj; tabu.fill(false); since = 0; } else { sel[c] = !adding; tabu[i] = true; since += 1; }
+        
         let step = Step {
             eval: evals - 1,
             class: c,
