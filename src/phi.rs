@@ -1,9 +1,6 @@
-// φ_sharp : φ_s d'IIT 4.0 (TPM, répertoires cause/effet, bipartitions unidirectionnelles, MIP, complexe).
-// État : bit i = unité i. Tpm : p[x * n + i] = P(U_i(t+1) = 1 | U(t) = x), unités indépendantes sachant x.
 const NONE: usize = usize::MAX;
 const EPS: f64 = 1e-9;
 const TIE: f64 = 1e-12;
-
 #[derive(Clone, Debug)]
 pub struct Tpm {
     pub n: usize,
@@ -19,8 +16,6 @@ impl Partition {
         (self.from.count_ones() * self.to.count_ones()) as usize
     }
 }
-// Les états (state, cause_state, effect_state, index des répertoires) sont compactés :
-// le bit r est la r-ième unité de `units`. `global` les ramène aux bits du substrat.
 #[derive(Clone, Debug)]
 pub struct Sia {
     pub units: usize,
@@ -65,7 +60,6 @@ impl Tpm {
         }
         Tpm::new(n, p)
     }
-    // Fond figé : les unités hors `units` gardent leur état courant.
     pub fn condition(&self, units: usize, state: usize) -> Tpm {
         let n = self.n;
         let fixed = state & !units & ((1usize << n) - 1);
@@ -80,8 +74,6 @@ impl Tpm {
         }
         Tpm { n: k, p }
     }
-    // Coupure from → to : pour chaque unité de `to`, les entrées issues de `from`
-    // sont remplacées par du bruit uniforme (marginalisation).
     pub fn cut(&self, from: usize, to: usize) -> Tpm {
         let n = self.n;
         let size = 1usize << n;
@@ -103,7 +95,6 @@ impl Tpm {
         }
         Tpm { n, p }
     }
-    // π_e(z|s) = Π_j p(z_j|s)
     pub fn effect_at(&self, s: usize, z: usize) -> f64 {
         let row = &self.p[s * self.n..(s + 1) * self.n];
         (0..self.n)
@@ -113,7 +104,6 @@ impl Tpm {
     pub fn effect(&self, s: usize) -> Vec<f64> {
         (0..1usize << self.n).map(|z| self.effect_at(s, z)).collect()
     }
-    // π_c(z|s) ∝ Π_j p(s_j|z), prior uniforme ; nul partout si s est inatteignable.
     pub fn cause(&self, s: usize) -> Vec<f64> {
         let n = self.n;
         let mut l: Vec<f64> = (0..1usize << n)
@@ -132,7 +122,6 @@ impl Tpm {
         }
         l
     }
-    // π_e(z) : état d'entrée uniforme, produit des marginales d'unités.
     pub fn unconstrained_effect(&self) -> Vec<f64> {
         let n = self.n;
         let size = 1usize << n;
@@ -202,16 +191,12 @@ fn local_cuts(k: usize) -> Vec<(usize, usize)> {
     let full = (1usize << k) - 1;
     (1..full).map(|a| (a, full ^ a)).collect()
 }
-// Θ(S) : les 2^k − 2 bipartitions unidirectionnelles (k = 1 : coupure de l'auto-connexion).
 pub fn partitions(units: usize) -> Vec<Partition> {
     local_cuts(units.count_ones() as usize)
         .into_iter()
         .map(|(a, b)| Partition { from: scatter(units, a), to: scatter(units, b) })
         .collect()
 }
-// s'_x = argmax_z π_x(z|s)·log2(π_x(z|s)/π_x(z))
-// φ_x(θ) = π_x(s'_x|s)·|log2(π_x(s'_x|s)/π_x^θ(s'_x|s))|, φ_s(θ) = min(φ_c, φ_e)
-// MIP = argmin_θ φ_s(θ)/(|S¹|·|S²|), φ_s = φ_s(MIP)
 pub fn analyze(tpm: &Tpm, state: usize, units: usize) -> Sia {
     let sys = tpm.condition(units, state);
     let k = sys.n;
@@ -290,7 +275,6 @@ pub fn analyze(tpm: &Tpm, state: usize, units: usize) -> Sia {
         effect,
     }
 }
-// Complexes : φ_s maximal, égalité → plus grand système ; exclusion des systèmes chevauchants.
 pub fn complexes(tpm: &Tpm, state: usize) -> Vec<Sia> {
     let mut ranked: Vec<(i64, u32, usize)> = Vec::new();
     for units in 1..1usize << tpm.n {
