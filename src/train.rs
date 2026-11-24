@@ -157,12 +157,14 @@ fn null_eff(s: &Sample) -> Vec<u8> {
     out
 }
 
-fn fitness(nets: &[Net], percepts: &[Percept]) -> Vec<(f64, usize)> {
+fn fitness(nets: &[Net], batch: &[Sample], percepts: &[Percept]) -> Vec<(f64, usize)> {
+    let nulls: Vec<Percept> = batch.iter().map(|s| Percept::new(&null_eff(s))).collect();
     let b = percepts.len();
     by_net(par_map(nets.len() * b, |t| {
-        let p = &percepts[t % b];
+        let (p, q) = (&percepts[t % b], &nulls[t % b]);
         let o = quiet(&nets[t / b], p, search::Budget::measured(p));
-        (o.phi - o.chance, o.evals)
+        let n = quiet(&nets[t / b], q, search::Budget::measured(p));
+        (o.phi - n.phi, o.evals + n.evals)   // contenu, pas taille
     }), b)
 }
 
@@ -400,7 +402,7 @@ pub fn session(plan: &Plan, on_epoch: &mut dyn FnMut(&Epoch)) -> Session {
             })
             .collect();
         nets.push(instantiate(&start, &m));
-        let scores = if oracle { fitness_oracle(&nets, &batch, &percepts) } else { fitness(&nets, &percepts) };
+        let scores = if oracle { fitness_oracle(&nets, &batch, &percepts) } else { fitness(&nets, &batch, &percepts) };
         let center = scores[plan.lambda].0;
         let mut order: Vec<usize> = (0..plan.lambda).collect();
         order.sort_by(|&p, &q| {
