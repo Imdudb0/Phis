@@ -1,11 +1,14 @@
 use phisharp::net::{K_DEFAULT, K_MAX, K_MIN};
 use phisharp::train::{self, Epoch, Plan};
+
 const USAGE: &str = "usage : train [--out <fichier.phis>] [--k <unités>] [--seed <entier>]";
 const SEED: u64 = 0x5048_4953;
+
 fn fail(msg: &str) -> ! {
     eprintln!("{msg}");
     std::process::exit(2)
 }
+
 fn main() {
     let mut path = String::from("out/sharp.phis");
     let mut k = K_DEFAULT;
