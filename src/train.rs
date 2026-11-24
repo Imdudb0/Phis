@@ -1,11 +1,16 @@
 use crate::model::{self, Answer, Model};
-use crate::net::Net;
+use crate::net::{Evidence, Field, Net};
 use crate::percept::Percept;
+use crate::phi;
 use crate::ptgrs::{Cause, Ptgrs, Role, Sample};
 use crate::rng::Rng;
-use crate::search;
+use crate::search::{self, Budget, Outcome, Step};
 use std::cmp::Ordering;
 use std::sync::atomic::{AtomicUsize, Ordering as Atomic};
+
+const FLAT: f64 = 1e-9;      // deux scores plus proches que ça sont « égaux »
+const FLAT_MAX: usize = 15;  // générations plates consécutives avant arrêt
+const LUCK: u64 = 0xA5A5_5A5A_C3C3_3C3C; // décorrèle le tirage « hasard » de la recherche
 
 pub const ROLES: usize = 5;
 const NAMES: [&str; ROLES] = [
@@ -15,6 +20,8 @@ const NAMES: [&str; ROLES] = [
     "bruit",
     "leurres",
 ];
+
+
 const SIGMA0: f64 = 0.3;
 
 #[derive(Clone, Copy, Debug)]
@@ -46,6 +53,8 @@ pub struct Epoch {
     pub best: f64,
     pub parents: f64,
     pub mean: f64,
+    pub real: f64, 
+    pub base: f64,
     pub evals: usize,
     pub total: usize,
 }
@@ -178,21 +187,53 @@ fn instantiate(template: &Net, x: &[f64]) -> Net {
     net
 }
 
-// Signal d'entraînement : φ_sharp moyen relatif à E, par réseau, sur le même lot.
-fn fitness(nets: &[Net], percepts: &[Percept]) -> Vec<(f64, usize)> {
+#[derive(Clone, Copy, Debug)]
+struct Score {
+    delta: f64, // φ(E) − base : ce que le réseau gagne grâce à E et à l'abduction
+    real: f64,  // φ_sharp sur E
+    base: f64,  // max(φ sur E permuté, φ d'une sélection au hasard)
+    evals: usize,
+}
+
+/// Mêmes octets, même longueur, même histogramme ; ordre détruit : plus de cause cachée.
+fn null_of(p: &Percept, rng: &mut Rng) -> Percept {
+    let mut e = p.eff.clone();
+    rng.shuffle(&mut e);
+    Percept::new(&e)
+}
+
+/// φ_sharp d'une sélection de classes tirée au hasard, de même taille que l'explication trouvée.
+fn chance(net: &Net, p: &Percept, o: &Outcome, rng: &mut Rng) -> f64 {
+    let f = Field::new(net, p);
+    let mut pool = f.cands.clone();
+    rng.shuffle(&mut pool);
+    let mut sel = vec![false; f.nc];
+    for &c in pool.iter().take(o.explanation.classes.len()) {
+        sel[c] = true;
+    }
+    phi::phi_sharp(&net.tpm(&Evidence::of(&f, &sel)), o.r)
+}
+
+fn fitness(nets: &[Net], percepts: &[Percept], nulls: &[Percept]) -> Vec<Score> {
     let b = percepts.len();
-    let cells: Vec<(f64, usize)> = par_map(nets.len() * b, |t| {
-        let p = &percepts[t % b];
-        let mut rng = Rng::new(model::seed(&p.eff));
-        let o = search::ask(&nets[t / b], p, &mut rng);
-        (o.phi, o.evals)
+    let cells: Vec<Score> = par_map(nets.len() * b, |t| {
+        let (net, i) = (&nets[t / b], t % b);
+        let (p, q) = (&percepts[i], &nulls[i]);
+        let budget = Budget::measured(p); // même budget des deux côtés
+        let seed = model::seed(&p.eff);
+        let real = search::run(net, p, &mut Rng::new(seed), budget, &mut |_: &Step| {});
+        let null = search::run(net, q, &mut Rng::new(model::seed(&q.eff)), budget, &mut |_: &Step| {});
+        let base = null.phi.max(chance(net, p, &real, &mut Rng::new(seed ^ LUCK)));
+        Score { delta: real.phi - base, real: real.phi, base, evals: real.evals + null.evals }
     });
+    let n = b as f64;
     cells
         .chunks(b)
-        .map(|row| {
-            let phi = row.iter().map(|c| c.0).sum::<f64>() / b as f64;
-            let evals = row.iter().map(|c| c.1).sum::<usize>();
-            (phi, evals)
+        .map(|row| Score {
+            delta: row.iter().map(|c| c.delta).sum::<f64>() / n,
+            real: row.iter().map(|c| c.real).sum::<f64>() / n,
+            base: row.iter().map(|c| c.base).sum::<f64>() / n,
+            evals: row.iter().map(|c| c.evals).sum::<usize>(),
         })
         .collect()
 }
@@ -306,6 +347,7 @@ pub fn session(plan: &Plan, on_epoch: &mut dyn FnMut(&Epoch)) -> Session {
     let mut r_step = master.fork();
     let mut r_data = master.fork();
     let mut r_hold = master.fork();
+    let mut r_null = master.fork();
     let start = Net::new(plan.k, &mut r_init);
     let dim = start.params().len();
     assert_eq!(dim, plan.dim, "plan incohérent avec l'architecture");
@@ -333,13 +375,14 @@ pub fn session(plan: &Plan, on_epoch: &mut dyn FnMut(&Epoch)) -> Session {
     let mut path = vec![0.0f64; dim];
     let mut trace: Vec<Epoch> = Vec::with_capacity(plan.epochs);
     let mut total = 0usize;
-
+    let mut flat = 0usize;
+    
     for epoch in 1..=plan.epochs {
-        // Seul `eff` entre dans la boucle : la cause cachée est écartée ici.
         let percepts: Vec<Percept> = draw(&mut r_data, plan.batch)
             .iter()
             .map(|s| Percept::new(&s.eff))
             .collect();
+        let nulls: Vec<Percept> = percepts.iter().map(|p| null_of(p, &mut r_null)).collect();
         let mut z: Vec<Vec<f64>> = Vec::with_capacity(plan.lambda);
         for _ in 0..plan.lambda {
             let mut v = Vec::with_capacity(dim);
@@ -356,41 +399,55 @@ pub fn session(plan: &Plan, on_epoch: &mut dyn FnMut(&Epoch)) -> Session {
             })
             .collect();
         nets.push(instantiate(&start, &m));
-        let scores = fitness(&nets, &percepts);
-        let center = scores[plan.lambda].0;
+        let scores = fitness(&nets, &percepts, &nulls);
+        let center = scores[plan.lambda];
+        let kids = &scores[..plan.lambda];
         let mut order: Vec<usize> = (0..plan.lambda).collect();
         order.sort_by(|&p, &q| {
-            scores[q].0.partial_cmp(&scores[p].0).unwrap_or(Ordering::Equal).then(p.cmp(&q))
+            kids[q].delta.partial_cmp(&kids[p].delta).unwrap_or(Ordering::Equal).then(p.cmp(&q))
         });
-
+        // Fitness plate (règle CMA-ES) : si le meilleur et le ~λ/4-ième sont égaux, la sélection
+        // n'a aucune information → pas de marche aléatoire de m, on élargit σ.
+        let probe = (1 + plan.lambda / 4).min(plan.lambda - 1);
         let used = sigma;
-        let mut yw = vec![0.0f64; dim];
-        for (r, &i) in order.iter().take(plan.mu).enumerate() {
-            for d in 0..dim {
-                yw[d] += w[r] * z[i][d];
+        if kids[order[0]].delta - kids[order[probe]].delta > FLAT {
+            flat = 0;
+            let mut yw = vec![0.0f64; dim];
+            for (r, &i) in order.iter().take(plan.mu).enumerate() {
+                for d in 0..dim {
+                    yw[d] += w[r] * z[i][d];
+                }
             }
+            for d in 0..dim {
+                m[d] += used * yw[d];
+                path[d] = (1.0 - cs) * path[d] + gain * yw[d];
+            }
+            let norm = path.iter().map(|v| v * v).sum::<f64>().sqrt();
+            sigma = used * ((cs / ds) * (norm / chi - 1.0)).exp();
+        } else {
+            flat += 1;
+            sigma = used * (0.2 + cs / ds).exp();
         }
-        for d in 0..dim {
-            m[d] += used * yw[d];
-            path[d] = (1.0 - cs) * path[d] + gain * yw[d];
-        }
-        let norm = path.iter().map(|v| v * v).sum::<f64>().sqrt();
-        sigma = used * ((cs / ds) * (norm / chi - 1.0)).exp();
-
-        let spent: usize = scores.iter().map(|s| s.1).sum();
+        let spent: usize = scores.iter().map(|s| s.evals).sum();
         total += spent;
         let rec = Epoch {
             epoch,
             sigma: used,
-            center,
-            best: scores[order[0]].0,
-            parents: order[..plan.mu].iter().map(|&i| scores[i].0).sum::<f64>() / plan.mu as f64,
-            mean: scores[..plan.lambda].iter().map(|s| s.0).sum::<f64>() / plan.lambda as f64,
+            center: center.delta,
+            best: kids[order[0]].delta,
+            parents: order[..plan.mu].iter().map(|&i| kids[i].delta).sum::<f64>() / plan.mu as f64,
+            mean: kids.iter().map(|s| s.delta).sum::<f64>() / plan.lambda as f64,
+            real: center.real,
+            base: center.base,
             evals: spent,
             total,
         };
         on_epoch(&rec);
         trace.push(rec);
+        if flat >= FLAT_MAX {
+            eprintln!("plateau : {flat} générations sans information de sélection, arrêt");
+            break;
+        }
         if sigma < floor {
             break;
         }
@@ -415,8 +472,8 @@ pub fn header(p: &Plan) -> String {
 
 pub fn progress(e: &Epoch) -> String {
     format!(
-        "gén {:>4} | σ {:>10.3e} | φ_sharp centre {:>9.6} | meilleur {:>9.6} | parents {:>9.6} | moyen {:>9.6} | éval {:>8} | cumul {:>11}",
-        e.epoch, e.sigma, e.center, e.best, e.parents, e.mean, e.evals, e.total
+        "gén {:>4} | σ {:>10.3e} | Δφ centre {:>9.6} | meilleur {:>9.6} | parents {:>9.6} | moyen {:>9.6} | φ(E) {:>9.6} | base {:>9.6} | éval {:>8} | cumul {:>11}",
+        e.epoch, e.sigma, e.center, e.best, e.parents, e.mean, e.real, e.base, e.evals, e.total
     )
 }
 
