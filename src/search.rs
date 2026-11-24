@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 const NONE: usize = usize::MAX;
 const TOL: f64 = 1e-9;
-const CHANCE_DRAWS: usize = 4;                     
+const CHANCE_DRAWS: usize = 8;                     
 
 /// Budget mesuré sur le percept : une évaluation de φ_sharp par classe de répétitions.
 #[derive(Clone, Copy, Debug)]
@@ -260,7 +260,8 @@ pub fn run(
         let next = judge(net, &field, &sel, state);
         evals += 1;
         let tried = next.phi;
-        let ok = tried > cur.phi + TOL;
+let ok = tried > cur.phi + TOL
+    || (adding && (tried - cur.phi).abs() <= TOL && unjust_next < unjust_cur - TOL);
         if ok {
             cur = next;
             tabu.fill(false);
