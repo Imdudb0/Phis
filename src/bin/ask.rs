@@ -1,7 +1,8 @@
 //! Binaire strict conforme au protocole :
 //! `ask --model out/sharp.phis --file perceived.eff`
 //!
-//! Ne modifie jamais le fichier d'entrée, n'ajoute aucun gabarit ni consigne.
+//! Avec `--trace`, affiche sur stderr la trajectoire φ_sharp(t), la clause focale détectée
+//! relationnellement ainsi que les « trous » identifiés par le résidu dans perceived.eff.
 
 use std::env;
 use std::io::Write;
@@ -83,7 +84,7 @@ fn main() {
     let cfg = SearchConfig {
         budget_steps,
         disable_refutation: false,
-        max_explain_len: 256,
+        max_explain_len: 320,
     };
 
     let result = run_abductive_search(&net, &perceived_bytes, cfg);
@@ -102,6 +103,14 @@ fn main() {
                 pt.report.residue_score
             );
         }
+        eprintln!("[focal_clause_idx] {}", result.focal_clause_idx);
+        let holes: Vec<String> = result
+            .final_report
+            .residue_holes
+            .iter()
+            .map(|b| format!("{:?}", String::from_utf8_lossy(b)))
+            .collect();
+        eprintln!("[residue_holes] {}", holes.join(", "));
     }
 
     let mut stdout = std::io::stdout().lock();
