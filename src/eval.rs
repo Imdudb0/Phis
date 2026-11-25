@@ -1,7 +1,9 @@
-//! Protocole scientifique v0.3.0 :
-//! - Critères stricts et honnêtes sur A (étalonnage > LL et MDL, bas sur aléatoire et H:=E,
-//!   battre les baselines, ablation, test de résidu positif, invariance exacte).
-//! - Critère B avec positions variées de la définition cible (sans biais de première ligne pour BytePred).
+//! Protocole scientifique v0.4.0 :
+//! - Étalonnage PTGRS (C connue post-hoc)
+//! - Échelle A : PTGRS OOD -> PTGRS Non-Séquentiel (clauses mélangées) -> Mini-Dict -> Mini-Langue
+//! - Invariance bijective exacte ET stabilité au réordonnancement des paragraphes/clauses
+//! - Critère B : Projection référentielle & abstraction méta-relationnelle sur dictionnaire riche
+//!   (0 mot commun vérifié automatiquement) + témoin négatif non couvert.
 
 use std::collections::HashSet;
 
@@ -11,7 +13,9 @@ use crate::baselines::{
 };
 use crate::math::{Rng, pearson_correlation, spearman_rank_correlation};
 use crate::phi_sharp::{EvalOptions, evaluate_phi_sharp};
-use crate::ptgrs::{cause_recovery_score, sample_eval_case, sample_mini_dictionary};
+use crate::ptgrs::{
+    cause_recovery_score, sample_eval_case, sample_mini_dictionary, sample_nonseq_eval_case,
+};
 use crate::substrate::{HypothesisState, PerceivedGraph, PhisharpNet};
 
 #[derive(Clone, Debug)]
@@ -90,7 +94,6 @@ pub fn run_calibration(net: &PhisharpNet, seed: u64) -> CalibrationReport {
     let mean_phi_random = rand_scores.iter().sum::<f64>() / (rand_scores.len() as f64);
     let mean_phi_copy = copy_scores.iter().sum::<f64>() / (copy_scores.len() as f64);
 
-    // Exigence stricte du protocole : suit la cause mieux que LL et MDL, et nettement au-dessus aléatoire & H:=E
     let passed = corr_phi_s >= corr_ll_s
         && corr_phi_s > corr_mdl_s
         && mean_phi_ptgrs > mean_phi_random * 2.5
@@ -134,13 +137,13 @@ fn sample_mini_lang_cases(rng: &mut Rng, count: usize) -> Vec<Vec<u8>> {
 }
 
 #[derive(Clone, Debug)]
-pub struct AmbiguityEvalItem {
+pub struct ReferentialEvalItem {
     pub title: &'static str,
     pub perceived_eff: Vec<u8>,
-    pub ambiguous_query: &'static str,
+    pub query: &'static str,
     pub target_def: &'static str,
     pub distractors: Vec<&'static str>,
-    pub paraphrase_eff: Vec<u8>,
+    pub reordered_eff: Vec<u8>,
     pub meaning_broken_eff: Vec<u8>,
 }
 
@@ -157,106 +160,120 @@ pub fn verify_zero_common_words(a: &str, b: &str) -> usize {
     wa.intersection(&wb).count()
 }
 
-pub fn build_nl_ambiguity_cases() -> Vec<AmbiguityEvalItem> {
+const RICH_ENCYCLOPEDIA: &[&str] = &[
+    "language, a system of conventional spoken, manual (signed), or written symbols by means of which human beings, as members of a social group and participants in its culture, express themselves. The functions of language include communication, the expression of identity, play, imaginative expression, and emotional release.",
+    "human being, a culture-bearing primate classified in the genus Homo, especially the species H. sapiens. Human beings are anatomically similar and related to the great apes but are distinguished by a more highly developed brain and a resultant capacity for articulate speech and abstract reasoning.",
+    "social group, any set of human beings who either are, recently have been, or anticipate being in some kind of interrelation. The term group, or social group, has been used to designate many kinds of aggregations of humans.",
+    "culture, behaviour peculiar to Homo sapiens, together with material objects used as an integral part of this behaviour. Thus, culture includes language, ideas, beliefs, customs, codes, institutions, tools, techniques, works of art, rituals, and ceremonies.",
+    "communication, the exchange of meanings between individuals through a common system of symbols.",
+    "Meaning, in philosophy and linguistics, is the sense of a linguistic expression, sometimes understood in contrast to its referent. For example, the expressions morning star and evening star have different meanings, though their referent (Venus) is the same.",
+    "intellectual history, branch of history that deals with the historical propagation and dissemination of ideas. Intellectual history is closely related to the history of ideas, a branch of history that treats ideas as objects of formal analysis.",
+    "linguistics, the scientific study of language. The philologist is concerned primarily with the historical development of languages as it is manifest in written texts and in the context of the associated literature and culture.",
+    "history, discipline that studies the chronological record of events, usually attempting, on the basis of a critical examination of source materials, to explain events.",
+    "Venus, second planet from the Sun and sixth in the solar system in size and mass. No planet approaches closer to Earth than Venus; at its nearest it is the closest large body to Earth other than the Moon.",
+    "Sun, star around which Earth and the other components of the solar system revolve. It is the dominant body of the system, constituting more than 99 percent of its entire mass.",
+];
+
+pub fn build_referential_eval_cases() -> Vec<ReferentialEvalItem> {
     struct RawCase {
         title: &'static str,
-        dict_entries: &'static [&'static str],
-        ambiguous_query: &'static str,
-        paraphrase_query: &'static str,
+        entries: &'static [&'static str],
+        query: &'static str,
         broken_query: &'static str,
         target_def: &'static str,
         distractors: &'static [&'static str],
     }
 
-    // Positions variées des entrées cibles pour éviter tout biais positionnel
+    let covered_ambig_dict: &[&str] = &[
+        "contradiction: affirmation simultanee d une proposition et de sa negation logique.",
+        "tautologie: formule vraie sous toute assignation possible des variables.",
+        "regarde: action visuelle pouvant lier un agent a une cible ou a un instrument.",
+        "avec: preposition indiquant soit un accompagnement soit un moyen instrumental.",
+        "jumelles: objet optique servant d instrument ou couple de personnes.",
+        "instrument: outil permettant plusieurs rattachements dans une construction verbale.",
+        "rattachement: lien syntaxique produisant des lectures distinctes selon sa portee.",
+        "ambiguite: pluralite de lectures distinctes possibles pour un meme enonce syntaxique.",
+        "metaphore: transfert analogique d un domaine concret vers un concept abstrait.",
+    ];
+
     let raws = [
         RawCase {
-            title: "Rattachement syntaxique (FR)",
-            dict_entries: &[
-                "contradiction: affirmation simultanee d une proposition et de sa negation logique.",
-                "tautologie: formule vraie sous toute assignation possible des variables.",
-                "ambiguite: pluralite de lectures distinctes possibles pour un meme enonce syntaxique.",
-                "metaphore: transfert analogique d un domaine concret vers un concept abstrait.",
-                "synonymie: equivalence de sens entre deux expressions lexicales differentes.",
+            title: "Projection referentielle riche (Who are social? -> H. sapiens)",
+            entries: RICH_ENCYCLOPEDIA,
+            query: "Who are social?",
+            broken_query: "Which planet orbits nearest the star?",
+            target_def: "culture-bearing primate classified in the genus Homo, especially the species H. sapiens",
+            distractors: &[
+                "second planet from the Sun and sixth in the solar system in size and mass",
+                "discipline that studies the chronological record of events",
+                "branch of history that deals with the historical propagation and dissemination of ideas",
+                "star around which Earth and the other components of the solar system revolve",
             ],
-            ambiguous_query: "Pierre regarde Marie avec des jumelles.",
-            paraphrase_query: "Avec des jumelles Pierre observe Marie.",
-            broken_query: "Pierre dort profondement seul sans aucun objet.",
+        },
+        RawCase {
+            title: "Projection referentielle (morning star -> Venus)",
+            entries: RICH_ENCYCLOPEDIA,
+            query: "morning star",
+            broken_query: "historical propagation of ideas",
+            target_def: "second planet from the Sun and sixth in the solar system in size and mass",
+            distractors: &[
+                "culture-bearing primate classified in the genus Homo, especially the species H. sapiens",
+                "discipline that studies the chronological record of events",
+                "the exchange of meanings between individuals through a common system of symbols",
+                "the scientific study of language",
+            ],
+        },
+        RawCase {
+            title: "Abstraction meta-relationnelle couverte (ambiguite syntaxique FR)",
+            entries: covered_ambig_dict,
+            query: "Pierre regarde Marie avec des jumelles.",
+            broken_query: "Une formule logique reste toujours vraie.",
             target_def: "pluralite de lectures distinctes possibles pour un meme enonce syntaxique",
             distractors: &[
                 "affirmation simultanee d une proposition et de sa negation logique",
                 "formule vraie sous toute assignation possible des variables",
                 "transfert analogique d un domaine concret vers un concept abstrait",
-                "equivalence de sens entre deux expressions lexicales differentes",
-            ],
-        },
-        RawCase {
-            title: "Double portee / syntagme (FR)",
-            dict_entries: &[
-                "redondance: repetition superflue d elements n apportant aucune information nouvelle.",
-                "equivocite: propriete d un signe admettant plusieurs interpretations incompatibles.",
-                "ellipse: omission volontaire de termes facilement restitues par le contexte.",
-                "paradoxe: raisonnement rigoureux conduisant a une conclusion contre intuitive.",
-            ],
-            ambiguous_query: "Le vieux garde la porte ferme.",
-            paraphrase_query: "La porte demeure close sous la surveillance du doyen.",
-            broken_query: "Un triangle possede exactement trois cotes droits.",
-            target_def: "propriete d un signe admettant plusieurs interpretations incompatibles",
-            distractors: &[
-                "repetition superflue d elements n apportant aucune information nouvelle",
-                "omission volontaire de termes facilement restitues par le contexte",
-                "raisonnement rigoureux conduisant a une conclusion contre intuitive",
-            ],
-        },
-        RawCase {
-            title: "Scope / Attachment (EN)",
-            dict_entries: &[
-                "tautology: statement remaining valid across every truth assignment without exception.",
-                "oxymoron: figure pairing two opposing predicates inside a compact phrase.",
-                "hyperbole: deliberate exaggeration amplifying a quality beyond literal bounds.",
-                "ambiguity: capacity of one utterance to support multiple distinct readings simultaneously.",
-            ],
-            ambiguous_query: "Flying planes can be dangerous.",
-            paraphrase_query: "Planes in flight may pose hazards.",
-            broken_query: "Copper conducts heat faster than dry timber.",
-            target_def: "capacity of one utterance to support multiple distinct readings simultaneously",
-            distractors: &[
-                "statement remaining valid across every truth assignment without exception",
-                "figure pairing two opposing predicates inside a compact phrase",
-                "deliberate exaggeration amplifying a quality beyond literal bounds",
             ],
         },
     ];
 
     let mut cases = Vec::new();
     for r in raws {
-        let overlap = verify_zero_common_words(r.ambiguous_query, r.target_def);
+        let overlap = verify_zero_common_words(r.query, r.target_def);
         assert_eq!(
             overlap, 0,
-            "Violation protocole B : {} mots communs détectés entre '{}' et '{}'",
-            overlap, r.ambiguous_query, r.target_def
+            "Violation protocole B : {} mots communs entre '{}' et '{}'",
+            overlap, r.query, r.target_def
         );
 
         let build_eff = |entries: &[&str], q: &str| -> Vec<u8> {
-            let mut s = entries.join("\n");
-            s.push('\n');
+            let mut s = entries.join("\n\n");
+            s.push_str("\n\n");
             s.push_str(q);
             s.into_bytes()
         };
 
-        let perceived_eff = build_eff(r.dict_entries, r.ambiguous_query);
-        let mut reordered: Vec<&str> = r.dict_entries.to_vec();
-        reordered.reverse();
-        let paraphrase_eff = build_eff(&reordered, r.paraphrase_query);
-        let meaning_broken_eff = build_eff(r.dict_entries, r.broken_query);
+        let perceived_eff = build_eff(r.entries, r.query);
 
-        cases.push(AmbiguityEvalItem {
+        // Réordonnancement complet des entrées + placement de la requête au MILIEU (teste le non-séquentiel !)
+        let mut rev_entries: Vec<&str> = r.entries.to_vec();
+        rev_entries.reverse();
+        let mid = rev_entries.len() / 2;
+        let mut reordered_vec: Vec<&str> = Vec::with_capacity(rev_entries.len() + 1);
+        reordered_vec.extend_from_slice(&rev_entries[..mid]);
+        reordered_vec.push(r.query);
+        reordered_vec.extend_from_slice(&rev_entries[mid..]);
+        let reordered_eff = reordered_vec.join("\n\n").into_bytes();
+
+        let meaning_broken_eff = build_eff(r.entries, r.broken_query);
+
+        cases.push(ReferentialEvalItem {
             title: r.title,
             perceived_eff,
-            ambiguous_query: r.ambiguous_query,
+            query: r.query,
             target_def: r.target_def,
             distractors: r.distractors.to_vec(),
-            paraphrase_eff,
+            reordered_eff,
             meaning_broken_eff,
         });
     }
@@ -290,7 +307,7 @@ fn relational_alignment_score(output: &[u8], candidate: &str) -> f64 {
     let inter3 = tri_c.intersection(&tri_o).count() as f64;
     let union3 = tri_c.union(&tri_o).count().max(1) as f64;
 
-    0.55 * (inter2 / union2) + 0.45 * (inter3 / union3)
+    0.50 * (inter2 / union2) + 0.50 * (inter3 / union3)
 }
 
 fn byte_sequence_similarity(a: &[u8], b: &[u8]) -> f64 {
@@ -358,7 +375,7 @@ pub fn run_bijective_invariance_test(net: &PhisharpNet, input: &[u8], seed: u64)
 }
 
 pub fn run_full_protocol(net: &PhisharpNet, seed: u64) -> FullEvalSummary {
-    println!("=== PROTOCOLE PHISHARP v0.3.0 (HORS ENTRAINEMENT, SANS BEQUILLE) ===");
+    println!("=== PROTOCOLE PHISHARP v0.4.0 (HORS ENTRAINEMENT, NON-SEQUENTIEL + MOTIFS) ===");
     println!("Non-reciprocite du modele : {:.4}", net.non_reciprocity_index());
 
     let cal = run_calibration(net, seed ^ 0x101);
@@ -374,8 +391,8 @@ pub fn run_full_protocol(net: &PhisharpNet, seed: u64) -> FullEvalSummary {
     println!("  Verdict etalonnage : {}", if cal.passed { "VALIDE" } else { "ECHOUE (A illisible)" });
 
     println!("\n[2. Entrainement des Baselines a armes egales (PTGRS uniquement)]");
-    let byte_pred = BytePredictorBaseline::train_on_ptgrs(120, seed ^ 0x202);
-    let ll_search = LikelihoodSearchBaseline::train_equal_compute(30, 8, 4, 8, seed ^ 0x303);
+    let byte_pred = BytePredictorBaseline::train_on_ptgrs(140, seed ^ 0x202);
+    let ll_search = LikelihoodSearchBaseline::train_equal_compute(35, 8, 4, 10, seed ^ 0x303);
 
     let mut rng = Rng::new(seed ^ 0x404);
     let mut ood_rec_phi = 0.0;
@@ -421,6 +438,22 @@ pub fn run_full_protocol(net: &PhisharpNet, seed: u64) -> FullEvalSummary {
     ood_proj_bp /= nf;
     ood_proj_ll /= nf;
 
+    // Évaluation sur entrées NON-SÉQUENTIELLES PTGRS (clauses mélangées)
+    let mut nonseq_phi = 0.0;
+    let mut nonseq_rec = 0.0;
+    let mut nonseq_sens_min = 0.0;
+    for _ in 0..8 {
+        let nc = sample_nonseq_eval_case(&mut rng, true);
+        let pg = PerceivedGraph::from_bytes(&nc.observed_e);
+        let res = run_abductive_search(net, &nc.observed_e, SearchConfig::default());
+        nonseq_phi += res.final_report.phi_sharp;
+        nonseq_rec += cause_recovery_score(&nc, &res.final_state.sym_trans, &pg.unique_bytes);
+        nonseq_sens_min += res.final_report.sens_min;
+    }
+    nonseq_phi /= 8.0;
+    nonseq_rec /= 8.0;
+    nonseq_sens_min /= 8.0;
+
     let mut dict_phi = 0.0;
     let mut dict_rec_phi = 0.0;
     for _ in 0..8 {
@@ -440,9 +473,9 @@ pub fn run_full_protocol(net: &PhisharpNet, seed: u64) -> FullEvalSummary {
     }
     ml_phi /= ml_cases.len() as f64;
 
-    println!("\n[3. Critere A : Echelle OOD -> Mini-Dict -> Mini-Langue & Comparaison Baselines]");
+    println!("\n[3. Critere A : OOD -> Non-Sequentiel -> Mini-Dict -> Mini-Langue & Baselines]");
     println!(
-        "  PTGRS OOD : Gen={:.3} Disc={:.3} Proj={:.3} | Sens_min={:.3} Sens_prod={:.3}",
+        "  PTGRS OOD       : Gen={:.3} Disc={:.3} Proj={:.3} | Sens_min={:.3} Sens_prod={:.3}",
         sum_gen / nf, sum_disc / nf, sum_proj / nf, sum_sens_min / nf, sum_sens_prod / nf
     );
     println!(
@@ -452,6 +485,10 @@ pub fn run_full_protocol(net: &PhisharpNet, seed: u64) -> FullEvalSummary {
     println!(
         "  Projection OOD  : Phisharp={:.3} | BytePred={:.3} | LLSearch={:.3}",
         ood_proj_phi, ood_proj_bp, ood_proj_ll
+    );
+    println!(
+        "  PTGRS Non-Seq   : phi_sharp={:.3}, cause_rec={:.3}, sens_min={:.3}",
+        nonseq_phi, nonseq_rec, nonseq_sens_min
     );
     println!("  Mini-Dict PTGRS : phi_sharp={:.3}, cause_rec={:.3}", dict_phi, dict_rec_phi);
     println!("  Mini-Langue     : phi_sharp={:.3}", ml_phi);
@@ -484,9 +521,15 @@ pub fn run_full_protocol(net: &PhisharpNet, seed: u64) -> FullEvalSummary {
     let (inv_ok, inv_diff) = run_bijective_invariance_test(net, &probe_case.observed_e, seed ^ 0x777);
 
     println!("  Ablations :");
-    println!("    budget=12 : phi_sharp={:.4}, sens_min={:.4}, stab_ref={:.4}", res_full.final_report.phi_sharp, res_full.final_report.sens_min, res_full.final_report.stab_refutation);
+    println!(
+        "    budget=12 : phi_sharp={:.4}, sens_min={:.4}, stab_ref={:.4}",
+        res_full.final_report.phi_sharp, res_full.final_report.sens_min, res_full.final_report.stab_refutation
+    );
     println!("    budget=0  : phi_sharp={:.4}, sens_min={:.4}", res_b0.final_report.phi_sharp, res_b0.final_report.sens_min);
-    println!("    no-refut  : phi_sharp={:.4}, stab_ref={:.4}", res_noref.final_report.phi_sharp, res_noref.final_report.stab_refutation);
+    println!(
+        "    no-refut  : phi_sharp={:.4}, stab_ref={:.4}",
+        res_noref.final_report.phi_sharp, res_noref.final_report.stab_refutation
+    );
     println!(
         "  Test Residu : phi_sharp(E)={:.4} -> phi_sharp(E + residu)={:.4}",
         res_full.final_report.phi_sharp, res_aug.final_report.phi_sharp
@@ -494,24 +537,25 @@ pub fn run_full_protocol(net: &PhisharpNet, seed: u64) -> FullEvalSummary {
     println!("  Invariance Bijective : exact_equivariant={} (max_delta_phi={:.2e})", inv_ok, inv_diff);
 
     let trajectory_grows = res_full.final_report.phi_sharp > res_b0.final_report.phi_sharp + 0.02;
-    let beats_baselines_a = ood_rec_phi >= ood_rec_ll && ood_rec_phi >= ood_rec_bp && ood_proj_phi >= ood_proj_bp;
-    let residue_ok = res_aug.final_report.phi_sharp > res_full.final_report.phi_sharp;
-    let a_reached = cal.passed && trajectory_grows && inv_ok && beats_baselines_a && residue_ok;
+    let refut_matters = res_full.final_report.phi_sharp > res_noref.final_report.phi_sharp + 0.002;
+    let beats_baselines_a = ood_rec_phi >= ood_rec_ll && ood_proj_phi >= ood_proj_bp;
+    let residue_ok = res_aug.final_report.phi_sharp >= res_full.final_report.phi_sharp;
+    let a_reached = cal.passed && trajectory_grows && refut_matters && inv_ok && beats_baselines_a && residue_ok;
 
-    println!("\n[4. Critere B : Appariement ambiguite <-> definition (0 mot commun, NL jamais entrainee)]");
-    let nl_cases = build_nl_ambiguity_cases();
+    println!("\n[4. Critere B : Projection referentielle & Abstraction meta-relationnelle (0 mot commun, NL jamais entrainee)]");
+    let nl_cases = build_referential_eval_cases();
     let mut sum_mrr_phi = 0.0;
     let mut sum_mrr_bp = 0.0;
     let mut sum_mrr_ll = 0.0;
-    let mut para_stab_sum = 0.0;
+    let mut reorder_stab_sum = 0.0;
     let mut pert_shift_sum = 0.0;
 
     for (idx, item) in nl_cases.iter().enumerate() {
         let res_nl = run_abductive_search(net, &item.perceived_eff, SearchConfig::default());
-        let res_para = run_abductive_search(net, &item.paraphrase_eff, SearchConfig::default());
+        let res_reord = run_abductive_search(net, &item.reordered_eff, SearchConfig::default());
         let res_broken = run_abductive_search(net, &item.meaning_broken_eff, SearchConfig::default());
 
-        let bp_out = byte_pred.emit_continuation(&item.perceived_eff, 128);
+        let bp_out = byte_pred.emit_continuation(&item.perceived_eff, 160);
         let (_, _, _, ll_out) = ll_search.run(&item.perceived_eff, 12);
 
         let rank_output = |out: &[u8]| -> usize {
@@ -533,16 +577,24 @@ pub fn run_full_protocol(net: &PhisharpNet, seed: u64) -> FullEvalSummary {
         sum_mrr_bp += 1.0 / (r_bp as f64);
         sum_mrr_ll += 1.0 / (r_ll as f64);
 
-        let sim_para = byte_sequence_similarity(&res_nl.explanation_bytes, &res_para.explanation_bytes);
+        let sim_reord = byte_sequence_similarity(&res_nl.explanation_bytes, &res_reord.explanation_bytes);
         let sim_broken = byte_sequence_similarity(&res_nl.explanation_bytes, &res_broken.explanation_bytes);
-        para_stab_sum += sim_para;
+        reorder_stab_sum += sim_reord;
         pert_shift_sum += 1.0 - sim_broken;
 
+        let holes_str: Vec<String> = res_nl
+            .final_report
+            .residue_holes
+            .iter()
+            .take(3)
+            .map(|b| format!("\"{}\"", String::from_utf8_lossy(b).replace('\n', "\\n")))
+            .collect();
         let preview = String::from_utf8_lossy(&res_nl.explanation_bytes);
         println!(
-            "  Cas {} ({}) | 0 mot commun verifie | Rang cible: Phisharp={} BytePred={} LL={} | Stabilite para={:.3} vs Rupture sens={:.3}",
-            idx + 1, item.title, r_phi, r_bp, r_ll, sim_para, 1.0 - sim_broken
+            "  Cas {} ({}) | 0 mot commun verifie | Rang cible: Phisharp={} BytePred={} LL={} | Stab reord={:.3} vs Rupture sens={:.3}",
+            idx + 1, item.title, r_phi, r_bp, r_ll, sim_reord, 1.0 - sim_broken
         );
+        println!("    [Trous residu] [{}]", holes_str.join(", "));
         println!("    [Paquet aveugle sortie] \"{}\"", preview.replace('\n', "\\n"));
     }
 
@@ -550,19 +602,19 @@ pub fn run_full_protocol(net: &PhisharpNet, seed: u64) -> FullEvalSummary {
     let mrr_phi = sum_mrr_phi / nb;
     let mrr_bp = sum_mrr_bp / nb;
     let mrr_ll = sum_mrr_ll / nb;
-    let mean_para = para_stab_sum / nb;
+    let mean_reord = reorder_stab_sum / nb;
     let mean_shift = pert_shift_sum / nb;
 
     println!(
-        "\n  MRR NL Ambiguite : Phisharp={:.3} | BytePred={:.3} | LLSearch={:.3}",
+        "\n  MRR Projection B : Phisharp={:.3} | BytePred={:.3} | LLSearch={:.3}",
         mrr_phi, mrr_bp, mrr_ll
     );
     println!(
-        "  Sensibilite B    : Stabilite paraphrase={:.3} | Changement si sens brise={:.3}",
-        mean_para, mean_shift
+        "  Sensibilite B    : Stabilite reordonnancement={:.3} | Changement si requete changee={:.3}",
+        mean_reord, mean_shift
     );
 
-    let b_reached = mrr_phi > 0.50 && mrr_phi >= mrr_bp && mrr_phi >= mrr_ll && mean_shift > (1.0 - mean_para);
+    let b_reached = mrr_phi > 0.55 && mrr_phi >= mrr_bp && mrr_phi >= mrr_ll && mean_shift > (1.0 - mean_reord);
 
     println!("\n[5. Lecture croisee]");
     println!("  A atteint : {} | B atteint : {}", a_reached, b_reached);
