@@ -282,8 +282,15 @@ fn logprob(t: &mut Tape, f: &Fwd, op: usize, site: usize, na: usize, allow_ref: 
         let mv = t.input(1, N_OPS, &m);
         t.add(f.policy, mv)
     };
+
     let lp = t.log_softmax_rows(pol);
-    let o = t.gather_rows(lp, &[op]);
+    // (1,N_OPS) est une LIGNE : on sélectionne une colonne par produit avec un
+    // one-hot colonna, jamais par gather_rows. Même motif que la colonne NULL
+    // dans phi::evaluate.
+    let mut sel = vec![0.0f32; N_OPS];
+    sel[op] = 1.0;
+    let selv = t.input(N_OPS, 1, &sel);
+    let o = t.matmul(lp, selv);
     let lpo = t.sum_all(o);
 
     // log-softmax sur les sites sans transposition : le max est une constante
@@ -477,5 +484,32 @@ mod tests {
         let _ = search(&p, &b, &v, &w, &small(), 17, Some(&mut g));
         let n: f32 = g.iter().map(|x| x.iter().map(|v| v.abs()).sum::<f32>()).sum();
         assert!(n > 0.0, "le signal φ_sharp doit produire un gradient");
+    }
+
+#[test]
+    fn logprob_pour_chaque_operateur() {
+        let (_b, v, w, p) = setup();
+        let mut t = Tape::new();
+        let f = substrate::forward(&mut t, &p, &v, &w, &Itv::default());
+        for op in 0..N_OPS {
+            let lp = logprob(&mut t, &f, op, 0, w.na, true);
+            let x = t.scalar_of(lp);
+            assert!(x.is_finite(), "op {}", op);
+            assert!(x <= 0.0, "log-prob positif pour op {} : {}", op, x);
+        }
+        let lp = logprob(&mut t, &f, OP_BIND, 0, w.na, false);
+        assert!(t.scalar_of(lp).is_finite());
+    }
+
+    #[test]
+    fn grad_politique_non_nul() {
+        let (_b, v, w, p) = setup();
+        let mut t = Tape::new();
+        let f = substrate::forward(&mut t, &p, &v, &w, &Itv::default());
+        let lp = logprob(&mut t, &f, OP_COMPOSE, 1 % w.na, w.na, true);
+        let loss = t.neg(lp);
+        let g = t.backward(loss, p.nblocks());
+        let n: f32 = g[substrate::B_WPI].iter().map(|x| x.abs()).sum();
+        assert!(n > 0.0, "la politique doit recevoir un gradient");
     }
 }
