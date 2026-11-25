@@ -33,9 +33,7 @@ pub const NUM_PARAMS: usize = OFF_OUT + REL_DIM * DIM; // 1492
 const MAGIC: &[u8; 4] = b"PHIS";
 const VERSION: u32 = 4;
 
-/// Substrat relationnel brut (format CSR) extrait de la matrice d'auto-égalité M(a,b) = [a!=b & E[a]==E[b]].
-/// Aucun concept sémantique (bigramme, miroir, pas arithmétique...) n'est codé en dur :
-/// chaque lien stocke uniquement le voisinage brut autour de (t, j) dans M et l'écart relatif.
+/// Substrat relationnel brut extrait de la matrice d'auto-égalité M(a,b) = [a!=b & E[a]==E[b]].
 #[derive(Clone, Debug)]
 pub struct RawSubstrate {
     pub len: usize,
@@ -51,8 +49,10 @@ impl RawSubstrate {
         let max_edges = 12usize;
         let log_cap = (n.min(win_cap).max(2) as f32).ln();
 
-        let m = |a: isize, b: isize| -> f32 {
-            if a >= 0 && b >= 0 && a != b {
+        // Exclut le self-swap trivial (j, t) pour qu'une lettre double isolée (ex: "ss")
+        // ne simule pas une symétrie miroir.
+        let m_nb = |a: isize, b: isize, ti: isize, ji: isize| -> f32 {
+            if a >= 0 && b >= 0 && a != b && !(a == ji && b == ti) {
                 let au = a as usize;
                 let bu = b as usize;
                 if au < n && bu < n && bytes[au] == bytes[bu] {
@@ -79,14 +79,14 @@ impl RawSubstrate {
             for j in lo..hi {
                 if j != t && bytes[j] == b {
                     let ji = j as isize;
-                    let neigh = m(ti - 1, ji - 1)
-                        + m(ti + 1, ji + 1)
-                        + m(ti - 2, ji - 2)
-                        + m(ti + 2, ji + 2)
-                        + m(ti - 1, ji + 1)
-                        + m(ti + 1, ji - 1)
-                        + m(ti - 2, ji + 2)
-                        + m(ti + 2, ji - 2);
+                    let neigh = m_nb(ti - 1, ji - 1, ti, ji)
+                        + m_nb(ti + 1, ji + 1, ti, ji)
+                        + m_nb(ti - 2, ji - 2, ti, ji)
+                        + m_nb(ti + 2, ji + 2, ti, ji)
+                        + m_nb(ti - 1, ji + 1, ti, ji)
+                        + m_nb(ti + 1, ji - 1, ti, ji)
+                        + m_nb(ti - 2, ji + 2, ti, ji)
+                        + m_nb(ti + 2, ji - 2, ti, ji);
                     candidates.push((j, t.abs_diff(j), neigh));
                 }
             }
@@ -94,7 +94,6 @@ impl RawSubstrate {
             let match_count = candidates.len();
             deg.push(2.0 * (match_count as f32 / span_len as f32) - 1.0);
 
-            // Garde au plus 12 liens : 6 les plus proches + 6 au voisinage le plus dense
             let mut selected: Vec<usize> = Vec::with_capacity(max_edges.min(match_count));
             if match_count <= max_edges {
                 for &(j, _, _) in &candidates {
@@ -123,16 +122,16 @@ impl RawSubstrate {
                 let log_dist = (dist.ln() / log_cap).clamp(0.0, 1.0);
                 let dir = if j < t { -1.0 } else { 1.0 };
                 edges.push([
-                    m(ti - 1, ji - 1),
-                    m(ti + 1, ji + 1),
-                    m(ti - 2, ji - 2),
-                    m(ti + 2, ji + 2),
-                    m(ti - 1, ji + 1),
-                    m(ti + 1, ji - 1),
-                    m(ti - 2, ji + 2),
-                    m(ti + 2, ji - 2),
-                    m(ti - 1, ji),
-                    m(ti, ji - 1),
+                    m_nb(ti - 1, ji - 1, ti, ji),
+                    m_nb(ti + 1, ji + 1, ti, ji),
+                    m_nb(ti - 2, ji - 2, ti, ji),
+                    m_nb(ti + 2, ji + 2, ti, ji),
+                    m_nb(ti - 1, ji + 1, ti, ji),
+                    m_nb(ti + 1, ji - 1, ti, ji),
+                    m_nb(ti - 2, ji + 2, ti, ji),
+                    m_nb(ti + 2, ji - 2, ti, ji),
+                    m_nb(ti - 1, ji, ti, ji),
+                    m_nb(ti, ji - 1, ti, ji),
                     log_dist,
                     dir,
                 ]);
@@ -146,6 +145,75 @@ impl RawSubstrate {
             edges,
             deg,
         }
+    }
+
+    /// Isole la sous-zone intrinsèquement 2-connectée du graphe d'auto-égalité (sans voir Q).
+    /// Sur un moule brut, renvoie [0..n]. Sur un moule étiqueté, détache automatiquement
+    /// le bord passif (préfixe ou suffixe) comme référent induit.
+    pub fn intrinsic_causal_core(&self) -> (usize, usize, Option<(usize, usize)>) {
+        let n = self.len;
+        if n < 12 {
+            return (0, n, None);
+        }
+
+        let mut pref = vec![0.0f32; n + 1];
+        for t in 0..n {
+            let mut max_supp = 0.0f32;
+            for feat in &self.edges[self.offsets[t]..self.offsets[t + 1]] {
+                let supp = feat[0] + feat[1] + feat[4] + feat[5];
+                if supp > max_supp {
+                    max_supp = supp;
+                }
+            }
+            let act = (max_supp / 2.0).min(1.0);
+            pref[t + 1] = pref[t] + (act - 0.35);
+        }
+
+        let min_w = (n / 2).max(10).min(n);
+        let step = if n > 256 { (n / 64).max(1) } else { 1 };
+        let mut best_s = 0usize;
+        let mut best_e = n;
+        let mut best_score = f32::NEG_INFINITY;
+
+        let mut s = 0usize;
+        while s + min_w <= n {
+            let mut e = s + min_w;
+            while e <= n {
+                let sc = pref[e] - pref[s];
+                if sc > best_score {
+                    best_score = sc;
+                    best_s = s;
+                    best_e = e;
+                }
+                if e == n {
+                    break;
+                }
+                e = (e + step).min(n);
+            }
+            s += step;
+        }
+
+        if best_score <= 0.0 {
+            return (0, n, None);
+        }
+
+        // Ne grignote pas 1 ou 2 octets de bord sur un moule brut
+        if best_s <= 2 {
+            best_s = 0;
+        }
+        if n.saturating_sub(best_e) <= 2 {
+            best_e = n;
+        }
+
+        let referent = if best_s >= 3 && n.saturating_sub(best_e) <= 2 {
+            Some((0, best_s))
+        } else if n.saturating_sub(best_e) >= 3 && best_s <= 2 {
+            Some((best_e, n))
+        } else {
+            None
+        };
+
+        (best_s, best_e, referent)
     }
 }
 
@@ -176,8 +244,7 @@ impl PhiGraph {
         Self { weights }
     }
 
-    /// Capteur relationnel 100% appris : transforme le substrat d'auto-égalité brut en
-    /// champ relationnel normalisé (RMS) afin d'empêcher tout triche par réduction d'amplitude.
+    /// Capteur relationnel 100% appris avec normalisation RMS.
     pub fn encode_relations(&self, sub: &RawSubstrate) -> Vec<[f32; REL_DIM]> {
         let w = &self.weights;
         let n = sub.len;
@@ -234,7 +301,7 @@ impl PhiGraph {
             let mut row = [0.0f32; REL_DIM];
             for r in 0..REL_DIM {
                 let base = OFF_REL_NODE_W + r * NODE_IN;
-                let mut acc = w[OFF_REL_NODE_B + r];
+                let mut acc = 0.25 * w[OFF_REL_NODE_B + r];
                 for k in 0..NODE_IN {
                     acc += w[base + k] * node_in[k];
                 }
@@ -438,7 +505,7 @@ impl PhiGraph {
         if version != VERSION || count != NUM_PARAMS || data.len() != 12 + count * 4 {
             return Err(io::Error::new(
                 ErrorKind::InvalidData,
-                "Version ou taille du modèle .phis incompatible (ré-entraîne avec v0.4)",
+                "Version ou taille du modèle .phis incompatible (ré-entraîne avec v0.4.1)",
             ));
         }
         let mut weights = Vec::with_capacity(count);
