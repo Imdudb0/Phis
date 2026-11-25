@@ -1,23 +1,40 @@
-[1m[92m    Finished[0m `release` profile [optimized] target(s) in 0.01s
-[1m[92m     Running[0m `target/release/phisharp ask --model out/sharp.phis --file out/gram.eff`
-=== PHISHARP ABDUCTION REPORT (v0.2) ===
-Effet (E)       : 'out/gram.eff' (40 octets)
-φ_sharp         : +0.6398
-  Générativité  : 0.6502  (résidu moyen = 0.1957)
-  Discrimination: 0.7718
-  Projection    : 0.7602  [réfut=0.542 | dépl=0.896 | abst=0.843]
-  Intégration   : 0.5242  (MIP exacte sur 31 coupes : perte=0.2122, coupe {0,2,3,4,5} | {1})
+[1m[33mwarning[0m[1m: field `mean_residual` is never read[0m
+  [1m[94m--> [0msrc/phi.rs:50:9
+   [1m[94m|[0m
+[1m[94m45[0m [1m[94m|[0m pub struct CompositePhi {
+   [1m[94m|[0m            [1m[94m------------[0m [1m[94mfield in this struct[0m
+[1m[94m...[0m
+[1m[94m50[0m [1m[94m|[0m     pub mean_residual: f32,
+   [1m[94m|[0m         [1m[33m^^^^^^^^^^^^^[0m
+   [1m[94m|[0m
+   [1m[94m= [0m[1mnote[0m: `CompositePhi` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+   [1m[94m= [0m[1mnote[0m: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
 
-Trajectoire abductive (résidu) :
-  t0=0.675 -> t1=0.588 -> t2=0.539 -> t3=0.524 -> t4=0.405 -> t5=0.220 -> t6=0.196  (gain/t0=+0.710, rebond=0.0000)
+[1m[33mwarning[0m: `phisharp` (bin "phisharp") generated 1 warning
+[1m[92m    Finished[0m `release` profile [optimized] target(s) in 0.03s
+[1m[92m     Running[0m `target/release/phisharp ask --model out/sharp.phis --file out/comp.eff`
+=== PHISHARP ABDUCTION REPORT (v0.3 — Projection Référentielle) ===
+Effet (E)       : 'out/comp.eff' (233 octets, 5 blocs détectés)
+Cohérence scène : sélectivité=0.4501 (R_top=0.809 vs R_rest=0.443, paire [1]<->[2])
+φ_sharp(cible)  : +0.3382  [Gen=0.392 Disc=0.562 Proj=0.834 IIT=0.084, res=0.4261]
 
-Noyau causal auto-spécifié (offset 32, densité explicative max) :
-  ASCII : "o|,"9nf}"
-  HEX   : 6f 7c 2c 22 39 6e 66 7d
+Bloc cible [4] :
+  "jvzvqjvzvtjvzvajvzvljvzvbjvzv"
 
-Zones de tension (résidu maximal dans perceived.eff) :
-  offset  18 | 0x24 '$' | résidu = 1.4620
-  offset  12 | 0x7d '}' | résidu = 1.3319
-  offset  21 | 0x22 '"' | résidu = 0.4150
-  offset   9 | 0x39 '9' | résidu = 0.4150
-  offset  27 | 0x39 '9' | résidu = 0.4097
+Projection référentielle vers les moules de perceived.eff :
+  #1 bloc [3] | résonance=0.6421 | err_croisée=0.3937 | cos=+0.960 | octets_communs=0%
+     moule : "MOLD_SHARED: QBDB;QBDB=QBDB0QBDB4QBDBFQBDB"
+     noyau : "D_SHARED: QBDB;QBD"
+  #2 bloc [0] | résonance=0.5982 | err_croisée=0.4278 | cos=+0.835 | octets_communs=0%
+     moule : "MOLD_ARITHMETIC: '()*+,'()*+,'()*+,'()*+,'()*+,'()*+"
+     noyau : "LD_ARITHMETIC: '()*+,'("
+     référent induit (auto-spécifié) : ")*+,'()*+,'()*+,'()*+,'()*+"
+  #3 bloc [1] | résonance=0.5737 | err_croisée=0.4014 | cos=+0.592 | octets_communs=0%
+     moule : "MOLD_NESTED: VQTXC@N'NP?!*2)VQTXC@N'NP?!*2)VQTXC@N'N"
+     noyau : "OLD_NESTED: VQTXC@N'NP?!*2)VQTX"
+  #4 bloc [2] | résonance=0.5595 | err_croisée=0.4215 | cos=+0.583 | octets_communs=0%
+     moule : "MOLD_GRAMMAR: GH-!4Y)>4GH-@4Y)>4Z$?4GH-!4GH-!4Y)>4GH-@"
+     noyau : "OLD_GRAMMAR: GH-!4Y)>4GH"
+
+Explication projetée (alphabet de E, marge=+0.0438) :
+  MOLD_SHARED: QBDB;QBDB=QBDB0QBDB4QBDBFQBDB
