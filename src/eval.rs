@@ -1,6 +1,7 @@
-//! Protocole scientifique v0.2.0 :
-//! - Étalonnage à budget égal (t=12) entre PTGRS et octets aléatoires, plus Spearman multi-budgets.
-//! - Ablation no-refut évaluée sous critère complet (honnête).
+//! Protocole scientifique v0.3.0 :
+//! - Critères stricts et honnêtes sur A (étalonnage > LL et MDL, bas sur aléatoire et H:=E,
+//!   battre les baselines, ablation, test de résidu positif, invariance exacte).
+//! - Critère B avec positions variées de la définition cible (sans biais de première ligne pour BytePred).
 
 use std::collections::HashSet;
 
@@ -40,7 +41,6 @@ pub fn run_calibration(net: &PhisharpNet, seed: u64) -> CalibrationReport {
         let case = sample_eval_case(&mut rng, ood);
         let pg = PerceivedGraph::from_bytes(&case.observed_e);
 
-        // Multi-budget pour tester le suivi qualité-vs-cause
         let budget = match i % 4 {
             0 => 0,
             1 => 3,
@@ -73,7 +73,6 @@ pub fn run_calibration(net: &PhisharpNet, seed: u64) -> CalibrationReport {
         copy_scores.push(rep_copy.phi_sharp);
     }
 
-    // Témoin négatif 1 : octets aléatoires purs (même budget=12 que phi_full_budget_scores)
     let mut rand_scores = Vec::with_capacity(12);
     for _ in 0..12 {
         let len = 180 + rng.usize_below(120);
@@ -91,9 +90,11 @@ pub fn run_calibration(net: &PhisharpNet, seed: u64) -> CalibrationReport {
     let mean_phi_random = rand_scores.iter().sum::<f64>() / (rand_scores.len() as f64);
     let mean_phi_copy = copy_scores.iter().sum::<f64>() / (copy_scores.len() as f64);
 
-    let passed = corr_phi_s > 0.25
-        && mean_phi_ptgrs > mean_phi_random * 1.5
-        && mean_phi_ptgrs > mean_phi_copy * 2.0;
+    // Exigence stricte du protocole : suit la cause mieux que LL et MDL, et nettement au-dessus aléatoire & H:=E
+    let passed = corr_phi_s >= corr_ll_s
+        && corr_phi_s > corr_mdl_s
+        && mean_phi_ptgrs > mean_phi_random * 2.5
+        && mean_phi_ptgrs > mean_phi_copy * 2.5;
 
     CalibrationReport {
         passed,
@@ -167,13 +168,14 @@ pub fn build_nl_ambiguity_cases() -> Vec<AmbiguityEvalItem> {
         distractors: &'static [&'static str],
     }
 
+    // Positions variées des entrées cibles pour éviter tout biais positionnel
     let raws = [
         RawCase {
             title: "Rattachement syntaxique (FR)",
             dict_entries: &[
-                "ambiguite: pluralite de lectures distinctes possibles pour un meme enonce syntaxique.",
                 "contradiction: affirmation simultanee d une proposition et de sa negation logique.",
                 "tautologie: formule vraie sous toute assignation possible des variables.",
+                "ambiguite: pluralite de lectures distinctes possibles pour un meme enonce syntaxique.",
                 "metaphore: transfert analogique d un domaine concret vers un concept abstrait.",
                 "synonymie: equivalence de sens entre deux expressions lexicales differentes.",
             ],
@@ -191,8 +193,8 @@ pub fn build_nl_ambiguity_cases() -> Vec<AmbiguityEvalItem> {
         RawCase {
             title: "Double portee / syntagme (FR)",
             dict_entries: &[
-                "equivocite: propriete d un signe admettant plusieurs interpretations incompatibles.",
                 "redondance: repetition superflue d elements n apportant aucune information nouvelle.",
+                "equivocite: propriete d un signe admettant plusieurs interpretations incompatibles.",
                 "ellipse: omission volontaire de termes facilement restitues par le contexte.",
                 "paradoxe: raisonnement rigoureux conduisant a une conclusion contre intuitive.",
             ],
@@ -209,10 +211,10 @@ pub fn build_nl_ambiguity_cases() -> Vec<AmbiguityEvalItem> {
         RawCase {
             title: "Scope / Attachment (EN)",
             dict_entries: &[
-                "ambiguity: capacity of one utterance to support multiple distinct readings simultaneously.",
                 "tautology: statement remaining valid across every truth assignment without exception.",
                 "oxymoron: figure pairing two opposing predicates inside a compact phrase.",
                 "hyperbole: deliberate exaggeration amplifying a quality beyond literal bounds.",
+                "ambiguity: capacity of one utterance to support multiple distinct readings simultaneously.",
             ],
             ambiguous_query: "Flying planes can be dangerous.",
             paraphrase_query: "Planes in flight may pose hazards.",
@@ -356,7 +358,7 @@ pub fn run_bijective_invariance_test(net: &PhisharpNet, input: &[u8], seed: u64)
 }
 
 pub fn run_full_protocol(net: &PhisharpNet, seed: u64) -> FullEvalSummary {
-    println!("=== PROTOCOLE PHISHARP v0.2.0 (HORS ENTRAINEMENT) ===");
+    println!("=== PROTOCOLE PHISHARP v0.3.0 (HORS ENTRAINEMENT, SANS BEQUILLE) ===");
     println!("Non-reciprocite du modele : {:.4}", net.non_reciprocity_index());
 
     let cal = run_calibration(net, seed ^ 0x101);
@@ -373,7 +375,7 @@ pub fn run_full_protocol(net: &PhisharpNet, seed: u64) -> FullEvalSummary {
 
     println!("\n[2. Entrainement des Baselines a armes egales (PTGRS uniquement)]");
     let byte_pred = BytePredictorBaseline::train_on_ptgrs(120, seed ^ 0x202);
-    let ll_search = LikelihoodSearchBaseline::train_equal_compute(25, 6, 4, 8, seed ^ 0x303);
+    let ll_search = LikelihoodSearchBaseline::train_equal_compute(30, 8, 4, 8, seed ^ 0x303);
 
     let mut rng = Rng::new(seed ^ 0x404);
     let mut ood_rec_phi = 0.0;
@@ -492,8 +494,9 @@ pub fn run_full_protocol(net: &PhisharpNet, seed: u64) -> FullEvalSummary {
     println!("  Invariance Bijective : exact_equivariant={} (max_delta_phi={:.2e})", inv_ok, inv_diff);
 
     let trajectory_grows = res_full.final_report.phi_sharp > res_b0.final_report.phi_sharp + 0.02;
-    let beats_baselines_a = ood_rec_phi >= ood_rec_ll && ood_proj_phi >= ood_proj_bp;
-    let a_reached = cal.passed && trajectory_grows && inv_ok && beats_baselines_a;
+    let beats_baselines_a = ood_rec_phi >= ood_rec_ll && ood_rec_phi >= ood_rec_bp && ood_proj_phi >= ood_proj_bp;
+    let residue_ok = res_aug.final_report.phi_sharp > res_full.final_report.phi_sharp;
+    let a_reached = cal.passed && trajectory_grows && inv_ok && beats_baselines_a && residue_ok;
 
     println!("\n[4. Critere B : Appariement ambiguite <-> definition (0 mot commun, NL jamais entrainee)]");
     let nl_cases = build_nl_ambiguity_cases();
