@@ -1,4 +1,4 @@
-[1m[92m    Finished[0m `release` profile [optimized] target(s) in 0.02s
+[1m[92m    Finished[0m `release` profile [optimized] target(s) in 0.03s
 [1m[92m     Running[0m `target/release/phisharp sample --out out/synth.txt --family symmetric`
 Effet généré dans 'out/synth.txt' (16 octets, cause cachée = symmetric)
   ASCII : N:z\\z:NN:z\\z:N
