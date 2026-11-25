@@ -791,7 +791,7 @@ impl Adam {
                 self.v[b][t] = self.b2 * self.v[b][t] + (1.0 - self.b2) * g * g;
                 let mh = self.m[b][t] / c1;
                 let vh = self.v[b][t] / c2;
-                p.data[b][t] += self.lr * mh / (vh.sqrt() + self.eps);
+                p.data[b][t] -= self.lr * mh / (vh.sqrt() + self.eps);
             }
         }
     }
@@ -843,5 +843,17 @@ mod tests {
         let b = t.input(1, 4, &[0.1, 0.2, 0.3, 0.4]);
         let d = t.emd(a, b);
         assert!(t.scalar_of(d).abs() < 1e-6);
+    }
+
+    #[test]
+    fn adam_descend() {
+        let mut p = Params::default();
+        let b = p.block(1, 1, &[1.0]);
+        let mut opt = Adam::new(&p, 0.05);
+        for _ in 0..200 {
+            let g = vec![vec![2.0 * p.data[b][0]]];
+            opt.step(&mut p, &g);
+        }
+        assert!(p.data[b][0].abs() < 0.05, "Adam doit descendre : x = {}", p.data[b][0]);
     }
 }
