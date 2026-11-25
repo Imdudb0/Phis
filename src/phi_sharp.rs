@@ -268,7 +268,7 @@ pub fn score_generativity(h: &HypothesisState, pg: &PerceivedGraph) -> f64 {
     let mean_ll1 = ll1 / count1.max(1.0);
 
     let mut ll2 = 0.0;
-    let mut count2 = 0.0;
+    let mut count2: f64 = 0.0;
     if pg.sym_seq.len() >= 3 {
         let mut trans2 = vec![0.0; k * k];
         for u in 0..k {
