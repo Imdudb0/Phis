@@ -35,7 +35,7 @@ impl BytePredictorBaseline {
             let loss_at = |l: &[f64; 4]| -> f64 {
                 let w = softmax4(l);
                 let mut nll = 0.0;
-                let mut cnt = 0.0;
+                let mut cnt: f32 = 0.0;
                 for i in 1..pg.sym_seq.len() {
                     let u = pg.sym_seq[i - 1];
                     let v = pg.sym_seq[i];
