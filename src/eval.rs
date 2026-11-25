@@ -1,14 +1,6 @@
-//! Protocole scientifique complet de lecture des résultats (falsifiable, hors entraînement).
-//!
-//! Implémente chaque barreau et chaque test spécifié :
-//! 1. Étalonnage (PTGRS C connue post-hoc) : φ_sharp vs vraisemblance vs MDL, octets aléatoires, H := E.
-//! 2. Échelle d'évaluation : PTGRS OOD -> Mini-dictionnaires PTGRS -> Mini-langue connue -> Vrai dictionnaire NL.
-//! 3. Critère A : Générativité/Discrimination/Projection (min & prod), courbe anytime qualité-vs-budget,
-//!    ablation budget=0 & sans réfutation, test de résidu, invariance exacte sous renommage bijectif.
-//! 4. Critère B : Appariement phrase ambiguë <-> définition de l'ambiguïté SANS MOT COMMUN (vérifié
-//!    automatiquement) parmi des distracteurs (rang continu + MRR), sensibilité sémantique vs paraphrase,
-//!    paquet d'évaluation aveugle.
-//! 5. Baselines à armes égales (prédicteur d'octets + recherche par vraisemblance) + Tableau croisé A vs B.
+//! Protocole scientifique v0.2.0 :
+//! - Étalonnage à budget égal (t=12) entre PTGRS et octets aléatoires, plus Spearman multi-budgets.
+//! - Ablation no-refut évaluée sous critère complet (honnête).
 
 use std::collections::HashSet;
 
@@ -38,6 +30,7 @@ pub fn run_calibration(net: &PhisharpNet, seed: u64) -> CalibrationReport {
     let n_cases = 24;
     let mut cause_scores = Vec::with_capacity(n_cases);
     let mut phi_scores = Vec::with_capacity(n_cases);
+    let mut phi_full_budget_scores = Vec::with_capacity(n_cases);
     let mut ll_scores = Vec::with_capacity(n_cases);
     let mut mdl_scores = Vec::with_capacity(n_cases);
     let mut copy_scores = Vec::with_capacity(n_cases);
@@ -47,7 +40,7 @@ pub fn run_calibration(net: &PhisharpNet, seed: u64) -> CalibrationReport {
         let case = sample_eval_case(&mut rng, ood);
         let pg = PerceivedGraph::from_bytes(&case.observed_e);
 
-        // On évalue sur des budgets variés (0, 4, 8, 12) pour couvrir toute la plage de qualité
+        // Multi-budget pour tester le suivi qualité-vs-cause
         let budget = match i % 4 {
             0 => 0,
             1 => 3,
@@ -63,6 +56,9 @@ pub fn run_calibration(net: &PhisharpNet, seed: u64) -> CalibrationReport {
                 max_explain_len: 128,
             },
         );
+        let res_full = run_abductive_search(net, &case.observed_e, SearchConfig::default());
+        phi_full_budget_scores.push(res_full.final_report.phi_sharp);
+
         let rec = cause_recovery_score(&case, &res.final_state.sym_trans, &pg.unique_bytes);
         let ll = normalized_log_likelihood(&res.final_state, &pg);
         let mdl = mdl_diagnostic_score(&res.final_state, &pg);
@@ -77,7 +73,7 @@ pub fn run_calibration(net: &PhisharpNet, seed: u64) -> CalibrationReport {
         copy_scores.push(rep_copy.phi_sharp);
     }
 
-    // Témoin négatif 1 : octets aléatoires purs
+    // Témoin négatif 1 : octets aléatoires purs (même budget=12 que phi_full_budget_scores)
     let mut rand_scores = Vec::with_capacity(12);
     for _ in 0..12 {
         let len = 180 + rng.usize_below(120);
@@ -91,14 +87,13 @@ pub fn run_calibration(net: &PhisharpNet, seed: u64) -> CalibrationReport {
     let corr_mdl_s = spearman_rank_correlation(&mdl_scores, &cause_scores);
     let corr_phi_p = pearson_correlation(&phi_scores, &cause_scores);
 
-    let mean_phi_ptgrs = phi_scores.iter().sum::<f64>() / (phi_scores.len() as f64);
+    let mean_phi_ptgrs = phi_full_budget_scores.iter().sum::<f64>() / (phi_full_budget_scores.len() as f64);
     let mean_phi_random = rand_scores.iter().sum::<f64>() / (rand_scores.len() as f64);
     let mean_phi_copy = copy_scores.iter().sum::<f64>() / (copy_scores.len() as f64);
 
-    // Critère d'étalonnage : φ_sharp suit la récupération de cause, reste bas sur aléatoire et H := E
-    let passed = corr_phi_s > 0.15
-        && mean_phi_ptgrs > mean_phi_random * 1.15
-        && mean_phi_ptgrs > mean_phi_copy * 1.5;
+    let passed = corr_phi_s > 0.25
+        && mean_phi_ptgrs > mean_phi_random * 1.5
+        && mean_phi_ptgrs > mean_phi_copy * 2.0;
 
     CalibrationReport {
         passed,
@@ -112,7 +107,6 @@ pub fn run_calibration(net: &PhisharpNet, seed: u64) -> CalibrationReport {
     }
 }
 
-/// Génère le barreau 3 : Mini-langue à grammaire compositionnelle connue (jamais entraînée).
 fn sample_mini_lang_cases(rng: &mut Rng, count: usize) -> Vec<Vec<u8>> {
     let nouns = ["kora", "velu", "tano", "mira", "soli", "neva"];
     let verbs = ["plix", "drok", "zami", "frel"];
@@ -121,7 +115,6 @@ fn sample_mini_lang_cases(rng: &mut Rng, count: usize) -> Vec<Vec<u8>> {
 
     for _ in 0..count {
         let mut buf = Vec::new();
-        // Règles grammaticales implicites : S -> NP VP ; NP -> N | MOD N ; VP -> V NP
         for _ in 0..8 {
             let n1 = nouns[rng.usize_below(nouns.len())];
             let m1 = mods[rng.usize_below(mods.len())];
@@ -130,7 +123,6 @@ fn sample_mini_lang_cases(rng: &mut Rng, count: usize) -> Vec<Vec<u8>> {
             let line = format!("{} {} {} {};\n", m1, n1, v1, n2);
             buf.extend_from_slice(line.as_bytes());
         }
-        // Requête structurelle à résoudre dans la mini-langue
         let qn = nouns[rng.usize_below(nouns.len())];
         let qv = verbs[rng.usize_below(verbs.len())];
         let qm = mods[rng.usize_below(mods.len())];
@@ -140,9 +132,6 @@ fn sample_mini_lang_cases(rng: &mut Rng, count: usize) -> Vec<Vec<u8>> {
     out
 }
 
-/// Jeu d'évaluation du Critère B (jamais vu à l'entraînement !).
-/// Contient un mini-dictionnaire de définitions + une phrase ambiguë sans mot commun avec
-/// la définition de l'ambiguïté, plus des distracteurs.
 #[derive(Clone, Debug)]
 pub struct AmbiguityEvalItem {
     pub title: &'static str,
@@ -239,7 +228,6 @@ pub fn build_nl_ambiguity_cases() -> Vec<AmbiguityEvalItem> {
 
     let mut cases = Vec::new();
     for r in raws {
-        // Vérification automatique : ZÉRO mot commun entre la phrase ambiguë et la définition cible !
         let overlap = verify_zero_common_words(r.ambiguous_query, r.target_def);
         assert_eq!(
             overlap, 0,
@@ -255,7 +243,6 @@ pub fn build_nl_ambiguity_cases() -> Vec<AmbiguityEvalItem> {
         };
 
         let perceived_eff = build_eff(r.dict_entries, r.ambiguous_query);
-        // Paraphrase + réordonnancement des entrées du dictionnaire (préserve le sens)
         let mut reordered: Vec<&str> = r.dict_entries.to_vec();
         reordered.reverse();
         let paraphrase_eff = build_eff(&reordered, r.paraphrase_query);
@@ -274,14 +261,11 @@ pub fn build_nl_ambiguity_cases() -> Vec<AmbiguityEvalItem> {
     cases
 }
 
-/// Similarité relationnelle / transitionnelle entre les octets émis et une définition candidate
-/// (utilisée uniquement pour classer les candidats en évaluation B, sans jamais servir à l'entraînement).
 fn relational_alignment_score(output: &[u8], candidate: &str) -> f64 {
     let c_bytes = candidate.as_bytes();
     if output.is_empty() || c_bytes.is_empty() {
         return 0.0;
     }
-    // Recouvrement normalisé des bigrammes et trigrammes d'octets ordonnés
     let mut big_c = HashSet::new();
     for w in c_bytes.windows(2) {
         big_c.insert((w[0], w[1]));
@@ -338,8 +322,6 @@ pub struct FullEvalSummary {
     pub mrr_ll_search: f64,
 }
 
-/// Test d'invariance stricte sous renommage bijectif d'octets :
-/// φ_sharp(t, π(E)) == φ_sharp(t, E) et π^{-1}(sortie(π(E))) == sortie(E).
 pub fn run_bijective_invariance_test(net: &PhisharpNet, input: &[u8], seed: u64) -> (bool, f64) {
     let mut rng = Rng::new(seed);
     let mut perm: Vec<u8> = (0u8..=255u8).collect();
@@ -374,10 +356,9 @@ pub fn run_bijective_invariance_test(net: &PhisharpNet, input: &[u8], seed: u64)
 }
 
 pub fn run_full_protocol(net: &PhisharpNet, seed: u64) -> FullEvalSummary {
-    println!("=== PROTOCOLE PHISHARP (HORS ENTRAINEMENT) ===");
+    println!("=== PROTOCOLE PHISHARP v0.2.0 (HORS ENTRAINEMENT) ===");
     println!("Non-reciprocite du modele : {:.4}", net.non_reciprocity_index());
 
-    // 1. Étalonnage
     let cal = run_calibration(net, seed ^ 0x101);
     println!("\n[1. Etalonnage PTGRS (C connue post-hoc)]");
     println!(
@@ -385,17 +366,15 @@ pub fn run_full_protocol(net: &PhisharpNet, seed: u64) -> FullEvalSummary {
         cal.corr_phi_vs_cause_spearman, cal.corr_ll_vs_cause_spearman, cal.corr_mdl_vs_cause_spearman
     );
     println!(
-        "  phi_sharp(PTGRS)={:.4} | phi_sharp(octets aleatoires)={:.4} | phi_sharp(H:=E)={:.4}",
+        "  phi_sharp(PTGRS, b=12)={:.4} | phi_sharp(octets aleatoires, b=12)={:.4} | phi_sharp(H:=E)={:.4}",
         cal.mean_phi_ptgrs, cal.mean_phi_random_bytes, cal.mean_phi_trivial_copy
     );
     println!("  Verdict etalonnage : {}", if cal.passed { "VALIDE" } else { "ECHOUE (A illisible)" });
 
-    // Baselines à armes égales sur PTGRS
     println!("\n[2. Entrainement des Baselines a armes egales (PTGRS uniquement)]");
     let byte_pred = BytePredictorBaseline::train_on_ptgrs(120, seed ^ 0x202);
     let ll_search = LikelihoodSearchBaseline::train_equal_compute(25, 6, 4, 8, seed ^ 0x303);
 
-    // 3. Échelle d'évaluation A (OOD -> Mini-dict -> Mini-langue)
     let mut rng = Rng::new(seed ^ 0x404);
     let mut ood_rec_phi = 0.0;
     let mut ood_rec_bp = 0.0;
@@ -440,7 +419,6 @@ pub fn run_full_protocol(net: &PhisharpNet, seed: u64) -> FullEvalSummary {
     ood_proj_bp /= nf;
     ood_proj_ll /= nf;
 
-    // Barreau 2 : Mini-dictionnaires PTGRS
     let mut dict_phi = 0.0;
     let mut dict_rec_phi = 0.0;
     for _ in 0..8 {
@@ -453,7 +431,6 @@ pub fn run_full_protocol(net: &PhisharpNet, seed: u64) -> FullEvalSummary {
     dict_phi /= 8.0;
     dict_rec_phi /= 8.0;
 
-    // Barreau 3 : Mini-langue connue
     let ml_cases = sample_mini_lang_cases(&mut rng, 6);
     let mut ml_phi = 0.0;
     for mc in &ml_cases {
@@ -477,7 +454,6 @@ pub fn run_full_protocol(net: &PhisharpNet, seed: u64) -> FullEvalSummary {
     println!("  Mini-Dict PTGRS : phi_sharp={:.3}, cause_rec={:.3}", dict_phi, dict_rec_phi);
     println!("  Mini-Langue     : phi_sharp={:.3}", ml_phi);
 
-    // Courbe Anytime, Ablations, Résidu, Invariance
     let probe_case = sample_eval_case(&mut rng, true);
     let res_full = run_abductive_search(net, &probe_case.observed_e, SearchConfig::default());
     let res_b0 = run_abductive_search(
@@ -503,11 +479,10 @@ pub fn run_full_protocol(net: &PhisharpNet, seed: u64) -> FullEvalSummary {
 
     let aug_e = build_residue_augmentation(&probe_case.observed_e, &res_full.final_report);
     let res_aug = run_abductive_search(net, &aug_e, SearchConfig::default());
-
     let (inv_ok, inv_diff) = run_bijective_invariance_test(net, &probe_case.observed_e, seed ^ 0x777);
 
     println!("  Ablations :");
-    println!("    budget=12 : phi_sharp={:.4}, sens_min={:.4}", res_full.final_report.phi_sharp, res_full.final_report.sens_min);
+    println!("    budget=12 : phi_sharp={:.4}, sens_min={:.4}, stab_ref={:.4}", res_full.final_report.phi_sharp, res_full.final_report.sens_min, res_full.final_report.stab_refutation);
     println!("    budget=0  : phi_sharp={:.4}, sens_min={:.4}", res_b0.final_report.phi_sharp, res_b0.final_report.sens_min);
     println!("    no-refut  : phi_sharp={:.4}, stab_ref={:.4}", res_noref.final_report.phi_sharp, res_noref.final_report.stab_refutation);
     println!(
@@ -520,7 +495,6 @@ pub fn run_full_protocol(net: &PhisharpNet, seed: u64) -> FullEvalSummary {
     let beats_baselines_a = ood_rec_phi >= ood_rec_ll && ood_proj_phi >= ood_proj_bp;
     let a_reached = cal.passed && trajectory_grows && inv_ok && beats_baselines_a;
 
-    // 4. Critère B : Ambiguïté NL sans mot commun (hors entraînement)
     println!("\n[4. Critere B : Appariement ambiguite <-> definition (0 mot commun, NL jamais entrainee)]");
     let nl_cases = build_nl_ambiguity_cases();
     let mut sum_mrr_phi = 0.0;
@@ -561,10 +535,9 @@ pub fn run_full_protocol(net: &PhisharpNet, seed: u64) -> FullEvalSummary {
         para_stab_sum += sim_para;
         pert_shift_sum += 1.0 - sim_broken;
 
-        // Paquet d'évaluation aveugle (sans exposer A ni le nom du modèle)
         let preview = String::from_utf8_lossy(&res_nl.explanation_bytes);
         println!(
-            "  Cas {} ({}) | 0 mot commun verifie | Rang cible: Phisharp={} BytePred={} LL={} | Stabilité para={:.3} vs Rupture sens={:.3}",
+            "  Cas {} ({}) | 0 mot commun verifie | Rang cible: Phisharp={} BytePred={} LL={} | Stabilite para={:.3} vs Rupture sens={:.3}",
             idx + 1, item.title, r_phi, r_bp, r_ll, sim_para, 1.0 - sim_broken
         );
         println!("    [Paquet aveugle sortie] \"{}\"", preview.replace('\n', "\\n"));
@@ -588,7 +561,6 @@ pub fn run_full_protocol(net: &PhisharpNet, seed: u64) -> FullEvalSummary {
 
     let b_reached = mrr_phi > 0.50 && mrr_phi >= mrr_bp && mrr_phi >= mrr_ll && mean_shift > (1.0 - mean_para);
 
-    // 5. Lecture croisée
     println!("\n[5. Lecture croisee]");
     println!("  A atteint : {} | B atteint : {}", a_reached, b_reached);
     let verdict = match (a_reached, b_reached) {
