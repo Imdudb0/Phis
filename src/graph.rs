@@ -8,9 +8,9 @@ pub const DIM: usize = 4;
 pub const REL_DIM: usize = 8;
 pub const SEARCH_STEPS: usize = 6;
 pub const STATE_DIM: usize = NODES * DIM;
-pub const INPUT_DIM: usize = REL_DIM * 3; // résidu moitié 1 + moitié 2 + corrélation contexte
+pub const INPUT_DIM: usize = REL_DIM * 3;
 
-const OFF_EDGE: usize = 0; // NODES * NODES * DIM * DIM = 576
+const OFF_EDGE: usize = 0; // 576
 const OFF_BIAS: usize = OFF_EDGE + NODES * NODES * DIM * DIM; // 576, len 24
 const OFF_IN: usize = OFF_BIAS + NODES * DIM; // 600, len 576
 const OFF_G1: usize = OFF_IN + NODES * DIM * INPUT_DIM; // 1176, len 32
@@ -22,7 +22,7 @@ const OFF_OUT: usize = OFF_U + DIM * DIM; // 1320, len 32
 pub const NUM_PARAMS: usize = OFF_OUT + REL_DIM * DIM; // 1352
 
 const MAGIC: &[u8; 4] = b"PHIS";
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 
 #[derive(Clone, Debug)]
 pub struct PhiGraph {
@@ -37,16 +37,7 @@ pub struct AbductionTrace {
     pub final_mean_err: f32,
 }
 
-/// Champ purement relationnel multi-échelle (jusqu'à 256 octets de portée).
-/// Toutes les composantes sont invariantes par bijection affine de l'alphabet :
-///   [0] const_step : pas arithmétique constant (Δ1(t) == Δ1(t-1) != 0)
-///   [1] uni_rec    : proximité log de la dernière occurrence du même octet
-///   [2] bi_rec     : récurrence de bigramme (motifs / morphèmes / mots courts)
-///   [3] tri_rec    : récurrence de trigramme (racines / syntagmes / clauses)
-///   [4] mirror     : symétrie miroir (bigramme inversé ou centre de palindrome)
-///   [5] hub        : centralité structurelle (délimiteurs / hubs vs symboles rares)
-///   [6] boundary   : gradient de frontière entre symboles fréquents et rares
-///   [7] scale_rec  : échelle de distance de la récurrence (locale vs longue portée)
+/// Champ purement relationnel multi-échelle (portée 256 octets, invariant par bijection affine).
 pub fn extract_relations(bytes: &[u8]) -> Vec<[f32; REL_DIM]> {
     let n = bytes.len();
     let mut freq = [0u32; 256];
@@ -236,7 +227,6 @@ impl PhiGraph {
         (preds, pos_err, mean_err)
     }
 
-    /// Recherche abductive itérative avec injection segmentée du résidu (moitié 1 / moitié 2 / contexte).
     pub fn abduce(&self, rels: &[[f32; REL_DIM]], cut_mask: Option<u8>) -> AbductionTrace {
         let w = &self.weights;
         let mut state = [0.0f32; STATE_DIM];
@@ -340,7 +330,7 @@ impl PhiGraph {
         if version != VERSION || count != NUM_PARAMS || data.len() != 12 + count * 4 {
             return Err(io::Error::new(
                 ErrorKind::InvalidData,
-                "Version ou taille du modèle .phis incompatible (ré-entraîne avec v0.2)",
+                "Version ou taille du modèle .phis incompatible (ré-entraîne avec v0.3)",
             ));
         }
         let mut weights = Vec::with_capacity(count);
