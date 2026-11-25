@@ -1,43 +1,42 @@
 [1m[33mwarning[0m[1m: field `mean_residual` is never read[0m
-  [1m[94m--> [0msrc/phi.rs:50:9
+  [1m[94m--> [0msrc/phi.rs:67:9
    [1m[94m|[0m
-[1m[94m45[0m [1m[94m|[0m pub struct CompositePhi {
+[1m[94m62[0m [1m[94m|[0m pub struct CompositePhi {
    [1m[94m|[0m            [1m[94m------------[0m [1m[94mfield in this struct[0m
 [1m[94m...[0m
-[1m[94m50[0m [1m[94m|[0m     pub mean_residual: f32,
+[1m[94m67[0m [1m[94m|[0m     pub mean_residual: f32,
    [1m[94m|[0m         [1m[33m^^^^^^^^^^^^^[0m
    [1m[94m|[0m
    [1m[94m= [0m[1mnote[0m: `CompositePhi` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
    [1m[94m= [0m[1mnote[0m: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
 
 [1m[33mwarning[0m: `phisharp` (bin "phisharp") generated 1 warning
-[1m[92m    Finished[0m `release` profile [optimized] target(s) in 0.00s
-[1m[92m     Running[0m `target/release/phisharp ask --model out/sharp.phis --file molds.eff`
-=== PHISHARP ABDUCTION REPORT (v0.3 — Projection Référentielle) ===
-Effet (E)       : 'molds.eff' (169 octets, 5 blocs détectés)
-Cohérence scène : sélectivité=0.4938 (R_top=0.705 vs R_rest=0.300, paire [1]<->[2])
-φ_sharp(cible)  : -0.6235  [Gen=0.047 Disc=0.216 Proj=0.669 IIT=0.068, res=1.3893]
+[1m[92m    Finished[0m `release` profile [optimized] target(s) in 0.03s
+[1m[92m     Running[0m `target/release/phisharp ask --model out/sharp.phis --file out/comp.eff`
+=== PHISHARP ABDUCTION REPORT (v0.4 — Projection Référentielle) ===
+Effet (E)       : 'out/comp.eff' (233 octets, 5 blocs détectés)
+Cohérence scène : sélectivité=0.5365 (R_top=0.890 vs R_rest=0.397, paire [0]<->[1])
+φ_sharp(cible)  : +0.7721  [Gen=0.836 Disc=0.871 Proj=0.945 IIT=0.487, res=0.0816]
 
 Bloc cible [4] :
-  "pqrsrqpqrsrqpqrsrqp"
+  "jvzvqjvzvtjvzvajvzvljvzvbjvzv"
 
 Projection référentielle vers les moules de perceived.eff :
-  #1 bloc [2] | résonance=0.2266 | err_croisée=1.0245 | cos=-0.022 | octets_communs=0%
-     moule : "progression: 123456123456123456123456"
-     noyau : "3456123456123456"
-     référent induit (auto-spécifié) : "progression: 12345612"
-  #2 bloc [0] | résonance=0.2083 | err_croisée=1.3374 | cos=+0.646 | octets_communs=0%
-     moule : "symetrie: ABCDCBAABCDCBAABCDCBA"
-     noyau : "BCDCBAABCDCBA"
-     référent induit (auto-spécifié) : "symetrie: ABCDCBAA"
-  #3 bloc [1] | résonance=0.1907 | err_croisée=1.2166 | cos=+0.057 | octets_communs=0%
-     moule : "periodicite: XYZXYZXYZXYZXYZXYZXYZ"
-     noyau : "YZXYZXYZXYZXYZX"
-     référent induit (auto-spécifié) : "periodicite: XYZX"
-  #4 bloc [3] | résonance=0.1659 | err_croisée=1.0085 | cos=-0.494 | octets_communs=21%
-     moule : "grammaire: alpha_1 beta alpha_2 beta alpha_1"
-     noyau : " alpha_2 beta alpha"
-     référent induit (auto-spécifié) : "grammaire: alpha_1 beta"
+  #1 bloc [3] | résonance=0.8154 | err_croisée=0.1694 | cos=+0.931 | octets_communs=0%
+     moule : "MOLD_SHARED: QBDB;QBDB=QBDB0QBDB4QBDBFQBDB"
+     noyau : "MOLD_SHARED: QBDB;QBDB=QBDB0QBDB4QBDBFQBDB"
+  #2 bloc [2] | résonance=0.5203 | err_croisée=0.3287 | cos=+0.116 | octets_communs=0%
+     moule : "MOLD_GRAMMAR: GH-!4Y)>4GH-@4Y)>4Z$?4GH-!4GH-!4Y)>4GH-@"
+     noyau : "MOLD_GRAMM"
+     référent induit (auto-spécifié) : "AR: GH-!4Y)>4GH-@4Y)>4Z$?4GH-!4GH-!4Y)>4GH-@"
+  #3 bloc [0] | résonance=0.4778 | err_croisée=0.2755 | cos=-0.163 | octets_communs=0%
+     moule : "MOLD_ARITHMETIC: '()*+,'()*+,'()*+,'()*+,'()*+,'()*+"
+     noyau : "MOLD_ARITHME"
+     référent induit (auto-spécifié) : "TIC: '()*+,'()*+,'()*+,'()*+,'()*+,'()*+"
+  #4 bloc [1] | résonance=0.4711 | err_croisée=0.2588 | cos=-0.216 | octets_communs=0%
+     moule : "MOLD_NESTED: VQTXC@N'NP?!*2)VQTXC@N'NP?!*2)VQTXC@N'N"
+     noyau : "MOLD_NESTED: V"
+     référent induit (auto-spécifié) : "QTXC@N'NP?!*2)VQTXC@N'NP?!*2)VQTXC@N'N"
 
-Explication projetée (alphabet de E, marge=+0.0183) :
-  progression: 12345612
+Explication projetée (alphabet de E, marge=+0.2951) :
+  MOLD_SHARED: QBDB;QBDB=QBDB0QBDB4QBDBFQBDB
