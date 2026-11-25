@@ -242,11 +242,27 @@ pub fn derive(g: &Grammar, seed: &TermGraph, steps: &[Step], max_nodes: usize) -
     tg
 }
 
+/// Octets réservés par le format : image des étiquettes + marqueur de partage.
+fn reserved(g: &Grammar) -> [bool; 256] {
+    let mut r = [false; 256];
+    for &b in g.byte_of.iter() {
+        r[b as usize] = true;
+    }
+    r[g.ref_byte as usize] = true;
+    r
+}
+
+fn fallback_byte(res: &[bool; 256]) -> u8 {
+    (0..256usize).find(|&i| !res[i]).map(|i| i as u8).unwrap_or(0)
+}
+
 pub fn serialize(g: &Grammar, tg: &TermGraph) -> Vec<u8> {
     let mut out = Vec::new();
     if tg.is_empty() {
         return out;
     }
+    let res = reserved(g);
+    let fb = fallback_byte(&res);
     let mut index = vec![u32::MAX; tg.len()];
     let mut counter = 0u32;
     let mut stack: Vec<u32> = vec![tg.root];
@@ -261,9 +277,6 @@ pub fn serialize(g: &Grammar, tg: &TermGraph) -> Vec<u8> {
             continue;
         }
         let seen = index[vi] != u32::MAX;
-        // Un index de partage tient sur un octet. Au-delà de 255 il n'est plus
-        // représentable : on ré-émet le sous-graphe, jamais un index replié.
-        // Format inchangé pour <= 256 nœuds atteignables (tous les épisodes).
         if seen && index[vi] <= 255 {
             out.push(g.ref_byte);
             out.push(index[vi] as u8);
@@ -274,15 +287,79 @@ pub fn serialize(g: &Grammar, tg: &TermGraph) -> Vec<u8> {
             counter += 1;
         }
         if tg.lab[vi] == LIT {
-            out.push(tg.lit[vi]);
+            // Un littéral opaque ne doit jamais émettre un octet réservé :
+            // sinon il est relu comme en-tête de format.
+            let b = tg.lit[vi];
+            out.push(if res[b as usize] { fb } else { b });
             continue;
         }
         let l = tg.lab[vi] as usize;
-        out.push(if l < g.byte_of.len() { g.byte_of[l] } else { 0 });
+        out.push(if l < g.byte_of.len() { g.byte_of[l] } else { fb });
         for &c in tg.ch[vi].iter().rev() {
             stack.push(c);
         }
     }
+    out
+}
+
+/// Un littéral occupe un slot d'index, exactement comme dans `serialize`.
+fn lit_node(out: &mut TermGraph, emitted: &mut Vec<u32>, b: u8) -> u32 {
+    let n = out.node(LIT, Vec::new(), b);
+    emitted.push(n);
+    n
+}
+
+fn parse_rec(
+    g: &Grammar,
+    cur: &mut Cursor,
+    out: &mut TermGraph,
+    emitted: &mut Vec<u32>,
+    depth: usize,
+    sentinel: u32,
+) -> u32 {
+    if depth > MAX_DEPTH || out.len() >= MAX_PARSE_NODES {
+        return sentinel;
+    }
+    let b = match cur.take() {
+        Some(x) => x,
+        None => return lit_node(out, emitted, 0),
+    };
+    if b == g.ref_byte {
+        let idx = cur.take().unwrap_or(0) as usize;
+        if idx < emitted.len() {
+            return emitted[idx];
+        }
+        // flux malforme : un partage ne consomme pas de slot d'index.
+        return out.node(LIT, Vec::new(), 0);
+    }
+    match g.label_of_byte(b) {
+        None => lit_node(out, emitted, b),
+        Some(l) => {
+            let a = g.arity[l as usize] as usize;
+            let me = out.node(l, Vec::new(), 0);
+            emitted.push(me);
+            let mut ch = Vec::with_capacity(a);
+            for _ in 0..a {
+                ch.push(parse_rec(g, cur, out, emitted, depth + 1, sentinel));
+            }
+            out.ch[me as usize] = ch;
+            me
+        }
+    }
+}
+
+pub fn parse(g: &Grammar, bytes: &[u8]) -> TermGraph {
+    let mut out = TermGraph::new();
+    // Sentinelle HORS registre d'index : réutilisée à la borne, pour que le
+    // nombre de nœuds reste borné sans décaler les index de partage.
+    let sentinel = out.node(LIT, Vec::new(), 0);
+    let mut cur = Cursor { b: bytes, i: 0 };
+    let mut emitted = Vec::new();
+    if bytes.is_empty() {
+        out.root = sentinel;
+        return out;
+    }
+    out.root = parse_rec(g, &mut cur, &mut out, &mut emitted, 0, sentinel);
     out
 }
 
@@ -301,54 +378,6 @@ impl<'a> Cursor<'a> {
             None
         }
     }
-}
-
-fn parse_rec(g: &Grammar, cur: &mut Cursor, out: &mut TermGraph, emitted: &mut Vec<u32>, depth: usize) -> u32 {
-    if depth > MAX_DEPTH || out.len() >= MAX_PARSE_NODES {
-        return out.node(LIT, Vec::new(), 0);
-    }
-    let b = match cur.take() {
-        Some(x) => x,
-        None => return out.node(LIT, Vec::new(), 0),
-    };
-    if b == g.ref_byte {
-        let idx = cur.take().unwrap_or(0) as usize;
-        if idx < emitted.len() {
-            return emitted[idx];
-        }
-        return out.node(LIT, Vec::new(), 0);
-    }
-    match g.label_of_byte(b) {
-        None => out.node(LIT, Vec::new(), b),
-        Some(l) => {
-            let a = g.arity[l as usize] as usize;
-            // réserve l'indice AVANT les enfants : ordre préfixe, donc les
-            // back-références du flux original restent valides.
-            let me = out.node(l, Vec::new(), 0);
-            emitted.push(me);
-            let mut ch = Vec::with_capacity(a);
-            for _ in 0..a {
-                ch.push(parse_rec(g, cur, out, emitted, depth + 1));
-            }
-            out.ch[me as usize] = ch;
-            me
-        }
-    }
-}
-
-/// Parseur TOTAL : aucune entrée ne le fait paniquer. Les octets inconnus
-/// deviennent des littéraux opaques. Nécessaire pour les sondes perturbées.
-pub fn parse(g: &Grammar, bytes: &[u8]) -> TermGraph {
-    let mut out = TermGraph::new();
-    let mut cur = Cursor { b: bytes, i: 0 };
-    let mut emitted = Vec::new();
-    if bytes.is_empty() {
-        out.node(LIT, Vec::new(), 0);
-        out.root = 0;
-        return out;
-    }
-    out.root = parse_rec(g, &mut cur, &mut out, &mut emitted, 0);
-    out
 }
 
 // ---------------------------------------------------------------- familles
