@@ -4,7 +4,7 @@ mod ptgrs;
 mod rng;
 mod train;
 
-use crate::graph::PhiGraph;
+use crate::graph::{PhiGraph, extract_relations};
 use crate::phi::{compute_phi_sharp, extract_core_motif, format_partition};
 use crate::ptgrs::{CauseFamily, sample_episode};
 use crate::rng::Rng;
@@ -16,7 +16,9 @@ use std::process;
 fn usage() -> ! {
     eprintln!("Usage:");
     eprintln!("  phisharp train --out out/sharp.phis [--steps 250] [--seed 42]");
-    eprintln!("  phisharp sample --out perceived.eff [--family periodic|symmetric|nested|shared|arithmetic] [--seed 7]");
+    eprintln!(
+        "  phisharp sample --out perceived.eff [--family periodic|symmetric|nested|shared|arithmetic|grammar] [--seed 7]"
+    );
     eprintln!("  phisharp ask --model out/sharp.phis --file perceived.eff");
     process::exit(1);
 }
@@ -87,7 +89,10 @@ fn main() {
             let mut rng = Rng::new(seed);
             let family = match arg_val(&args, "--family") {
                 Some(name) => CauseFamily::from_name(&name).unwrap_or_else(|| {
-                    eprintln!("Famille inconnue '{}'. Choix: periodic, symmetric, nested, shared, arithmetic.", name);
+                    eprintln!(
+                        "Famille inconnue '{}'. Choix: periodic, symmetric, nested, shared, arithmetic, grammar.",
+                        name
+                    );
                     process::exit(1);
                 }),
                 None => CauseFamily::ALL[rng.next_usize(CauseFamily::ALL.len())],
@@ -123,7 +128,6 @@ fn main() {
                 process::exit(1);
             }
 
-            // Graine déterministe dérivée de E pour une évaluation reproductible
             let mut hash = 0xCBF2_9CE4_8422_2325u64;
             for &b in &bytes {
                 hash ^= b as u64;
@@ -131,11 +135,15 @@ fn main() {
             }
             let mut rng = Rng::new(hash);
             let rep = compute_phi_sharp(&model, &bytes, &mut rng, true);
+            let rels = extract_relations(&bytes);
 
-            println!("=== PHISHARP ABDUCTION REPORT ===");
+            println!("=== PHISHARP ABDUCTION REPORT (v0.2) ===");
             println!("Effet (E)       : '{}' ({} octets)", file_path, bytes.len());
             println!("φ_sharp         : {:+.4}", rep.phi_sharp);
-            println!("  Générativité  : {:.4}  (résidu moyen = {:.4})", rep.generativity, rep.residual);
+            println!(
+                "  Générativité  : {:.4}  (résidu moyen = {:.4})",
+                rep.generativity, rep.residual
+            );
             println!("  Discrimination: {:.4}", rep.discrimination);
             println!(
                 "  Projection    : {:.4}  [réfut={:.3} | dépl={:.3} | abst={:.3}]",
@@ -157,14 +165,19 @@ fn main() {
                 .collect::<Vec<_>>()
                 .join(" -> ");
             println!("\nTrajectoire abductive (résidu) :");
-            println!("  {}  (gain={:+.4})", traj_str, rep.traj_gain);
+            println!(
+                "  {}  (gain/t0={:+.3}, rebond={:.4})",
+                traj_str, rep.traj_gain, rep.bounce_pen
+            );
 
-            let (start, motif) = extract_core_motif(&bytes, &rep.trace.final_pos_err);
-            println!("\nNoyau causal auto-spécifié (offset {}, alphabet de E) :", start);
+            let (start, motif) = extract_core_motif(&bytes, &rels, &rep.trace.final_pos_err);
+            println!(
+                "\nNoyau causal auto-spécifié (offset {}, densité explicative max) :",
+                start
+            );
             println!("  ASCII : \"{}\"", printable_preview(&motif));
             println!("  HEX   : {}", hex_preview(&motif));
 
-            // Top 5 positions qui résistent le plus à l'explication (le résidu)
             let mut ranked: Vec<(usize, f32)> = rep
                 .trace
                 .final_pos_err
@@ -182,7 +195,10 @@ fn main() {
                 } else {
                     '.'
                 };
-                println!("  offset {:>3} | 0x{:02x} '{}' | résidu = {:.4}", pos, b, ch, err);
+                println!(
+                    "  offset {:>3} | 0x{:02x} '{}' | résidu = {:.4}",
+                    pos, b, ch, err
+                );
             }
         }
 
