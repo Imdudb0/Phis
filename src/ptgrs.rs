@@ -256,22 +256,21 @@ pub fn serialize(g: &Grammar, tg: &TermGraph) -> Vec<u8> {
     let mut counter = 0u32;
     let mut stack: Vec<u32> = vec![tg.root];
     let mut guard = 0usize;
+
     while let Some(v) = stack.pop() {
-        guard += 1;
-        if guard > 4 * MAX_PARSE_NODES + 16 {
-            break;
-        }
-        let vi = v as usize;
-        if vi >= tg.len() {
-            continue;
-        }
-        if index[vi] != u32::MAX {
+        let seen = index[vi] != u32::MAX;
+        // Un index de partage tient sur un octet. Au-delà de 255 il n'est plus
+        // représentable : on ré-émet le sous-graphe, jamais un index replié.
+        // Format inchangé pour <= 256 nœuds atteignables (tous les épisodes).
+        if seen && index[vi] <= 255 {
             out.push(g.ref_byte);
-            out.push((index[vi] & 0xFF) as u8);
+            out.push(index[vi] as u8);
             continue;
         }
-        index[vi] = counter;
-        counter += 1;
+        if !seen {
+            index[vi] = counter;
+            counter += 1;
+        }
         if tg.lab[vi] == LIT {
             out.push(tg.lit[vi]);
             continue;
@@ -873,5 +872,19 @@ mod tests {
     fn minidict_interdit_hors_eval() {
         let mut rng = Rng::new(3);
         let _ = minidict(&FamilySpec::train(), &mut rng, 4);
+    }
+
+    #[test]
+    fn canal_observation_point_fixe() {
+        let mut rng = Rng::new(77);
+        for k in 0..5 {
+            let ep = episode(&FamilySpec::ood(k), &mut rng);
+            for x in probes(&ep.cause, &mut rng, 8).iter() {
+                let o1 = ep.cause.observe(x);
+                let o2 = serialize(&ep.cause.g, &parse(&ep.cause.g, &o1));
+                let o3 = serialize(&ep.cause.g, &parse(&ep.cause.g, &o2));
+                assert_eq!(o2, o3, "canal d'observation instable : index replie");
+            }
+        }
     }
 }
