@@ -289,12 +289,19 @@ pub fn step(t: &mut Tape, p: &Params, h: usize, w: &Wiring, itv: &Itv) -> usize 
     let mm = t.matmul(m, wu);
     let mb = t.add_row(mm, bu);
     let u = t.tanh(mb);
-    let hm = t.concat_rows(h, m);
+
     let wg = t.param(p, B_WG);
+    let rows_h: Vec<usize> = (0..H).collect();
+    let rows_m: Vec<usize> = (H..2 * H).collect();
+    let wg_h = t.gather_rows(wg, &rows_h);
+    let wg_m = t.gather_rows(wg, &rows_m);
+    let g1 = t.matmul(h, wg_h);
+    let g2 = t.matmul(m, wg_m);
+    let gm = t.add(g1, g2);
     let bg = t.param(p, B_BG);
-    let gm = t.matmul(hm, wg);
     let gb = t.add_row(gm, bg);
     let gate = t.sigmoid(gb);
+
     let one = t.input(w.n, H, &vec![1.0; w.n * H]);
     let inv = t.sub(one, gate);
     let a = t.mul(gate, h);
@@ -397,11 +404,16 @@ pub fn forward(t: &mut Tape, p: &Params, v: &EffView, w: &Wiring, itv: &Itv) -> 
 
     let poolw = t.input(1, n, &vec![1.0 / n.max(1) as f32; n]);
     let pooled = t.matmul(poolw, hcur);
-    let gs = t.input(1, GSTATS, &gstats(v));
-    let pf = t.concat_rows(pooled, gs);
+    let gsv = t.input(1, GSTATS, &gstats(v));
     let wpi = t.param(p, B_WPI);
+    let rows_h: Vec<usize> = (0..H).collect();
+    let rows_g: Vec<usize> = (H..H + GSTATS).collect();
+    let wpi_h = t.gather_rows(wpi, &rows_h);
+    let wpi_g = t.gather_rows(wpi, &rows_g);
+    let p1 = t.matmul(pooled, wpi_h);
+    let p2 = t.matmul(gsv, wpi_g);
+    let pl = t.add(p1, p2);
     let bpi = t.param(p, B_BPI);
-    let pl = t.matmul(pf, wpi);
     let policy = t.add_row(pl, bpi);
 
     Fwd { h0, hprev, h: hcur, hnext, rep_e, rep_c, mech, prop, res, ptr_logits, ptr, policy }
@@ -642,5 +654,24 @@ mod tests {
         let (out, cov) = execute(&b, &v, &w, &id);
         assert!(cov > 0.99, "couverture {cov}");
         assert_eq!(out, b);
+    }
+
+    #[test]
+    fn formes_du_graphe() {
+        use crate::ad::Shape;
+        let b = sample();
+        let v = build(&b, &ViewCfg::default());
+        let w = wire(&v);
+        let mut rng = Rng::new(13);
+        let p = init(&mut rng);
+        let mut t = Tape::new();
+        let f = forward(&mut t, &p, &v, &w, &Itv::default());
+        assert_eq!(t.shape(f.h), Shape { r: w.n, c: H });
+        assert_eq!(t.shape(f.rep_e), Shape { r: w.n, c: Q });
+        assert_eq!(t.shape(f.rep_c), Shape { r: w.n, c: Q });
+        assert_eq!(t.shape(f.ptr), Shape { r: w.na, c: P + 1 });
+        assert_eq!(t.shape(f.policy), Shape { r: 1, c: N_OPS });
+        assert_eq!(t.shape(f.prop), Shape { r: w.n, c: 1 });
+        assert_eq!(t.shape(f.mech), Shape { r: w.n, c: 1 });
     }
 }
