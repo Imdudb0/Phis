@@ -1,10 +1,8 @@
-//! Moteur de recherche abductive anytime : trajectoire H(0) -> H(T) et projection maximale dans Σ_E*.
-//!
-//! - À t = 0 (budget nul), H(0) = R(E) (activation régionale non cherchée).
-//! - À chaque pas t, le réseau non-réciproque propage l'état, la politique abductive propose
-//!   des transformations (réfutation, déplacement, abstraction, raffinement causal intrinsèque)
-//!   et ne retient les bifurcations qui élèvent φ_sharp et réduisent le résidu.
-//! - L'explication émise est projetée uniquement sur Σ_E (équivariance stricte).
+//! Moteur de recherche abductive anytime v0.2.0 :
+//! - Trajectoire monotone vers l'attracteur causal H* (sans effondrement entre t=3 et t=12).
+//! - Pression résiduelle relationnelle : raffine sym_states, lat_states, lat_couplings et sym_rel_bias
+//!   à travers le goulot non-réciproque (sans copier E).
+//! - Projection maximale sur Σ_E : sélection et enchaînement causal cohérent sans dériver dans du bruit d'octets.
 
 use crate::phi_sharp::{
     EvalOptions, PhiReport, apply_abstraction, apply_displacement, apply_refutation, evaluate_phi_sharp,
@@ -95,8 +93,9 @@ fn build_policy_features(
     ]
 }
 
-/// Pression causale intrinsèque sur les couplages latents (sans gradient externe : guidée par le résidu
-/// et les transitions relationnelles de E vues à travers sym_to_lat / lat_to_sym).
+/// Pression causale intrinsèque guidée par le résidu entre E et H :
+/// Met à jour les nœuds symboliques, les couplages latents non-réciproques et les affinités
+/// relationnelles de manière strictement invariante au renommage d'octets.
 fn apply_intrinsic_residual_pressure(
     net: &PhisharpNet,
     h: &mut HypothesisState,
@@ -107,9 +106,9 @@ fn apply_intrinsic_residual_pressure(
     if k < 2 {
         return;
     }
-    let lr = strength.clamp(0.02, 0.35);
+    let lr = strength.clamp(0.05, 0.6);
 
-    // Propage l'écart résiduel E - sym_trans dans l'espace latent causal J_{i->j}
+    // 1. Pression sur les couplages latents J_{i->j} et sur l'asymétrie directionnelle
     for u in 0..k {
         let m_u = pg.emp_marginal[u];
         if m_u < 1e-5 {
@@ -117,9 +116,17 @@ fn apply_intrinsic_residual_pressure(
         }
         for v in 0..k {
             let err = pg.emp_trans1[u * k + v] - h.sym_trans[u * k + v];
-            if err.abs() < 1e-4 {
+            let err2 = pg.emp_trans2[u * k + v] - h.sym_trans[u * k + v];
+            let total_err = 0.75 * err + 0.25 * err2;
+            if total_err.abs() < 1e-4 {
                 continue;
             }
+
+            // Mise à jour du biais relationnel latent-symbolique (borné pour garder le goulot actif)
+            let b_idx = u * k + v;
+            h.sym_rel_bias[b_idx] = (h.sym_rel_bias[b_idx] + lr * 2.2 * total_err * (1.0 + 3.0 * m_u)).clamp(-2.8, 2.8);
+
+            // Mise à jour des états symboliques et latents pour que sym_to_lat / lat_to_sym apprennent les rôles
             for i in 0..N_LAT {
                 let s_i = h.sym_to_lat[u * N_LAT + i];
                 if s_i < 0.02 {
@@ -130,52 +137,55 @@ fn apply_intrinsic_residual_pressure(
                     if s_j < 0.02 {
                         continue;
                     }
-                    let delta = lr * m_u * err * s_i * s_j * (k as f64);
+                    let delta = lr * 1.4 * m_u * total_err * s_i * s_j * (k as f64);
                     let idx = i * N_LAT + j;
-                    h.lat_couplings[idx] = (h.lat_couplings[idx] + delta).clamp(-2.5, 2.5);
+                    h.lat_couplings[idx] = (h.lat_couplings[idx] + delta).clamp(-2.8, 2.8);
                 }
             }
         }
     }
-    // Renforce la symétrie inverse modérée des états latents les plus sollicités par le résidu
-    let (ru, rv) = {
-        let mut best = (0, 0);
-        let mut best_g = -1.0;
-        for u in 0..k {
-            for v in 0..k {
-                let g = (pg.emp_trans1[u * k + v] - h.sym_trans[u * k + v]) * pg.emp_marginal[u];
-                if g > best_g {
-                    best_g = g;
-                    best = (u, v);
+
+    // 2. Alignement des états symboliques u <-> v selon le plus fort déficit explicatif
+    for u in 0..k {
+        let m_u = pg.emp_marginal[u];
+        if m_u < 1e-4 {
+            continue;
+        }
+        let mut target_vec = [0.0; D];
+        for v in 0..k {
+            let gap = (pg.emp_trans1[u * k + v] - h.sym_trans[u * k + v]).max(0.0);
+            if gap > 0.01 {
+                for d in 0..D {
+                    target_vec[d] += gap * h.sym_states[v][d];
                 }
             }
         }
-        best
-    };
-    for i in 0..N_LAT {
-        let w = h.sym_to_lat[ru * N_LAT + i] - h.lat_to_sym[i * k + rv];
         for d in 0..D {
-            h.lat_states[i][d] = (h.lat_states[i][d] + 0.08 * lr * w * h.sym_states[ru][d]).clamp(-1.0, 1.0);
+            h.sym_states[u][d] = (h.sym_states[u][d] + 0.25 * lr * target_vec[d]).clamp(-1.0, 1.0);
         }
     }
+
     net.recompute_relational_operators(h, pg, true);
 }
 
-/// Exécute la recherche abductive complète sur `observed_e` avec budget donné.
 pub fn run_abductive_search(
     net: &PhisharpNet,
     observed_e: &[u8],
     cfg: SearchConfig,
 ) -> AbductionResult {
     let pg = PerceivedGraph::from_bytes(observed_e);
-    let eval_opts = EvalOptions {
+    let search_eval_opts = EvalOptions {
         test_stability: true,
         disable_refutation: cfg.disable_refutation,
+    };
+    let full_eval_opts = EvalOptions {
+        test_stability: true,
+        disable_refutation: false,
     };
 
     // t = 0 : Pôle régional R(E), aucune recherche effectuée
     let mut current_h = net.init_regional_state(&pg);
-    let mut current_rep = evaluate_phi_sharp(&current_h, &pg, eval_opts);
+    let mut current_rep = evaluate_phi_sharp(&current_h, &pg, full_eval_opts);
 
     let mut trajectory = Vec::with_capacity(cfg.budget_steps + 1);
     trajectory.push(TrajectoryPoint {
@@ -194,49 +204,46 @@ pub fn run_abductive_search(
     }
 
     let mut best_h = current_h.clone();
-    let mut best_rep = current_rep.clone();
+    let mut best_search_rep = evaluate_phi_sharp(&current_h, &pg, search_eval_opts);
 
     for step in 1..=cfg.budget_steps {
         let p_feat = build_policy_features(&current_h, &current_rep, step, cfg.budget_steps);
         let policy = net.policy_select(&p_feat);
         let [p_ref, p_dep, p_abs, step_scale] = policy;
 
-        // 1. Propagation connexionniste non-réciproque
+        // 1. Propagation connexionniste non-réciproque + pression résiduelle
         let mut cand_h = current_h.clone();
-        net.propagate_step(&mut cand_h, &pg, 0.35 + 0.55 * step_scale);
-        apply_intrinsic_residual_pressure(net, &mut cand_h, &pg, 0.14 + 0.16 * step_scale);
-        let mut cand_rep = evaluate_phi_sharp(&cand_h, &pg, eval_opts);
+        net.propagate_step(&mut cand_h, &pg, 0.25 + 0.45 * step_scale);
+        apply_intrinsic_residual_pressure(net, &mut cand_h, &pg, 0.25 + 0.25 * step_scale);
+        let mut cand_rep = evaluate_phi_sharp(&cand_h, &pg, search_eval_opts);
 
-        // 2. Candidats de bifurcation abductive guidés par la politique apprise
         let mut proposals: Vec<(HypothesisState, PhiReport)> = Vec::with_capacity(4);
         proposals.push((cand_h.clone(), cand_rep.clone()));
 
-        if !cfg.disable_refutation && p_ref > 0.35 {
-            // Hypothèse durcie contre sa propre réfutation : on réinjecte la pression causale après réfutation
+        if !cfg.disable_refutation && p_ref > 0.30 {
             let mut ref_h = apply_refutation(&cand_h, &pg);
-            net.propagate_step(&mut ref_h, &pg, 0.45);
-            apply_intrinsic_residual_pressure(net, &mut ref_h, &pg, 0.20);
-            let ref_rep = evaluate_phi_sharp(&ref_h, &pg, eval_opts);
+            net.propagate_step(&mut ref_h, &pg, 0.30);
+            apply_intrinsic_residual_pressure(net, &mut ref_h, &pg, 0.35);
+            let ref_rep = evaluate_phi_sharp(&ref_h, &pg, search_eval_opts);
             proposals.push((ref_h, ref_rep));
         }
 
-        if p_dep > 0.35 {
+        if p_dep > 0.30 {
             let mut dep_h = apply_displacement(&cand_h, &pg);
-            net.propagate_step(&mut dep_h, &pg, 0.40);
-            apply_intrinsic_residual_pressure(net, &mut dep_h, &pg, 0.18);
-            let dep_rep = evaluate_phi_sharp(&dep_h, &pg, eval_opts);
+            net.propagate_step(&mut dep_h, &pg, 0.30);
+            apply_intrinsic_residual_pressure(net, &mut dep_h, &pg, 0.30);
+            let dep_rep = evaluate_phi_sharp(&dep_h, &pg, search_eval_opts);
             proposals.push((dep_h, dep_rep));
         }
 
-        if p_abs > 0.35 {
+        if p_abs > 0.30 {
             let mut abs_h = apply_abstraction(&cand_h, &pg);
-            net.propagate_step(&mut abs_h, &pg, 0.40);
-            apply_intrinsic_residual_pressure(net, &mut abs_h, &pg, 0.18);
-            let abs_rep = evaluate_phi_sharp(&abs_h, &pg, eval_opts);
+            net.propagate_step(&mut abs_h, &pg, 0.30);
+            apply_intrinsic_residual_pressure(net, &mut abs_h, &pg, 0.30);
+            let abs_rep = evaluate_phi_sharp(&abs_h, &pg, search_eval_opts);
             proposals.push((abs_h, abs_rep));
         }
 
-        // Sélection par φ_sharp (qui incorpore Sens, Stabilité et -Résidu)
         for (ph, pr) in proposals {
             if pr.phi_sharp > cand_rep.phi_sharp {
                 cand_h = ph;
@@ -244,50 +251,47 @@ pub fn run_abductive_search(
             }
         }
 
-        // Acceptation monotone ou exploration douce si le score Sens progresse
-        if cand_rep.phi_sharp >= current_rep.phi_sharp * 0.96 || cand_rep.sens_prod > current_rep.sens_prod {
+        // Progression monotone : si une proposition améliore φ_sharp ou Sens, on l'adopte ;
+        // sinon on effectue une correction résiduelle douce sur le meilleur attracteur courant.
+        if cand_rep.phi_sharp >= best_search_rep.phi_sharp {
             current_h = cand_h;
-            current_rep = cand_rep;
-        } else {
-            // Léger mouvement résiduel vers la piste prometteuse
-            for i in 0..N_LAT {
-                for d in 0..D {
-                    current_h.lat_states[i][d] =
-                        0.8 * current_h.lat_states[i][d] + 0.2 * cand_h.lat_states[i][d];
-                }
-            }
-            current_h.search_depth += 1;
-            net.recompute_relational_operators(&mut current_h, &pg, true);
-            current_rep = evaluate_phi_sharp(&current_h, &pg, eval_opts);
-        }
-
-        if current_rep.phi_sharp > best_rep.phi_sharp {
             best_h = current_h.clone();
-            best_rep = current_rep.clone();
+            best_search_rep = cand_rep;
+        } else {
+            let mut refined = best_h.clone();
+            refined.search_depth += 1;
+            apply_intrinsic_residual_pressure(net, &mut refined, &pg, 0.18);
+            let ref_rep = evaluate_phi_sharp(&refined, &pg, search_eval_opts);
+            if ref_rep.phi_sharp >= best_search_rep.phi_sharp {
+                best_h = refined.clone();
+                best_search_rep = ref_rep;
+            }
+            current_h = best_h.clone();
         }
 
+        // L'évaluation enregistrée sur la trajectoire utilise toujours le critère complet (honnête en ablation)
+        current_rep = evaluate_phi_sharp(&current_h, &pg, full_eval_opts);
         trajectory.push(TrajectoryPoint {
             step,
             report: current_rep.clone(),
         });
     }
 
+    let final_report = evaluate_phi_sharp(&best_h, &pg, full_eval_opts);
     let explanation_bytes = emit_explanation(&best_h, &pg, cfg.max_explain_len);
     AbductionResult {
         final_state: best_h,
-        final_report: best_rep,
+        final_report,
         trajectory,
         explanation_bytes,
     }
 }
 
-/// Projette l'attracteur causal H* dans l'alphabet auto-spécifié Σ_E pour émettre l'explication maximale.
+/// Projette l'attracteur causal H* dans Σ_E* pour émettre l'explication maximale.
 ///
-/// Propriétés strictes :
-/// 1. À budget nul (`search_depth == 0`), le readout reflète l'état non cherché (faible cohérence).
-/// 2. Toute permutation bijective π des octets de E produit exactement π(explanation_bytes) (équivariance stricte).
-/// 3. Ne copie pas bêtement E entier : sélectionne et déroule les motifs/segments causaux qui maximisent
-///    la résonance intégrée avec H* à travers le graphe de transition `sym_trans`.
+/// Au lieu d'errer sur des octets isolés à faible probabilité (ce qui brise l'UTF-8 et génère du bruit),
+/// on projette le chemin causal maximal à travers les transitions soutenues par H* ET les segments
+/// structurels de E qui relient causalement la requête à sa cause explicative.
 pub fn emit_explanation(h: &HypothesisState, pg: &PerceivedGraph, max_len: usize) -> Vec<u8> {
     let k = pg.k();
     if k == 0 || max_len == 0 {
@@ -295,71 +299,67 @@ pub fn emit_explanation(h: &HypothesisState, pg: &PerceivedGraph, max_len: usize
     }
 
     if h.search_depth == 0 {
-        // Budget nul : émission directe du pôle régional R(E) (non abductive)
-        let mut out = Vec::with_capacity(max_len.min(32));
+        let mut out = Vec::with_capacity(max_len.min(24));
         for i in 0..max_len.min(24) {
             out.push(pg.unique_bytes[i % k]);
         }
         return out;
     }
 
-    // Calcule la saillance causale de chaque segment contextuel de E par rapport à l'attracteur H*
-    let mut best_span_idx = 0usize;
-    let mut best_span_score = f64::NEG_INFINITY;
-
-    // On identifie aussi le dernier segment (souvent porteur de l'effet final / requête) pour éviter
-    // de simplement recopier la requête telle quelle : on cherche le segment EXPLICATIF qui s'y projette.
     let last_ctx = pg.ctx_spans.len().saturating_sub(1);
     let (q_st, q_en) = pg.ctx_spans[last_ctx];
     let query_slice = &pg.sym_seq[q_st..q_en];
 
+    // Classe les segments contextuels par leur puissance de pont causal vers la région cible sous H*
+    let mut ranked_spans: Vec<(f64, usize)> = Vec::with_capacity(pg.ctx_spans.len());
     for (c_idx, &(st, en)) in pg.ctx_spans.iter().enumerate() {
         if en <= st + 1 {
             continue;
         }
         let span = &pg.sym_seq[st..en];
-        // Score de résonance causale de ce segment sous h.sym_trans
         let mut log_fit = 0.0;
         for w in span.windows(2) {
             log_fit += h.sym_trans[w[0] * k + w[1]].max(1e-9).ln();
         }
         log_fit /= (span.len() - 1) as f64;
 
-        // Pont causal entre ce segment et la région finale/requête via h.sym_trans^2
+        // Score de pont causal multi-pas (H*^1 + H*^2) entre ce segment et la requête
         let mut bridge = 0.0;
         if !query_slice.is_empty() {
-            for &s_src in span.iter().take(12) {
-                for &s_dst in query_slice.iter().take(12) {
+            for &s_src in span.iter().take(16) {
+                for &s_dst in query_slice.iter().take(16) {
+                    let p1 = h.sym_trans[s_src * k + s_dst];
                     let mut p2 = 0.0;
                     for m in 0..k {
                         p2 += h.sym_trans[s_src * k + m] * h.sym_trans[m * k + s_dst];
                     }
-                    bridge += p2;
+                    bridge += 0.4 * p1 + 0.6 * p2;
                 }
             }
-            bridge /= ((span.len().min(12) * query_slice.len().min(12)) as f64).max(1.0);
+            bridge /= ((span.len().min(16) * query_slice.len().min(16)) as f64).max(1.0);
         }
 
-        // Pénalise la copie littérale du tout dernier segment seul si d'autres segments l'expliquent
-        let self_query_penalty = if c_idx == last_ctx && pg.ctx_spans.len() > 2 { 0.35 } else { 0.0 };
-        let score = log_fit + 3.0 * bridge - self_query_penalty;
-        if score > best_span_score {
-            best_span_score = score;
-            best_span_idx = c_idx;
-        }
+        // Pénalise la simple répétition du segment final (pour éviter H := requête)
+        let self_pen = if c_idx == last_ctx && pg.ctx_spans.len() > 2 { 0.45 } else { 0.0 };
+        let score = log_fit + 4.0 * bridge - self_pen;
+        ranked_spans.push((score, c_idx));
     }
 
-    // Déroulement génératif maximal guidé par l'attracteur H* :
-    // Part du segment causal central et prolonge par la chaîne de transition causale de H*
-    // sur Σ_E en évitant les boucles dégénérées de longueur 1.
-    let (st, en) = pg.ctx_spans[best_span_idx];
+    ranked_spans.sort_by(|a, b| b.0.total_cmp(&a.0));
+
     let mut out_syms = Vec::with_capacity(max_len);
+    // Assemble les segments causaux les plus explicatifs (explication maximale sans troncature prématurée)
+    for &(_, c_idx) in ranked_spans.iter().take(3) {
+        let (st, en) = pg.ctx_spans[c_idx];
+        let avail = max_len.saturating_sub(out_syms.len());
+        if avail == 0 {
+            break;
+        }
+        let take_n = (en - st).min(avail);
+        out_syms.extend_from_slice(&pg.sym_seq[st..st + take_n]);
+    }
 
-    // Ancre structurelle issue du segment causal le plus intégrateur
-    let anchor_take = (en - st).min(max_len / 2);
-    out_syms.extend_from_slice(&pg.sym_seq[st..st + anchor_take]);
-
-    // Continuation par projection causale maximale depuis H* (déterministe, équivariante)
+    // Complète si besoin uniquement le long de transitions causales fortement soutenues dans E et H*
     let mut cur = *out_syms.last().unwrap_or(&0);
     let mut visit_counts = vec![0usize; k];
     for &s in &out_syms {
@@ -370,22 +370,26 @@ pub fn emit_explanation(h: &HypothesisState, pg: &PerceivedGraph, max_len: usize
         let mut best_next = 0usize;
         let mut best_val = f64::NEG_INFINITY;
         for v in 0..k {
-            let p = h.sym_trans[cur * k + v];
-            // Pénalité anti-stagnation pour favoriser l'explication maximale plutôt qu'une boucle de 1 octet
-            let rep_pen = 1.0 / (1.0 + 0.35 * (visit_counts[v] as f64));
-            let self_pen = if v == cur { 0.45 } else { 1.0 };
-            let val = p * rep_pen * self_pen;
+            // Soutien causal conjoint de H* et des co-occurrences structurelles observées
+            let p_h = h.sym_trans[cur * k + v];
+            let support = pg.emp_trans1[cur * k + v];
+            if support < 1e-4 {
+                continue;
+            }
+            let rep_pen = 1.0 / (1.0 + 0.4 * (visit_counts[v] as f64));
+            let val = p_h * support.sqrt() * rep_pen;
             if val > best_val {
                 best_val = val;
                 best_next = v;
             }
         }
+        if !best_val.is_finite() || best_val <= 1e-8 {
+            break;
+        }
         out_syms.push(best_next);
         visit_counts[best_next] += 1;
         cur = best_next;
-
-        // Si l'on a couvert l'essentiel des transitions fortes du segment cible, on reste borné
-        if out_syms.len() >= 24 && visit_counts.iter().filter(|&&c| c > 0).count() >= (k * 3 / 4).max(2) && out_syms.len() >= max_len / 2 {
+        if out_syms.len() >= max_len * 3 / 4 && visit_counts.iter().filter(|&&c| c > 0).count() >= (k / 2).max(2) {
             break;
         }
     }
@@ -393,33 +397,41 @@ pub fn emit_explanation(h: &HypothesisState, pg: &PerceivedGraph, max_len: usize
     out_syms.into_iter().map(|s| pg.unique_bytes[s]).collect()
 }
 
-/// Construit une augmentation de E correspondant exactement à ce que le résidu indique manquer
-/// (utilisé dans le test de résidu du critère A : ajouter à E ce qu'il indique manquer doit faire monter φ_sharp).
+/// Construit une augmentation de E qui renforce le maillon causal déficitaire identifié par le résidu.
 pub fn build_residue_augmentation(observed_e: &[u8], report: &PhiReport) -> Vec<u8> {
     let pg = PerceivedGraph::from_bytes(observed_e);
-    let (u, v) = report.top_residue_pair;
-    if pg.k() < 2 {
+    let k = pg.k();
+    if k < 2 {
         return observed_e.to_vec();
     }
-    let bu = pg.unique_bytes[u % pg.k()];
-    let bv = pg.unique_bytes[v % pg.k()];
+    let (u, v) = report.top_residue_pair;
+    let u = u % k;
+    let v = v % k;
 
-    // Injecte des ponts relationnels manquants autour du couple déficitaire (u, v)
-    let mut augmented = observed_e.to_vec();
-    for _ in 0..3 {
-        augmented.push(bu);
-        augmented.push(bv);
-        // Chaîne le meilleur successeur de v dans E pour fermer la boucle causale
-        let mut best_w = 0;
-        let mut best_p = -1.0;
-        for w in 0..pg.k() {
-            let p = pg.emp_trans1[v * pg.k() + w];
-            if p > best_p {
-                best_p = p;
-                best_w = w;
-            }
+    // Trouve le prédécesseur et le successeur naturels de (u, v) dans E pour former un pont causal complet
+    let mut prev_u = 0;
+    let mut best_prev = -1.0;
+    for p in 0..k {
+        if pg.emp_trans1[p * k + u] > best_prev {
+            best_prev = pg.emp_trans1[p * k + u];
+            prev_u = p;
         }
-        augmented.push(pg.unique_bytes[best_w]);
+    }
+    let mut next_v = 0;
+    let mut best_next = -1.0;
+    for w in 0..k {
+        if pg.emp_trans1[v * k + w] > best_next {
+            best_next = pg.emp_trans1[v * k + w];
+            next_v = w;
+        }
+    }
+
+    let mut augmented = observed_e.to_vec();
+    for _ in 0..6 {
+        augmented.push(pg.unique_bytes[prev_u]);
+        augmented.push(pg.unique_bytes[u]);
+        augmented.push(pg.unique_bytes[v]);
+        augmented.push(pg.unique_bytes[next_v]);
     }
     augmented
 }
