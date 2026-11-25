@@ -135,6 +135,32 @@ fn cmd_smoke(a: &[String]) -> io::Result<()> {
     Ok(())
 }
 
+fn cmd_probe(a: &[String]) -> io::Result<()> {
+    let mp = argval(a, "--model").unwrap_or_else(|| "out/sharp.phis".into());
+    let fp = argval(a, "--file")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "--file requis"))?;
+    let m = Model::load(&mp)?;
+    let e = std::fs::read(&fp)?;
+    let v = eff::build(&e, &m.view);
+    let w = substrate::wire(&v);
+    for (label, itv) in [
+        ("budget0", substrate::Itv { rounds: m.search.rounds, ..Default::default() }),
+        ("final", abduction::search(&m.params, &e, &v, &w, &m.search, m.seed, None).itv),
+    ] {
+        let mut t = ad::Tape::new();
+        let f = substrate::forward(&mut t, &m.params, &v, &w, &itv);
+        let mech = phi::build_mech(&t, &f, &v, &w, &m.search.phi);
+        let pv = phi::evaluate(&mut t, &m.params, &v, &w, &f, &mech, &m.search.phi);
+        println!("{}\tmech\t{}\tpe\t{}\tpc\t{}", label, mech.m.len(), mech.pe.len(), mech.pc.len());
+        println!("{}\tinfo_e\t{:.8}\tinteg_e\t{:.8}", label, t.scalar_of(pv.info_e), t.scalar_of(pv.integ_e));
+        println!("{}\tinfo_c\t{:.8}\tinteg_c\t{:.8}", label, t.scalar_of(pv.info_c), t.scalar_of(pv.integ_c));
+        println!("{}\tstab\t{:.8}\tcov\t{:.8}\tsharp\t{:.8}", label, pv.stab_f, pv.cov_f, pv.sharp_f);
+    }
+    let id = substrate::identity_program(&e, &v);
+    println!("temoin\tphi_identity\t{:.8}", eval::phi_of_program(&m, &e, &v, &w, &id));
+    Ok(())
+}
+
 fn main() {
     let a: Vec<String> = std::env::args().skip(1).collect();
     let cmd = a.first().cloned().unwrap_or_else(|| "help".into());
@@ -150,6 +176,7 @@ fn main() {
             &argval(&a, "--work").unwrap_or_else(|| "out/blind".into()),
         ),
         "smoke" => cmd_smoke(&a),
+        "probe" => cmd_probe(&a),
         _ => {
             eprintln!(
                 "phisharp\n\n  ask --model out/sharp.phis --file perceived.eff\n  \
