@@ -50,12 +50,21 @@ pub struct Episode {
     pub hidden_cause: CauseFamily,
 }
 
+/// Épisode composite PTGRS : plusieurs moules + une requête sur alphabet strictement disjoint.
+/// Les métadonnées `hidden_*` ne sont JAMAIS vues durant l'entraînement.
+#[derive(Clone, Debug)]
+pub struct CompositeEpisode {
+    pub effect: Vec<u8>,
+    pub hidden_query_idx: usize,
+    pub hidden_match_idx: usize,
+    pub hidden_families: Vec<CauseFamily>,
+}
+
 struct TermNode {
     terminal: Option<u8>,
     children: Vec<usize>,
 }
 
-/// Graphe de termes minimal avec partage de sous-graphes (DAG).
 struct TermGraph {
     nodes: Vec<TermNode>,
 }
@@ -120,7 +129,7 @@ pub fn sample_episode(rng: &mut Rng, family: CauseFamily) -> Episode {
 
 pub fn sample_episode_in_range(rng: &mut Rng, family: CauseFamily, lo: u8, hi: u8) -> Episode {
     let mut tg = TermGraph::new();
-    let max_len = 48;
+    let max_len = 28 + rng.next_usize(25); // longueurs variables 28..52
 
     let root = match family {
         CauseFamily::Periodic => {
@@ -128,7 +137,7 @@ pub fn sample_episode_in_range(rng: &mut Rng, family: CauseFamily, lo: u8, hi: u
             let alpha = sample_alphabet(rng, period, lo, hi);
             let leaves: Vec<usize> = alpha.into_iter().map(|b| tg.add_leaf(b)).collect();
             let motif = tg.add_branch(leaves);
-            let reps = (36 / period).max(6);
+            let reps = (max_len / period).max(6) + 1;
             tg.add_branch(vec![motif; reps])
         }
         CauseFamily::Symmetric => {
@@ -137,7 +146,7 @@ pub fn sample_episode_in_range(rng: &mut Rng, family: CauseFamily, lo: u8, hi: u
             let fwd: Vec<usize> = alpha.iter().map(|&b| tg.add_leaf(b)).collect();
             let rev: Vec<usize> = fwd.iter().rev().copied().collect();
             let pal = tg.add_branch([fwd, rev].concat());
-            tg.add_branch(vec![pal, pal, pal])
+            tg.add_branch(vec![pal, pal, pal, pal])
         }
         CauseFamily::Nested => {
             let depth = 4 + rng.next_usize(3);
@@ -151,7 +160,7 @@ pub fn sample_episode_in_range(rng: &mut Rng, family: CauseFamily, lo: u8, hi: u
                 cur = tg.add_branch(vec![open, cur, close]);
             }
             let r = cur;
-            tg.add_branch(vec![r, r])
+            tg.add_branch(vec![r, r, r])
         }
         CauseFamily::SharedMotif => {
             let alpha = sample_alphabet(rng, 8, lo, hi);
@@ -169,18 +178,20 @@ pub fn sample_episode_in_range(rng: &mut Rng, family: CauseFamily, lo: u8, hi: u
             ])
         }
         CauseFamily::Arithmetic => {
-            let start = lo.wrapping_add((rng.next_usize((hi - lo).max(1) as usize)) as u8);
-            let step = (1 + rng.next_usize(7)) as u8;
+            let span = (hi - lo) as usize;
             let cycle = 5 + rng.next_usize(4);
-            let mut children = Vec::with_capacity(36);
-            for i in 0..36 {
-                let v = start.wrapping_add(step.wrapping_mul((i % cycle) as u8));
+            let max_step = (span / cycle.max(1)).clamp(1, 6);
+            let step = (1 + rng.next_usize(max_step)) as u8;
+            let max_start_off = span.saturating_sub((step as usize) * (cycle - 1));
+            let start = lo + (rng.next_usize(max_start_off + 1) as u8);
+            let mut children = Vec::with_capacity(max_len);
+            for i in 0..max_len {
+                let v = start + step * ((i % cycle) as u8);
                 children.push(tg.add_leaf(v));
             }
             tg.add_branch(children)
         }
         CauseFamily::Grammar => {
-            // Grammaire hiérarchique avec séparateur, racines morphologiques partagées et syntagmes
             let alpha = sample_alphabet(rng, 14, lo, hi);
             let sep = tg.add_leaf(alpha[0]);
 
@@ -220,5 +231,85 @@ pub fn sample_episode_in_range(rng: &mut Rng, family: CauseFamily, lo: u8, hi: u
     Episode {
         effect,
         hidden_cause: family,
+    }
+}
+
+/// Génère un effet composite multi-moules :
+/// - `num_molds` moules candidats (tous de causes distinctes) dans l'alphabet `[33..90]`
+/// - 1 requête de même cause cachée qu'un des moules dans un alphabet strictement disjoint
+///   (`[97..122]` si `printable_query`, sinon `[140..220]`).
+/// - Si `with_tags` est vrai, chaque moule reçoit un préfixe/étiquette dans `[33..90]`.
+/// - Si `query_last` est vrai, la requête est placée en dernière ligne (format définitions + requête).
+pub fn sample_composite_episode(
+    rng: &mut Rng,
+    num_molds: usize,
+    with_tags: bool,
+    printable_query: bool,
+    query_last: bool,
+) -> CompositeEpisode {
+    let mut fams = CauseFamily::ALL.to_vec();
+    rng.shuffle(&mut fams);
+    let k = num_molds.clamp(2, fams.len());
+    fams.truncate(k);
+
+    let target_fam = fams[0];
+    let mut entries: Vec<(Vec<u8>, CauseFamily, bool, bool)> = Vec::with_capacity(k + 1);
+
+    for (idx, &fam) in fams.iter().enumerate() {
+        let body = sample_episode_in_range(rng, fam, 33, 90).effect;
+        let line = if with_tags {
+            let mut prefix = if printable_query {
+                format!("MOLD_{}: ", fam.name().to_uppercase()).into_bytes()
+            } else {
+                let tag_len = 6 + rng.next_usize(5);
+                sample_alphabet(rng, tag_len, 33, 90)
+            };
+            prefix.extend_from_slice(&body);
+            prefix
+        } else {
+            body
+        };
+        entries.push((line, fam, false, idx == 0));
+    }
+
+    let (q_lo, q_hi) = if printable_query {
+        (97, 122)
+    } else {
+        (140, 220)
+    };
+    let query = sample_episode_in_range(rng, target_fam, q_lo, q_hi).effect;
+
+    if query_last {
+        rng.shuffle(&mut entries);
+        entries.push((query, target_fam, true, false));
+    } else {
+        entries.push((query, target_fam, true, false));
+        rng.shuffle(&mut entries);
+    }
+
+    let mut effect = Vec::new();
+    let mut hidden_query_idx = 0;
+    let mut hidden_match_idx = 0;
+    let mut hidden_families = Vec::with_capacity(entries.len());
+
+    for (i, (line, fam, is_query, is_match)) in entries.into_iter().enumerate() {
+        if i > 0 {
+            effect.push(b'\n');
+        }
+        effect.extend_from_slice(&line);
+        if is_query {
+            hidden_query_idx = i;
+        }
+        if is_match {
+            hidden_match_idx = i;
+        }
+        hidden_families.push(fam);
+    }
+
+    CompositeEpisode {
+        effect,
+        hidden_query_idx,
+        hidden_match_idx,
+        hidden_families,
     }
 }
