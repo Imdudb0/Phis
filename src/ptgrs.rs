@@ -454,7 +454,9 @@ fn gen_pat(
 }
 
 fn gen_tpl(arity: &[u8], used: &[u8], rng: &mut Rng, root_lab: u8, recursive: bool, depth: usize) -> Tpl {
-    let cands: Vec<usize> = (0..arity.len()).filter(|&l| arity[l] <= 2).collect();
+    let cands: Vec<usize> = (0..arity.len())
+        .filter(|&l| arity[l] >= 1 && arity[l] <= 2)
+        .collect();
     let lab = if recursive && rng.bernoulli(0.5) {
         root_lab as usize
     } else if cands.is_empty() {
@@ -604,7 +606,7 @@ pub struct Episode {
 /// de dictionnaire, jamais de texte, jamais d'auto-description.
 pub fn episode(spec: &FamilySpec, rng: &mut Rng) -> Episode {
     let mut best: Option<Episode> = None;
-    for _ in 0..8 {
+    for _ in 0..32 {
         let g = sample_grammar(spec, rng);
         let seed = sample_seed(&g, rng);
         let mut tg = seed.clone();
@@ -780,7 +782,7 @@ pub fn minidict(spec: &FamilySpec, rng: &mut Rng, k_entries: usize) -> MiniDict 
     used[colon as usize] = true;
     let qmark: u8 = (0..=255u8).find(|&i| !used[i as usize]).unwrap_or(2);
     used[qmark as usize] = true;
-    
+
     let mut e: Vec<u8> = Vec::new();
     let mut entries = Vec::new();
     for (i, body) in bodies.iter().enumerate() {
