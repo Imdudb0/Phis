@@ -18,21 +18,60 @@ pub struct TrainConfig {
     pub seed: u64,
 }
 
+/// Pénalise la moyenne ET le pire chevauchement (empêche 2 familles de fusionner).
 fn batch_collapse_penalty(states: &[[f32; STATE_DIM]]) -> f32 {
     let mut sum = 0.0f32;
+    let mut max_sq = 0.0f32;
     let mut pairs = 0usize;
     for i in 0..states.len() {
         for j in (i + 1)..states.len() {
             let c = cosine_sim(&states[i], &states[j]).max(0.0);
-            sum += c * c;
+            let sq = c * c;
+            sum += sq;
+            if sq > max_sq {
+                max_sq = sq;
+            }
             pairs += 1;
         }
     }
     if pairs == 0 {
         0.0
     } else {
-        sum / (pairs as f32)
+        0.5 * (sum / (pairs as f32)) + 0.5 * max_sq
     }
+}
+
+/// Spécificité générative croisée (non-supervisée) : chaque cause H_i doit expliquer E_i
+/// nettement mieux que le pire confondeur E_j du lot (bloque l'aplatissement du capteur).
+fn cross_specificity(
+    graph: &PhiGraph,
+    singles: &[PreparedEpisode],
+    states: &[[f32; STATE_DIM]],
+    residuals: &[f32],
+) -> f32 {
+    let n = singles.len();
+    if n < 2 {
+        return 0.0;
+    }
+    let rels_list: Vec<_> = singles
+        .iter()
+        .map(|ep| graph.encode_relations(&ep.orig))
+        .collect();
+    let mut spec_sum = 0.0f32;
+    for i in 0..n {
+        let mut min_other = f32::INFINITY;
+        for j in 0..n {
+            if i == j {
+                continue;
+            }
+            let (_, _, err_ij) = graph.evaluate_hypothesis(&states[i], &rels_list[j]);
+            if err_ij < min_other {
+                min_other = err_ij;
+            }
+        }
+        spec_sum += ((min_other - residuals[i]) / (min_other + 0.05)).clamp(0.0, 1.0);
+    }
+    spec_sum / (n as f32)
 }
 
 fn eval_batch(
@@ -42,13 +81,16 @@ fn eval_batch(
 ) -> f32 {
     let mut sum_phi = 0.0f32;
     let mut states = Vec::with_capacity(singles.len());
+    let mut residuals = Vec::with_capacity(singles.len());
     for ep in singles {
         let rep = compute_phi_sharp_prepared(graph, ep, false);
         sum_phi += rep.phi_sharp;
         states.push(rep.trace.final_state);
+        residuals.push(rep.residual);
     }
     let mean_phi = sum_phi / (singles.len() as f32);
     let collapse = batch_collapse_penalty(&states);
+    let spec = cross_specificity(graph, singles, &states, &residuals);
 
     let mut comp_sum = 0.0f32;
     for comp in composites {
@@ -60,7 +102,7 @@ fn eval_batch(
         comp_sum / (composites.len() as f32)
     };
 
-    mean_phi - 0.22 * collapse + 0.50 * mean_comp
+    mean_phi + 0.35 * spec - 0.40 * collapse + 0.55 * mean_comp
 }
 
 pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
@@ -80,7 +122,7 @@ pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
         .min(cfg.pop_pairs.max(1));
 
     println!(
-        "Entraînement Phisharp v0.4 ({} paramètres dont 140 capteur relationnel, {} étapes, {} paires ES, {} threads)...",
+        "Entraînement Phisharp v0.4.1 ({} paramètres dont 140 capteur relationnel, {} étapes, {} paires ES, {} threads)...",
         NUM_PARAMS, cfg.steps, cfg.pop_pairs, n_threads
     );
 
@@ -181,6 +223,7 @@ pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
             let mut integ = 0.0;
             let mut res = 0.0;
             let mut states = Vec::with_capacity(singles.len());
+            let mut residuals = Vec::with_capacity(singles.len());
             for ep in &singles {
                 let r = compute_phi_sharp_prepared(&model, ep, false);
                 phi += r.phi_sharp;
@@ -190,21 +233,24 @@ pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
                 integ += r.integration;
                 res += r.residual;
                 states.push(r.trace.final_state);
+                residuals.push(r.residual);
             }
             let n = singles.len() as f32;
             let coll = batch_collapse_penalty(&states);
+            let spec = cross_specificity(&model, &singles, &states, &residuals);
             let sel: f32 = composites
                 .iter()
                 .map(|c| compute_composite_phi_prepared(&model, c).selectivity)
                 .sum::<f32>()
                 / (composites.len() as f32);
             println!(
-                "step {:>4}/{:<4} | φ={:+.4} | Gen={:.3} Disc={:.3} Proj={:.3} IIT={:.3} RefSel={:.3} | res={:.3} coll={:.3} ({:.1}s)",
+                "step {:>4}/{:<4} | φ={:+.4} | Gen={:.3} Disc={:.3} Spec={:.3} Proj={:.3} IIT={:.3} RefSel={:.3} | res={:.3} coll={:.3} ({:.1}s)",
                 step,
                 cfg.steps,
                 phi / n,
                 gen_sum / n,
                 disc / n,
+                spec,
                 proj / n,
                 integ / n,
                 sel,
@@ -249,6 +295,7 @@ fn evaluate_post_hoc(model: &PhiGraph, seed: u64) {
     let proj_trials = 50;
     let mut hits_raw = 0usize;
     let mut hits_tagged = 0usize;
+    let mut ref_detected = 0usize;
     let mut avg_margin = 0.0f32;
 
     for _ in 0..proj_trials {
@@ -264,8 +311,13 @@ fn evaluate_post_hoc(model: &PhiGraph, seed: u64) {
         let spans_tag = segment_effect(&ep_tag.effect);
         let m_tag =
             project_query_to_molds(model, &ep_tag.effect, &spans_tag, ep_tag.hidden_query_idx);
-        if m_tag.first().map(|m| m.dst_idx) == Some(ep_tag.hidden_match_idx) {
-            hits_tagged += 1;
+        if let Some(top) = m_tag.first() {
+            if top.dst_idx == ep_tag.hidden_match_idx {
+                hits_tagged += 1;
+                if top.referent.is_some() {
+                    ref_detected += 1;
+                }
+            }
         }
         if m_tag.len() >= 2 {
             avg_margin += m_tag[0].score - m_tag[1].score;
@@ -285,10 +337,12 @@ fn evaluate_post_hoc(model: &PhiGraph, seed: u64) {
         100.0 * (hits_raw as f32) / (proj_trials as f32)
     );
     println!(
-        "  Moules étiquetés (0 octet commun)  : {}/{} ({:.1}%)  [marge Top1-Top2 = {:+.4}]",
+        "  Moules étiquetés (0 octet commun)  : {}/{} ({:.1}%)  [marge Top1-Top2 = {:+.4}, référent extrait = {}/{}]",
         hits_tagged,
         proj_trials,
         100.0 * (hits_tagged as f32) / (proj_trials as f32),
-        avg_margin / (proj_trials as f32)
+        avg_margin / (proj_trials as f32),
+        ref_detected,
+        hits_tagged
     );
 }
