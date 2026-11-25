@@ -1,768 +1,553 @@
-//! PTGRS : Probabilistic Term Graph Rewriting System.
+//! Probabilistic Term Graph Rewriting System (PTGRS).
 //!
-//! Nœuds : `Atom` (symbole), `Cat` (concaténation), `Call` (non-terminal).
-//! Un `Call` est réécrit EN PLACE par l'une des règles de son op, tirée selon les
-//! poids. Un nœud référencé par plusieurs parents n'est donc réécrit qu'une fois :
-//! les occurrences du nœud partagé donnent exactement la même chaîne (copie,
-//! accord), alors que deux `Call` distincts d'un même op tirent indépendamment
-//! (variation). E est le rendu (yield) du graphe en forme normale.
+//! Séparation stricte des types :
+//! - `PtgrsSample` : contient UNIQUEMENT `observed_e: Vec<u8>`. C'est la seule structure vue à l'entraînement.
+//! - `PtgrsEvalCase` : contient `observed_e` + la cause cachée `HiddenCause` (pour l'évaluation post-hoc uniquement).
 //!
-//! La cause cachée C n'est jamais utilisée pour entraîner : `training_e` ne
-//! renvoie que E. C ne sort que par `draw_instance`, réservé à l'évaluation.
+//! Tout échantillon PTGRS utilise une bijection aléatoire d'octets pour que l'alphabet soit
+//! strictement auto-spécifié et exempt de tout prior lexical ou symbolique fixe.
 
-use crate::canon::{Canon, ABSENT};
-use crate::util::Rng;
-use std::collections::BTreeMap;
-
-pub type Sym = u16;
-pub type OpId = u16;
-
-/// Nœud d'un graphe de membre droit. Les enfants d'un `Cat` ont un indice
-/// strictement inférieur à celui du `Cat` (ordre topologique : DAG garanti).
-#[derive(Clone, Debug, PartialEq)]
-pub enum RNode {
-    Atom(Sym),
-    Call(OpId),
-    Cat(Vec<usize>),
-}
-
-#[derive(Clone, Debug)]
-pub struct Rule {
-    pub nodes: Vec<RNode>,
-    pub root: usize,
-    pub weight: f64,
-    /// 0 = aucune. Sinon, l'étendue du rendu du nœud est consignée (évaluation).
-    pub tag: u16,
-}
-
-impl Rule {
-    pub fn has_call(&self) -> bool {
-        self.nodes.iter().any(|n| matches!(n, RNode::Call(_)))
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct Ptgrs {
-    pub n_atoms: usize,
-    /// ops[o] = alternatives (règles) de l'op o.
-    pub ops: Vec<Vec<Rule>>,
-    pub start: OpId,
-}
-
-#[derive(Clone, Debug)]
-pub struct Limits {
-    pub max_steps: usize,
-    pub max_len: usize,
-    pub max_depth: usize,
-}
-
-impl Default for Limits {
-    fn default() -> Limits {
-        Limits { max_steps: 20_000, max_len: 4096, max_depth: 64 }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct Sample {
-    pub syms: Vec<Sym>,
-    /// (tag, début, fin) dans l'ordre post-fixe.
-    pub spans: Vec<(u16, usize, usize)>,
-    pub steps: usize,
-}
-
-#[derive(Clone, Copy, Debug)]
-enum Kind {
-    Atom(Sym),
-    Cat,
-    Call(OpId),
-}
-
-struct Gn {
-    kind: Kind,
-    kids: Vec<u32>,
-    tag: u16,
-    done: bool,
-}
-
-impl Ptgrs {
-    pub fn new(n_atoms: usize) -> Ptgrs {
-        Ptgrs { n_atoms, ops: Vec::new(), start: 0 }
-    }
-
-    pub fn add_op(&mut self) -> OpId {
-        self.ops.push(Vec::new());
-        (self.ops.len() - 1) as OpId
-    }
-
-    pub fn add_rule(&mut self, op: OpId, rule: Rule) {
-        self.ops[op as usize].push(rule);
-    }
-
-    pub fn validate(&self) -> Result<(), String> {
-        if self.ops.is_empty() {
-            return Err("aucun op".to_string());
-        }
-        if (self.start as usize) >= self.ops.len() {
-            return Err("start hors bornes".to_string());
-        }
-        for (o, alts) in self.ops.iter().enumerate() {
-            for (r, rule) in alts.iter().enumerate() {
-                if rule.root >= rule.nodes.len() {
-                    return Err(format!("op {o} règle {r}: racine hors bornes"));
-                }
-                if !(rule.weight >= 0.0) {
-                    return Err(format!("op {o} règle {r}: poids invalide"));
-                }
-                for (i, nd) in rule.nodes.iter().enumerate() {
-                    match nd {
-                        RNode::Atom(a) => {
-                            if (*a as usize) >= self.n_atoms {
-                                return Err(format!("op {o} règle {r}: atome hors bornes"));
-                            }
-                        }
-                        RNode::Call(c) => {
-                            if (*c as usize) >= self.ops.len() {
-                                return Err(format!("op {o} règle {r}: appel hors bornes"));
-                            }
-                        }
-                        RNode::Cat(ks) => {
-                            for &k in ks {
-                                if k >= i {
-                                    return Err(format!("op {o} règle {r}: cycle ou ordre"));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Renomme les atomes (map[ancien] = nouveau) ; `n_new` = nouvelle taille d'alphabet.
-    pub fn relabel(&self, map: &[Sym], n_new: usize) -> Ptgrs {
-        let mut g = self.clone();
-        g.n_atoms = n_new;
-        for alts in g.ops.iter_mut() {
-            for r in alts.iter_mut() {
-                for nd in r.nodes.iter_mut() {
-                    if let RNode::Atom(a) = nd {
-                        *a = map[*a as usize];
-                    }
-                }
-            }
-        }
-        g
-    }
-
-    /// Un tirage de E par réécriture probabiliste de graphe. `None` si une limite saute.
-    pub fn generate(&self, rng: &mut Rng, lim: &Limits) -> Option<Sample> {
-        let mut g: Vec<Gn> = vec![Gn { kind: Kind::Call(self.start), kids: Vec::new(), tag: 0, done: false }];
-        let mut steps = 0usize;
-        if !self.reduce(&mut g, 0, rng, lim, &mut steps, 0) {
-            return None;
-        }
-        let mut syms: Vec<Sym> = Vec::new();
-        let mut spans: Vec<(u16, usize, usize)> = Vec::new();
-        if !Self::flatten(&g, 0, &mut syms, &mut spans, lim.max_len) {
-            return None;
-        }
-        Some(Sample { syms, spans, steps })
-    }
-
-    fn choose_rule(&self, op: usize, rng: &mut Rng, depth: usize, lim: &Limits) -> usize {
-        let alts = &self.ops[op];
-        if alts.len() == 1 {
-            return 0;
-        }
-        let mut w: Vec<f64> = alts.iter().map(|r| r.weight.max(0.0)).collect();
-        // Profondeur avancée : on privilégie les règles terminales pour borner la récursion.
-        if depth * 2 >= lim.max_depth && alts.iter().any(|r| !r.has_call()) {
-            for (i, r) in alts.iter().enumerate() {
-                if r.has_call() {
-                    w[i] = 0.0;
-                }
-            }
-        }
-        rng.weighted(&w)
-    }
-
-    fn reduce(&self, g: &mut Vec<Gn>, n: usize, rng: &mut Rng, lim: &Limits, steps: &mut usize, depth: usize) -> bool {
-        if g[n].done {
-            return true;
-        }
-        if depth > lim.max_depth {
-            return false;
-        }
-        loop {
-            let op = match g[n].kind {
-                Kind::Call(op) => op as usize,
-                _ => break,
-            };
-            if *steps >= lim.max_steps || self.ops[op].is_empty() {
-                return false;
-            }
-            *steps += 1;
-            let ri = self.choose_rule(op, rng, depth, lim);
-            let rule = &self.ops[op][ri];
-            let base = g.len();
-            for nd in &rule.nodes {
-                let (kind, kids) = match nd {
-                    RNode::Atom(a) => (Kind::Atom(*a), Vec::new()),
-                    RNode::Call(o) => (Kind::Call(*o), Vec::new()),
-                    RNode::Cat(ix) => (Kind::Cat, ix.iter().map(|&i| (base + i) as u32).collect()),
-                };
-                g.push(Gn { kind, kids, tag: 0, done: false });
-            }
-            let r = base + rule.root;
-            let (k, ks) = (g[r].kind, g[r].kids.clone());
-            g[n].kind = k;
-            g[n].kids = ks;
-            if rule.tag != 0 {
-                g[n].tag = rule.tag;
-            }
-        }
-        g[n].done = true;
-        let kids = g[n].kids.clone();
-        for k in kids {
-            if !self.reduce(g, k as usize, rng, lim, steps, depth + 1) {
-                return false;
-            }
-        }
-        true
-    }
-
-    fn flatten(g: &[Gn], n: usize, out: &mut Vec<Sym>, spans: &mut Vec<(u16, usize, usize)>, max_len: usize) -> bool {
-        let start = out.len();
-        match g[n].kind {
-            Kind::Atom(a) => {
-                if out.len() >= max_len {
-                    return false;
-                }
-                out.push(a);
-            }
-            Kind::Cat => {
-                for &k in &g[n].kids {
-                    if !Self::flatten(g, k as usize, out, spans, max_len) {
-                        return false;
-                    }
-                }
-            }
-            Kind::Call(_) => return false,
-        }
-        if g[n].tag != 0 {
-            spans.push((g[n].tag, start, out.len()));
-        }
-        true
-    }
-
-    pub fn dump(&self) -> String {
-        let mut s = String::new();
-        for (o, alts) in self.ops.iter().enumerate() {
-            for r in alts {
-                let body: Vec<String> = r
-                    .nodes
-                    .iter()
-                    .enumerate()
-                    .map(|(i, n)| match n {
-                        RNode::Atom(a) => format!("n{i}=a{a}"),
-                        RNode::Call(c) => format!("n{i}=@{c}"),
-                        RNode::Cat(k) => format!("n{i}=cat{k:?}"),
-                    })
-                    .collect();
-                s.push_str(&format!("op{o} w={:.3} tag={} root=n{} : {}\n", r.weight, r.tag, r.root, body.join(" ")));
-            }
-        }
-        s
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Construction de causes
-// ---------------------------------------------------------------------------
-
-/// Morceau d'une règle `Cat`. `S(k)` référence le k-ième nœud partagé de la règle
-/// (un `Call` instancié une seule fois puis réutilisé : accord / copie).
-#[derive(Clone, Copy, Debug)]
-pub enum Part {
-    A(Sym),
-    C(OpId),
-    S(usize),
-}
-
-pub struct Builder {
-    pub g: Ptgrs,
-}
-
-impl Builder {
-    /// L'op 0 est l'op de départ.
-    pub fn new(n_atoms: usize) -> Builder {
-        let mut g = Ptgrs::new(n_atoms);
-        g.add_op();
-        Builder { g }
-    }
-
-    pub fn op(&mut self) -> OpId {
-        self.g.add_op()
-    }
-
-    pub fn word(rng: &mut Rng, n_atoms: usize, lo: usize, hi: usize) -> Vec<Sym> {
-        let len = rng.range(lo, hi);
-        (0..len).map(|_| rng.below(n_atoms) as Sym).collect()
-    }
-
-    pub fn atoms(w: &[Sym]) -> Vec<Part> {
-        w.iter().map(|&a| Part::A(a)).collect()
-    }
-
-    /// Ajoute à `op` une règle : nœuds partagés `shared` puis `Cat(parts)`.
-    pub fn rule(&mut self, op: OpId, weight: f64, shared: &[OpId], parts: &[Part]) {
-        let mut nodes: Vec<RNode> = shared.iter().map(|&o| RNode::Call(o)).collect();
-        let mut kids: Vec<usize> = Vec::new();
-        for p in parts {
-            match p {
-                Part::S(k) => kids.push(*k),
-                Part::A(a) => {
-                    nodes.push(RNode::Atom(*a));
-                    kids.push(nodes.len() - 1);
-                }
-                Part::C(o) => {
-                    nodes.push(RNode::Call(*o));
-                    kids.push(nodes.len() - 1);
-                }
-            }
-        }
-        nodes.push(RNode::Cat(kids));
-        let root = nodes.len() - 1;
-        self.g.add_rule(op, Rule { nodes, root, weight, tag: 0 });
-    }
-
-    /// Op déterministe : un mot (chunk).
-    pub fn chunk(&mut self, w: &[Sym]) -> OpId {
-        let op = self.op();
-        self.rule(op, 1.0, &[], &Self::atoms(w));
-        op
-    }
-
-    /// Op à alternatives : un mot par alternative.
-    pub fn choice(&mut self, alts: &[Vec<Sym>], weights: &[f64]) -> OpId {
-        let op = self.op();
-        for (i, w) in alts.iter().enumerate() {
-            self.rule(op, weights[i], &[], &Self::atoms(w));
-        }
-        op
-    }
-
-    /// Cadre : pre, filler (un seul tirage dans la règle), post.
-    pub fn frame(&mut self, pre: &[Sym], slot: OpId, post: &[Sym]) -> OpId {
-        let op = self.op();
-        let mut parts = Self::atoms(pre);
-        parts.push(Part::C(slot));
-        parts.extend(Self::atoms(post));
-        self.rule(op, 1.0, &[], &parts);
-        op
-    }
-
-    /// Cadre à accord : pre, X, mid, X, post avec le MÊME nœud X (réécrit une fois).
-    pub fn agree(&mut self, pre: &[Sym], slot: OpId, mid: &[Sym], post: &[Sym]) -> OpId {
-        let op = self.op();
-        let mut parts = Self::atoms(pre);
-        parts.push(Part::S(0));
-        parts.extend(Self::atoms(mid));
-        parts.push(Part::S(0));
-        parts.extend(Self::atoms(post));
-        self.rule(op, 1.0, &[slot], &parts);
-        op
-    }
-
-    /// Op de catégorie aléatoire (2 à 4 alternatives).
-    pub fn new_slot(&mut self, rng: &mut Rng) -> OpId {
-        let na = self.g.n_atoms;
-        let k = rng.range(2, 4);
-        let alts: Vec<Vec<Sym>> = (0..k).map(|_| Self::word(rng, na, 1, 3)).collect();
-        let ws: Vec<f64> = (0..k).map(|_| 0.3 + rng.f64()).collect();
-        self.choice(&alts, &ws)
-    }
-
-    /// Règle de départ.
-    pub fn finish(mut self, top: &[Part]) -> Ptgrs {
-        self.rule(0, 1.0, &[], top);
-        self.g
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Familles d'ENTRAÎNEMENT (les familles hors-distribution vivent dans `ladder`)
-// ---------------------------------------------------------------------------
+use crate::math::Rng;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Family {
-    Repeat,
-    Frame,
-    Agree,
-    Hier,
-    List,
-    Mixed,
+pub enum RuleFamily {
+    /// Familles vues à l'entraînement (PTGRS fermé)
+    Compose,
+    PermuteBind,
+    ShareFold,
+    ContextualShift,
+    ChainStep,
+    /// Familles hors-distribution (jamais vues à l'entraînement)
+    OodDeepNested,
+    OodCyclicEquiv,
+    OodRelationalTransfer,
 }
 
-pub const TRAIN_FAMILIES: [Family; 6] =
-    [Family::Repeat, Family::Frame, Family::Agree, Family::Hier, Family::List, Family::Mixed];
-
-fn frag_repeat(b: &mut Builder, rng: &mut Rng) -> Vec<Part> {
-    let na = b.g.n_atoms;
-    let nm = rng.range(1, 2);
-    let mut ms: Vec<OpId> = Vec::new();
-    for _ in 0..nm {
-        let w = Builder::word(rng, na, 2, 4);
-        ms.push(b.chunk(&w));
+impl RuleFamily {
+    pub fn in_dist_all() -> &'static [RuleFamily] {
+        &[
+            RuleFamily::Compose,
+            RuleFamily::PermuteBind,
+            RuleFamily::ShareFold,
+            RuleFamily::ContextualShift,
+            RuleFamily::ChainStep,
+        ]
     }
-    let mut top: Vec<Part> = Vec::new();
-    for _ in 0..rng.range(3, 7) {
-        top.push(Part::C(ms[rng.below(ms.len())]));
-        if rng.chance(0.5) {
-            top.push(Part::A(rng.below(na) as Sym));
-        }
-    }
-    top
-}
 
-fn frag_frame(b: &mut Builder, rng: &mut Rng) -> Vec<Part> {
-    let na = b.g.n_atoms;
-    let pre = Builder::word(rng, na, 1, 3);
-    let post = Builder::word(rng, na, 1, 2);
-    let slot = b.new_slot(rng);
-    let f = b.frame(&pre, slot, &post);
-    (0..rng.range(4, 8)).map(|_| Part::C(f)).collect()
-}
-
-fn frag_agree(b: &mut Builder, rng: &mut Rng) -> Vec<Part> {
-    let na = b.g.n_atoms;
-    let pre = Builder::word(rng, na, 1, 2);
-    let mid = Builder::word(rng, na, 1, 2);
-    let post = Builder::word(rng, na, 1, 2);
-    let slot = b.new_slot(rng);
-    let t = b.agree(&pre, slot, &mid, &post);
-    (0..rng.range(3, 6)).map(|_| Part::C(t)).collect()
-}
-
-fn frag_hier(b: &mut Builder, rng: &mut Rng, depth: usize) -> Vec<Part> {
-    let na = b.g.n_atoms;
-    let mut level: Vec<OpId> = Vec::new();
-    for _ in 0..rng.range(2, 3) {
-        let w = Builder::word(rng, na, 2, 3);
-        level.push(b.chunk(&w));
-    }
-    for _ in 0..depth {
-        let mut next: Vec<OpId> = Vec::new();
-        for _ in 0..rng.range(1, 2) {
-            let op = b.op();
-            let k = rng.range(2, 3);
-            let parts: Vec<Part> = (0..k).map(|_| Part::C(level[rng.below(level.len())])).collect();
-            b.rule(op, 1.0, &[], &parts);
-            next.push(op);
-        }
-        level = next;
-    }
-    (0..rng.range(3, 5)).map(|_| Part::C(level[rng.below(level.len())])).collect()
-}
-
-fn frag_list(b: &mut Builder, rng: &mut Rng) -> Vec<Part> {
-    let na = b.g.n_atoms;
-    let slot = b.new_slot(rng);
-    let sep = rng.below(na) as Sym;
-    let r = rng.range(4, 8);
-    let mut top: Vec<Part> = Vec::new();
-    for i in 0..r {
-        top.push(Part::C(slot));
-        if i + 1 < r {
-            top.push(Part::A(sep));
-        }
-    }
-    top
-}
-
-fn fragment(b: &mut Builder, rng: &mut Rng, idx: usize) -> Vec<Part> {
-    match idx % 5 {
-        0 => frag_repeat(b, rng),
-        1 => frag_frame(b, rng),
-        2 => frag_agree(b, rng),
-        3 => {
-            let d = rng.range(1, 2);
-            frag_hier(b, rng, d)
-        }
-        _ => frag_list(b, rng),
+    pub fn ood_all() -> &'static [RuleFamily] {
+        &[
+            RuleFamily::OodDeepNested,
+            RuleFamily::OodCyclicEquiv,
+            RuleFamily::OodRelationalTransfer,
+        ]
     }
 }
-
-/// Construit une cause de la famille demandée sur `n_atoms` atomes.
-pub fn build_cause(rng: &mut Rng, fam: Family, n_atoms: usize) -> Ptgrs {
-    let mut b = Builder::new(n_atoms);
-    let top: Vec<Part> = match fam {
-        Family::Repeat => fragment(&mut b, rng, 0),
-        Family::Frame => fragment(&mut b, rng, 1),
-        Family::Agree => fragment(&mut b, rng, 2),
-        Family::Hier => fragment(&mut b, rng, 3),
-        Family::List => fragment(&mut b, rng, 4),
-        Family::Mixed => {
-            let i = rng.below(5);
-            let j = (i + 1 + rng.below(4)) % 5;
-            let mut a = fragment(&mut b, rng, i);
-            let c = fragment(&mut b, rng, j);
-            if rng.chance(0.5) {
-                a.extend(c);
-                a
-            } else {
-                let mut c = c;
-                c.extend(a);
-                c
-            }
-        }
-    };
-    b.finish(&top)
-}
-
-// ---------------------------------------------------------------------------
-// Instances (E + vérité terrain réservée à l'évaluation)
-// ---------------------------------------------------------------------------
-
-pub struct Instance {
-    pub e: Vec<u8>,
-    /// Cause cachée : ne sert qu'à évaluer après coup.
-    pub cause: Ptgrs,
-    /// atome du générateur -> octet.
-    pub atom_byte: Vec<u8>,
-    pub spans: Vec<(u16, usize, usize)>,
-}
-
-impl Instance {
-    /// Cause exprimée dans l'alphabet canonique de E (les atomes absents de E
-    /// reçoivent des identifiants >= canon.n(), jamais confondus avec ceux de H).
-    pub fn cause_in_canon(&self, canon: &Canon) -> Ptgrs {
-        let mut map: Vec<Sym> = vec![0; self.cause.n_atoms];
-        let mut extra = canon.n();
-        for a in 0..self.cause.n_atoms {
-            let s = canon.sym_of[self.atom_byte[a] as usize];
-            if s != ABSENT {
-                map[a] = s as Sym;
-            } else {
-                map[a] = extra as Sym;
-                extra += 1;
-            }
-        }
-        self.cause.relabel(&map, extra)
-    }
-}
-
-/// Alphabet aléatoire : n octets distincts (ASCII imprimable une fois sur deux).
-pub fn random_alphabet(rng: &mut Rng, n: usize) -> Vec<u8> {
-    let mut pool: Vec<u8> = if rng.chance(0.5) { (33..=126u8).collect() } else { (0..=255u8).collect() };
-    rng.shuffle(&mut pool);
-    pool.truncate(n.min(pool.len()));
-    pool
-}
-
-/// Tire une cause et un E ; `None` si E sort de [len_lo, len_hi] ou dégénère.
-pub fn draw_instance(rng: &mut Rng, fam: Family, len_lo: usize, len_hi: usize) -> Option<Instance> {
-    let n_atoms = rng.range(4, 10);
-    let cause = build_cause(rng, fam, n_atoms);
-    if cause.validate().is_err() {
-        return None;
-    }
-    let lim = Limits { max_len: len_hi, ..Limits::default() };
-    let s = cause.generate(rng, &lim)?;
-    if s.syms.len() < len_lo || s.syms.len() > len_hi {
-        return None;
-    }
-    let atom_byte = random_alphabet(rng, n_atoms);
-    let e: Vec<u8> = s.syms.iter().map(|&a| atom_byte[a as usize]).collect();
-    let mut seen = [false; 256];
-    let mut distinct = 0;
-    for &b in &e {
-        if !seen[b as usize] {
-            seen[b as usize] = true;
-            distinct += 1;
-        }
-    }
-    if distinct < 3 {
-        return None;
-    }
-    Some(Instance { e, cause, atom_byte, spans: s.spans })
-}
-
-/// Seule porte d'entrée de l'entraînement : E, sans la cause.
-pub fn training_e(rng: &mut Rng) -> Vec<u8> {
-    for _ in 0..200 {
-        let fam = TRAIN_FAMILIES[rng.below(TRAIN_FAMILIES.len())];
-        if let Some(inst) = draw_instance(rng, fam, 24, 160) {
-            return inst.e;
-        }
-    }
-    b"abcabcabcabcabcabcabcabc".to_vec()
-}
-
-// ---------------------------------------------------------------------------
-// Équivalence observationnelle (pas égalité de graphes)
-// ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug)]
-pub struct ObsDist {
-    /// JS sur les chaînes exactes ; `None` si le support est quasi injectif.
-    pub strings: Option<f64>,
-    /// JS moyen sur les profils de 1-, 2-, 3-grammes.
-    pub ngrams: f64,
-    /// JS sur la distribution des longueurs.
-    pub lengths: f64,
+pub struct TermNode {
+    pub id: usize,
+    pub op: u8,          // identifiant abstrait d'opérateur (0..op_vocab)
+    pub children: Vec<usize>,
 }
 
-impl ObsDist {
-    pub fn total(&self) -> f64 {
-        match self.strings {
-            Some(s) => (s + self.ngrams + self.lengths) / 3.0,
-            None => (self.ngrams + self.lengths) / 2.0,
+#[derive(Clone, Debug)]
+pub struct TermGraph {
+    pub nodes: Vec<TermNode>,
+    pub root: usize,
+}
+
+impl TermGraph {
+    pub fn canonical_signature(&self, node_id: usize, depth: usize, visited: &mut Vec<usize>) -> u64 {
+        if depth > 12 || node_id >= self.nodes.len() {
+            return 0x517C_C1B7_2722_0A95;
         }
-    }
-    pub fn quality(&self) -> f64 {
-        1.0 - self.total()
-    }
-}
-
-fn bump<K: Ord>(m: &mut BTreeMap<K, f64>, k: K) {
-    *m.entry(k).or_insert(0.0) += 1.0;
-}
-
-/// Divergence de Jensen-Shannon (base 2), dans [0, 1].
-fn js<K: Ord + Clone>(p: &BTreeMap<K, f64>, q: &BTreeMap<K, f64>) -> f64 {
-    let sp: f64 = p.values().sum();
-    let sq: f64 = q.values().sum();
-    if sp <= 0.0 || sq <= 0.0 {
-        return 1.0;
-    }
-    let mut both: BTreeMap<K, (f64, f64)> = BTreeMap::new();
-    for (k, v) in p {
-        both.entry(k.clone()).or_insert((0.0, 0.0)).0 = v / sp;
-    }
-    for (k, v) in q {
-        both.entry(k.clone()).or_insert((0.0, 0.0)).1 = v / sq;
-    }
-    let mut d = 0.0;
-    for (_, &(a, b)) in both.iter() {
-        let m = 0.5 * (a + b);
-        if a > 0.0 {
-            d += 0.5 * a * (a / m).log2();
+        if let Some(pos) = visited.iter().position(|&x| x == node_id) {
+            // Partage / cycle dans le graphe de termes
+            return 0x9E37_79B9_0000_0000u64 ^ (pos as u64);
         }
-        if b > 0.0 {
-            d += 0.5 * b * (b / m).log2();
+        visited.push(node_id);
+        let node = &self.nodes[node_id];
+        let mut h = (node.op as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9) ^ (node.children.len() as u64);
+        for (idx, &ch) in node.children.iter().enumerate() {
+            let sub = self.canonical_signature(ch, depth + 1, visited);
+            h = h.rotate_left(11) ^ sub.wrapping_add((idx as u64 + 1).wrapping_mul(0x94D0_49BB_1331_11EB));
         }
+        visited.pop();
+        h
     }
-    d.clamp(0.0, 1.0)
-}
 
-fn profile(samples: &[Vec<Sym>], n: usize) -> BTreeMap<Vec<Sym>, f64> {
-    let mut m: BTreeMap<Vec<Sym>, f64> = BTreeMap::new();
-    for s in samples {
-        if s.len() >= n {
-            for w in s.windows(n) {
-                bump(&mut m, w.to_vec());
-            }
+    /// Sérialise le graphe sous forme d'expression relationnelle dans l'alphabet fourni.
+    pub fn render_in_alphabet(&self, node_id: usize, alphabet: &AlphabetMap, depth: usize, out: &mut Vec<u8>, visited: &mut Vec<usize>) {
+        if depth > 7 || node_id >= self.nodes.len() {
+            out.push(alphabet.wildcard_byte());
+            return;
         }
-    }
-    m
-}
-
-pub fn sample_many(sys: &Ptgrs, rng: &mut Rng, n: usize, lim: &Limits) -> Vec<Vec<Sym>> {
-    let mut out: Vec<Vec<Sym>> = Vec::new();
-    let mut tries = 0;
-    while out.len() < n && tries < n * 4 {
-        tries += 1;
-        if let Some(s) = sys.generate(rng, lim) {
-            out.push(s.syms);
+        if let Some(pos) = visited.iter().position(|&x| x == node_id) {
+            out.push(alphabet.ref_marker());
+            out.push(alphabet.op_byte((pos % alphabet.op_count()) as u8));
+            return;
         }
-    }
-    out
-}
-
-/// Distance observationnelle entre deux systèmes (mêmes symboles, p. ex. C
-/// ramenée à l'alphabet canonique de E et H compilée en PTGRS).
-pub fn obs_dist(a: &Ptgrs, b: &Ptgrs, rng: &mut Rng, n: usize, lim: &Limits) -> Option<ObsDist> {
-    let sa = sample_many(a, rng, n, lim);
-    let sb = sample_many(b, rng, n, lim);
-    if sa.is_empty() || sb.is_empty() || sa.len() < n / 2 || sb.len() < n / 2 {
-        return None;
-    }
-    let mut ma: BTreeMap<Vec<Sym>, f64> = BTreeMap::new();
-    let mut mb: BTreeMap<Vec<Sym>, f64> = BTreeMap::new();
-    for s in &sa {
-        bump(&mut ma, s.clone());
-    }
-    for s in &sb {
-        bump(&mut mb, s.clone());
-    }
-    let uniq_a = ma.len() as f64 / sa.len() as f64;
-    let uniq_b = mb.len() as f64 / sb.len() as f64;
-    let strings = if uniq_a > 0.5 || uniq_b > 0.5 { None } else { Some(js(&ma, &mb)) };
-    let mut ng = 0.0;
-    for k in 1..=3 {
-        ng += js(&profile(&sa, k), &profile(&sb, k));
-    }
-    ng /= 3.0;
-    let mut la: BTreeMap<usize, f64> = BTreeMap::new();
-    let mut lb: BTreeMap<usize, f64> = BTreeMap::new();
-    for s in &sa {
-        bump(&mut la, s.len() / 4);
-    }
-    for s in &sb {
-        bump(&mut lb, s.len() / 4);
-    }
-    Some(ObsDist { strings, ngrams: ng, lengths: js(&la, &lb) })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn familles_valides_et_generatives() {
-        let mut rng = Rng::new(11);
-        for fam in TRAIN_FAMILIES {
-            let mut ok = false;
-            for _ in 0..50 {
-                if let Some(inst) = draw_instance(&mut rng, fam, 8, 400) {
-                    assert!(inst.cause.validate().is_ok());
-                    assert!(!inst.e.is_empty());
-                    ok = true;
-                    break;
+        visited.push(node_id);
+        let node = &self.nodes[node_id];
+        out.push(alphabet.op_byte(node.op));
+        if !node.children.is_empty() {
+            out.push(alphabet.open_delim());
+            for (i, &ch) in node.children.iter().enumerate() {
+                if i > 0 {
+                    out.push(alphabet.sep_byte());
                 }
+                self.render_in_alphabet(ch, alphabet, depth + 1, out, visited);
             }
-            assert!(ok, "famille {:?} ne produit rien", fam);
+            out.push(alphabet.close_delim());
+        }
+        visited.pop();
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum RhsTemplate {
+    /// f(x, y) -> g(h(x), y)
+    Compose { g: u8, h: u8 },
+    /// f(x, y) -> k(y, x)
+    Permute { k: u8 },
+    /// f(x) -> d(x, x) (partage de sous-terme dans le graphe)
+    Share { d: u8 },
+    /// c(a, x) -> r(x, a) avec permutation d'arité variable
+    Shift { r: u8 },
+    /// x -> s(x) ou s(f(x)) en chaîne
+    Chain { s: u8 },
+    /// OOD : f(g(x, y), z) -> h(z, m(x, y, x))
+    OodDeep { h: u8, m: u8 },
+    /// OOD : transformation cyclique à parité alternée
+    OodCyclic { p: u8, q: u8 },
+    /// OOD : composition transitive relationnelle (a~b, b~c -> a~c)
+    OodTransitive { rel: u8 },
+}
+
+#[derive(Clone, Debug)]
+pub struct RewriteRule {
+    pub family: RuleFamily,
+    pub lhs_op: u8,
+    pub prob: f64,
+    pub template: RhsTemplate,
+}
+
+#[derive(Clone, Debug)]
+pub struct HiddenCause {
+    pub rules: Vec<RewriteRule>,
+    pub seed_graph: TermGraph,
+    pub alphabet: AlphabetMap,
+    pub num_steps: usize,
+}
+
+/// Bijection aléatoire d'octets propre à chaque instance PTGRS.
+#[derive(Clone, Debug)]
+pub struct AlphabetMap {
+    pub bytes: Vec<u8>, // longueur >= 24 : [ops..., open, close, sep, arrow, clause_end, ref_mark, wildcard, query_mark]
+    pub num_ops: usize,
+}
+
+impl AlphabetMap {
+    pub fn random(rng: &mut Rng, num_ops: usize) -> Self {
+        // On permute des octets imprimables ASCII (33..=126) ou octets quelconques (1..=254)
+        // L'usage d'octets quelconques garantit l'absence de tout biais ASCII.
+        let mut pool: Vec<u8> = (1u8..=254u8).collect();
+        rng.shuffle(&mut pool);
+        let total = num_ops + 8;
+        Self {
+            bytes: pool[..total].to_vec(),
+            num_ops,
         }
     }
 
-    #[test]
-    fn partage_donne_copie_exacte() {
-        // T -> [X ; X ; X] avec X partagé : les trois occurrences sont identiques.
-        let mut b = Builder::new(4);
-        let slot = b.choice(&[vec![0], vec![1], vec![2, 3]], &[1.0, 1.0, 1.0]);
-        let t = b.op();
-        b.rule(t, 1.0, &[slot], &[Part::S(0), Part::A(3), Part::S(0)]);
-        let g = b.finish(&[Part::C(t)]);
-        let mut rng = Rng::new(5);
-        for _ in 0..30 {
-            let s = g.generate(&mut rng, &Limits::default()).unwrap().syms;
-            let k = (s.len() - 1) / 2;
-            assert_eq!(s[..k], s[k + 1..]);
-        }
+    pub fn op_count(&self) -> usize {
+        self.num_ops
     }
 
-    #[test]
-    fn obs_dist_soi_meme_faible() {
-        let mut rng = Rng::new(21);
-        let inst = loop {
-            if let Some(i) = draw_instance(&mut rng, Family::Frame, 8, 400) {
-                break i;
+    #[inline]
+    pub fn op_byte(&self, op: u8) -> u8 {
+        self.bytes[(op as usize) % self.num_ops]
+    }
+    #[inline]
+    pub fn open_delim(&self) -> u8 { self.bytes[self.num_ops] }
+    #[inline]
+    pub fn close_delim(&self) -> u8 { self.bytes[self.num_ops + 1] }
+    #[inline]
+    pub fn sep_byte(&self) -> u8 { self.bytes[self.num_ops + 2] }
+    #[inline]
+    pub fn arrow_byte(&self) -> u8 { self.bytes[self.num_ops + 3] }
+    #[inline]
+    pub fn clause_end(&self) -> u8 { self.bytes[self.num_ops + 4] }
+    #[inline]
+    pub fn ref_marker(&self) -> u8 { self.bytes[self.num_ops + 5] }
+    #[inline]
+    pub fn wildcard_byte(&self) -> u8 { self.bytes[self.num_ops + 6] }
+    #[inline]
+    pub fn query_marker(&self) -> u8 { self.bytes[self.num_ops + 7] }
+}
+
+/// Donnée d'entraînement : UNIQUEMENT l'effet observé E en octets.
+#[derive(Clone, Debug)]
+pub struct PtgrsSample {
+    pub observed_e: Vec<u8>,
+}
+
+/// Donnée d'évaluation : inclut la cause cachée C (jamais exposée à l'entraînement).
+#[derive(Clone, Debug)]
+pub struct PtgrsEvalCase {
+    pub observed_e: Vec<u8>,
+    pub cause: HiddenCause,
+    pub target_explanation: Vec<u8>,
+    pub ood: bool,
+}
+
+fn build_random_term_graph(rng: &mut Rng, num_ops: usize, num_nodes: usize) -> TermGraph {
+    let mut nodes = Vec::with_capacity(num_nodes);
+    for id in 0..num_nodes {
+        let op = rng.usize_below(num_ops) as u8;
+        let max_arity = if id == 0 { 0 } else { 2.min(id) };
+        let arity = if id == 0 { 0 } else { rng.usize_below(max_arity + 1) };
+        let mut children = Vec::with_capacity(arity);
+        for _ in 0..arity {
+            children.push(rng.usize_below(id));
+        }
+        nodes.push(TermNode { id, op, children });
+    }
+    TermGraph {
+        root: num_nodes - 1,
+        nodes,
+    }
+}
+
+fn apply_rule_step(graph: &mut TermGraph, rules: &[RewriteRule], rng: &mut Rng, step_idx: usize) -> bool {
+    let mut candidates = Vec::new();
+    for (nid, node) in graph.nodes.iter().enumerate() {
+        for (rid, rule) in rules.iter().enumerate() {
+            if node.op == rule.lhs_op {
+                candidates.push((nid, rid, rule.prob));
             }
+        }
+    }
+    if candidates.is_empty() {
+        return false;
+    }
+    let probs: Vec<f64> = candidates.iter().map(|c| c.2).collect();
+    let pick = rng.sample_categorical(&probs);
+    let (nid, rid, _) = candidates[pick];
+    let rule = &rules[rid];
+
+    let existing_children = graph.nodes[nid].children.clone();
+    let c0 = *existing_children.first().unwrap_or(&0);
+    let c1 = *existing_children.get(1).unwrap_or(&c0);
+
+    match &rule.template {
+        RhsTemplate::Compose { g, h } => {
+            let h_id = graph.nodes.len();
+            graph.nodes.push(TermNode { id: h_id, op: *h, children: vec![c0] });
+            graph.nodes[nid].op = *g;
+            graph.nodes[nid].children = vec![h_id, c1];
+        }
+        RhsTemplate::Permute { k } => {
+            graph.nodes[nid].op = *k;
+            graph.nodes[nid].children = if existing_children.len() >= 2 {
+                vec![c1, c0]
+            } else {
+                vec![c0]
+            };
+        }
+        RhsTemplate::Share { d } => {
+            graph.nodes[nid].op = *d;
+            graph.nodes[nid].children = vec![c0, c0];
+        }
+        RhsTemplate::Shift { r } => {
+            graph.nodes[nid].op = *r;
+            if existing_children.len() >= 2 {
+                let mut rot = existing_children;
+                rot.rotate_left(1);
+                graph.nodes[nid].children = rot;
+            }
+        }
+        RhsTemplate::Chain { s } => {
+            let inner = graph.nodes.len();
+            graph.nodes.push(TermNode {
+                id: inner,
+                op: graph.nodes[nid].op,
+                children: existing_children,
+            });
+            graph.nodes[nid].op = *s;
+            graph.nodes[nid].children = vec![inner];
+        }
+        RhsTemplate::OodDeep { h, m } => {
+            let c2 = *existing_children.get(2).unwrap_or(&c1);
+            let m_id = graph.nodes.len();
+            graph.nodes.push(TermNode {
+                id: m_id,
+                op: *m,
+                children: vec![c0, c1, c0],
+            });
+            graph.nodes[nid].op = *h;
+            graph.nodes[nid].children = vec![c2, m_id];
+        }
+        RhsTemplate::OodCyclic { p, q } => {
+            let next_op = if step_idx % 2 == 0 { *p } else { *q };
+            let prev_id = graph.nodes.len();
+            graph.nodes.push(TermNode {
+                id: prev_id,
+                op: next_op,
+                children: vec![c0],
+            });
+            graph.nodes[nid].op = if step_idx % 2 == 0 { *q } else { *p };
+            // Partage mutuel dans le graphe
+            graph.nodes[nid].children = vec![prev_id, c1];
+        }
+        RhsTemplate::OodTransitive { rel } => {
+            let bridge = graph.nodes.len();
+            graph.nodes.push(TermNode {
+                id: bridge,
+                op: *rel,
+                children: vec![c1, c0],
+            });
+            graph.nodes[nid].op = *rel;
+            graph.nodes[nid].children = vec![c0, bridge];
+        }
+    }
+    true
+}
+
+fn generate_rules(rng: &mut Rng, num_ops: usize, num_rules: usize, ood: bool) -> Vec<RewriteRule> {
+    let families = if ood { RuleFamily::ood_all() } else { RuleFamily::in_dist_all() };
+    let mut rules = Vec::with_capacity(num_rules);
+    for i in 0..num_rules {
+        let fam = families[(i + rng.usize_below(families.len())) % families.len()];
+        let lhs_op = (i % num_ops) as u8;
+        let prob = 0.25 + 0.75 * rng.next_f64();
+        let op_rand = |r: &mut Rng| (r.usize_below(num_ops)) as u8;
+        let template = match fam {
+            RuleFamily::Compose => RhsTemplate::Compose { g: op_rand(rng), h: op_rand(rng) },
+            RuleFamily::PermuteBind => RhsTemplate::Permute { k: op_rand(rng) },
+            RuleFamily::ShareFold => RhsTemplate::Share { d: op_rand(rng) },
+            RuleFamily::ContextualShift => RhsTemplate::Shift { r: op_rand(rng) },
+            RuleFamily::ChainStep => RhsTemplate::Chain { s: op_rand(rng) },
+            RuleFamily::OodDeepNested => RhsTemplate::OodDeep { h: op_rand(rng), m: op_rand(rng) },
+            RuleFamily::OodCyclicEquiv => RhsTemplate::OodCyclic { p: op_rand(rng), q: op_rand(rng) },
+            RuleFamily::OodRelationalTransfer => RhsTemplate::OodTransitive { rel: op_rand(rng) },
         };
-        let mut r2 = Rng::new(22);
-        let d = obs_dist(&inst.cause, &inst.cause, &mut r2, 100, &Limits::default()).unwrap();
-        assert!(d.total() < 0.35);
+        rules.push(RewriteRule { family: fam, lhs_op, prob, template });
     }
+    rules
+}
+
+fn build_eval_case_internal(rng: &mut Rng, ood: bool, num_ops: usize, num_steps: usize) -> PtgrsEvalCase {
+    let alphabet = AlphabetMap::random(rng, num_ops);
+    let num_rules = if ood { 5 + rng.usize_below(4) } else { 3 + rng.usize_below(4) };
+    let rules = generate_rules(rng, num_ops, num_rules, ood);
+    let seed_graph = build_random_term_graph(rng, num_ops, if ood { 10 } else { 7 });
+
+    let mut current = seed_graph.clone();
+    let mut observed_e = Vec::with_capacity(256);
+    let mut visited = Vec::new();
+
+    // Chaque pas de réécriture produit des paires relationnelles (avant -> après) qui composent E.
+    // E contient donc la trace des effets observables dans l'alphabet auto-spécifié.
+    for step in 0..num_steps {
+        let mut before_bytes = Vec::new();
+        current.render_in_alphabet(current.root, &alphabet, 0, &mut before_bytes, &mut visited);
+        visited.clear();
+
+        let applied = apply_rule_step(&mut current, &rules, rng, step);
+
+        let mut after_bytes = Vec::new();
+        current.render_in_alphabet(current.root, &alphabet, 0, &mut after_bytes, &mut visited);
+        visited.clear();
+
+        if applied {
+            observed_e.extend_from_slice(&before_bytes);
+            observed_e.push(alphabet.arrow_byte());
+            observed_e.extend_from_slice(&after_bytes);
+            observed_e.push(alphabet.clause_end());
+        } else {
+            // Sonde d'un sous-terme actif pour entretenir la couverture relationnelle
+            let sub = rng.usize_below(current.nodes.len());
+            current.render_in_alphabet(sub, &alphabet, 0, &mut observed_e, &mut visited);
+            visited.clear();
+            observed_e.push(alphabet.clause_end());
+        }
+    }
+
+    // Dernière observation (état résultant / effet terminal)
+    observed_e.push(alphabet.query_marker());
+    let mut target_explanation = Vec::new();
+    current.render_in_alphabet(current.root, &alphabet, 0, &mut target_explanation, &mut visited);
+    observed_e.extend_from_slice(&target_explanation);
+    observed_e.push(alphabet.clause_end());
+
+    // Garantir une longueur exploitable et bornée
+    if observed_e.len() > 768 {
+        observed_e.truncate(768);
+    }
+
+    PtgrsEvalCase {
+        observed_e,
+        cause: HiddenCause {
+            rules,
+            seed_graph,
+            alphabet,
+            num_steps,
+        },
+        target_explanation,
+        ood,
+    }
+}
+
+/// Génère un échantillon d'entraînement FERMÉ : uniquement E (jamais C).
+pub fn sample_training_effect(rng: &mut Rng) -> PtgrsSample {
+    let num_ops = 6 + rng.usize_below(7);
+    let num_steps = 5 + rng.usize_below(6);
+    let case = build_eval_case_internal(rng, false, num_ops, num_steps);
+    PtgrsSample {
+        observed_e: case.observed_e,
+    }
+}
+
+/// Génère un cas d'évaluation PTGRS complet (in-dist ou OOD) avec cause cachée post-hoc.
+pub fn sample_eval_case(rng: &mut Rng, ood: bool) -> PtgrsEvalCase {
+    let num_ops = if ood { 9 + rng.usize_below(6) } else { 6 + rng.usize_below(7) };
+    let num_steps = if ood { 8 + rng.usize_below(6) } else { 5 + rng.usize_below(6) };
+    build_eval_case_internal(rng, ood, num_ops, num_steps)
+}
+
+/// Échelon 2 de l'échelle d'évaluation : Mini-dictionnaire généré par PTGRS (cause C connue post-hoc).
+/// Les règles de réécriture forment des "entrées de dictionnaire" relationnelles suivies d'une requête implicite.
+pub fn sample_mini_dictionary(rng: &mut Rng, ood: bool) -> PtgrsEvalCase {
+    let num_ops = 10 + rng.usize_below(6);
+    let alphabet = AlphabetMap::random(rng, num_ops);
+    let rules = generate_rules(rng, num_ops, 6, ood);
+    let seed_graph = build_random_term_graph(rng, num_ops, 8);
+
+    let mut observed_e = Vec::with_capacity(512);
+    let mut visited = Vec::new();
+
+    // Chaque règle génère plusieurs exemples définitionnels dans le mini-dictionnaire
+    for r in &rules {
+        let mut g = TermGraph {
+            nodes: vec![
+                TermNode { id: 0, op: (r.lhs_op + 1) % (num_ops as u8), children: vec![] },
+                TermNode { id: 1, op: (r.lhs_op + 2) % (num_ops as u8), children: vec![] },
+                TermNode { id: 2, op: r.lhs_op, children: vec![0, 1] },
+            ],
+            root: 2,
+        };
+        g.render_in_alphabet(g.root, &alphabet, 0, &mut observed_e, &mut visited);
+        visited.clear();
+        observed_e.push(alphabet.arrow_byte());
+        apply_rule_step(&mut g, std::slice::from_ref(r), rng, 0);
+        g.render_in_alphabet(g.root, &alphabet, 0, &mut observed_e, &mut visited);
+        visited.clear();
+        observed_e.push(alphabet.clause_end());
+    }
+
+    // Requête composite finale dérivée par la composition des règles cachées
+    let mut query_g = seed_graph.clone();
+    observed_e.push(alphabet.query_marker());
+    query_g.render_in_alphabet(query_g.root, &alphabet, 0, &mut observed_e, &mut visited);
+    visited.clear();
+    observed_e.push(alphabet.clause_end());
+
+    for s in 0..4 {
+        apply_rule_step(&mut query_g, &rules, rng, s);
+    }
+    let mut target_explanation = Vec::new();
+    query_g.render_in_alphabet(query_g.root, &alphabet, 0, &mut target_explanation, &mut visited);
+
+    PtgrsEvalCase {
+        observed_e,
+        cause: HiddenCause {
+            rules,
+            seed_graph,
+            alphabet,
+            num_steps: 4,
+        },
+        target_explanation,
+        ood,
+    }
+}
+
+/// Équivalence observationnelle entre deux causes cachées (pas égalité de graphes !) :
+/// Compare les signatures canoniques de réduction sur un ensemble de graphes-sondes déterministes.
+pub fn observational_equivalence(c1: &HiddenCause, c2: &HiddenCause) -> f64 {
+    let mut probe_rng1 = Rng::new(0xA1B2_C3D4_E5F6_0001);
+    let mut probe_rng2 = Rng::new(0xA1B2_C3D4_E5F6_0001);
+    let probes = 12;
+    let mut matches = 0.0;
+    let mut visited = Vec::new();
+
+    for p in 0..probes {
+        let ops = c1.alphabet.op_count().min(c2.alphabet.op_count()).max(2);
+        let mut g1 = build_random_term_graph(&mut probe_rng1, ops, 5 + (p % 4));
+        let mut g2 = g1.clone();
+        for s in 0..3 {
+            apply_rule_step(&mut g1, &c1.rules, &mut probe_rng1, s);
+            apply_rule_step(&mut g2, &c2.rules, &mut probe_rng2, s);
+        }
+        let s1 = g1.canonical_signature(g1.root, 0, &mut visited);
+        visited.clear();
+        let s2 = g2.canonical_signature(g2.root, 0, &mut visited);
+        visited.clear();
+        if s1 == s2 {
+            matches += 1.0;
+        } else {
+            // Proximité structurelle (opérateurs racines et arité)
+            let n1 = &g1.nodes[g1.root];
+            let n2 = &g2.nodes[g2.root];
+            if n1.op == n2.op && n1.children.len() == n2.children.len() {
+                matches += 0.35;
+            }
+        }
+    }
+    matches / (probes as f64)
+}
+
+/// Mesure post-hoc de qualité de cause retrouvée à partir d'une distribution relationnelle
+/// estimée sur E, confrontée aux transitions réelles produites par la cause cachée C.
+pub fn cause_recovery_score(
+    eval_case: &PtgrsEvalCase,
+    predicted_transition_matrix: &[f64],
+    unique_symbols: &[u8],
+) -> f64 {
+    let k = unique_symbols.len();
+    if k < 2 || predicted_transition_matrix.len() != k * k {
+        return 0.0;
+    }
+
+    // On exécute C sur une sonde fraîche pour obtenir les transitions causales vraies dans l'alphabet de C
+    let mut probe_rng = Rng::new(0xDEAD_BEEF_1234_5678);
+    let mut g = eval_case.cause.seed_graph.clone();
+    let mut true_seq = Vec::new();
+    let mut visited = Vec::new();
+    for s in 0..6 {
+        apply_rule_step(&mut g, &eval_case.cause.rules, &mut probe_rng, s);
+        g.render_in_alphabet(g.root, &eval_case.cause.alphabet, 0, &mut true_seq, &mut visited);
+        visited.clear();
+        true_seq.push(eval_case.cause.alphabet.clause_end());
+    }
+
+    let mut byte_to_idx = [usize::MAX; 256];
+    for (idx, &b) in unique_symbols.iter().enumerate() {
+        byte_to_idx[b as usize] = idx;
+    }
+
+    let mut hits = 0.0;
+    let mut count = 0.0;
+    for w in true_seq.windows(2) {
+        let i = byte_to_idx[w[0] as usize];
+        let j = byte_to_idx[w[1] as usize];
+        if i < k && j < k {
+            let p = predicted_transition_matrix[i * k + j].clamp(0.0, 1.0);
+            // Comparé au hasard uniforme 1/k
+            let lift = (p * (k as f64)).clamp(0.0, 4.0) / 4.0;
+            hits += lift;
+            count += 1.0;
+        }
+    }
+    if count < 1.0 { 0.0 } else { (hits / count).clamp(0.0, 1.0) }
 }
