@@ -1,9 +1,14 @@
-//! Substrat connexionniste 100% relationnel à matrices non-réciproques (v0.3.1).
+//! Substrat connexionniste 100% relationnel à matrices non-réciproques (v0.4.0).
 //!
-//! - Opérateur causal multiplicatif routé intégralement par V_lat (`w_op_mod`), sans table KxK directe.
-//! - Segmentation émergente par pics statistiques significatifs (> mean + 0.85 * std), sans couper les mots.
-//! - Invariance bijective exacte conservée.
+//! Avancées structurelles :
+//! 1. Découverte de motifs multi-octets émergents par cohésion PMI (sans rien coder en dur,
+//!    strictement invariant sous permutation bijective d'octets).
+//! 2. Graphe relationnel inter-clauses NON-SÉQUENTIEL (`ctx_adj`) reliant les clauses par
+//!    recouvrement de motifs pondéré par IDF et flux asymétrique (fini `c-1 -> c+1`).
+//! 3. Segmentation émergente adaptative (`MAX_CTX = 48`, `min_span = 6`) capable d'isoler
+//!    proprement des requêtes courtes ("Who are social?") sans les fusionner dans un article voisin.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
@@ -12,7 +17,8 @@ use crate::math::{Rng, entropy_bits, matvec, normalize_prob, sigmoid, softplus, 
 
 pub const D: usize = 12;
 pub const N_LAT: usize = 12;
-pub const MAX_CTX: usize = 24;
+pub const MAX_CTX: usize = 48;
+pub const MAX_MOTIFS: usize = 72;
 pub const SYM_FEAT_DIM: usize = 14;
 pub const CTX_FEAT_DIM: usize = 10;
 pub const POLICY_IN_DIM: usize = 20;
@@ -28,13 +34,22 @@ pub struct PerceivedGraph {
     pub emp_trans2: Vec<f64>,
     pub emp_cooccur: Vec<f64>,
     pub emp_marginal: Vec<f64>,
+    /// Motifs émergents multi-octets (séquences d'indices symboliques, invariants à π)
+    pub motifs: Vec<Vec<usize>>,
+    /// Spans des motifs découverts dans sym_seq : Vec<(start_pos, motif_id)>
+    pub motif_occurrences: Vec<(usize, usize)>,
+    pub motif_idf: Vec<f64>,
+    /// Poids TF-IDF des motifs par clause (n_ctx * n_motifs)
+    pub ctx_motif_weights: Vec<f64>,
+    /// Matrice d'adjacence relationnelle NON-SÉQUENTIELLE entre clauses (n_ctx * n_ctx)
+    pub ctx_adj: Vec<f64>,
     pub ctx_features: Vec<[f64; CTX_FEAT_DIM]>,
     pub ctx_sym_weights: Vec<f64>,
     pub ctx_spans: Vec<(usize, usize)>,
 }
 
-/// Détecte uniquement les vraies frontières émergentes de clauses (pics locaux > mean + 0.85 * std),
-/// de façon strictement invariante sous renommage bijectif d'octets.
+/// Découvre les frontières naturelles de clauses (sans délimiteur codé en dur),
+/// avec détection renforcée des séparateurs récurrents (ex. doubles retours, ponctuations terminales).
 fn discover_emergent_spans(
     sym_seq: &[usize],
     emp_trans1: &[f64],
@@ -43,7 +58,7 @@ fn discover_emergent_spans(
     k: usize,
 ) -> Vec<(usize, usize)> {
     let n = sym_seq.len();
-    if n < 16 || k < 2 {
+    if n < 12 || k < 2 {
         return vec![(0, n.max(1))];
     }
 
@@ -53,9 +68,13 @@ fn discover_emergent_spans(
         let h_out = sym_features[u][4];
         let h_in = sym_features[u][5];
         let asym = sym_features[u][7];
-        // Un séparateur de clause est fréquent, très dispersé en sortie/entrée et non-cohésif intérieurement
+        let self_rep = sym_features[u][8];
         let cohesion = sym_features[u][12];
-        sym_boundary_affinity[u] = freq.sqrt() * (0.45 * h_out + 0.35 * h_in + 0.20 * asym) * (1.15 - 0.5 * cohesion);
+        // Un séparateur de paragraphe/clause a forte entropie gauche/droite, faible cohésion
+        // interne, et apparaît parfois doublé ou en fin de motif.
+        let rep_bonus = if self_rep > 0.05 && freq < 0.08 { 0.45 * self_rep } else { 0.0 };
+        sym_boundary_affinity[u] =
+            freq.sqrt() * (0.45 * h_out + 0.35 * h_in + 0.20 * asym) * (1.20 - 0.55 * cohesion) + rep_bonus;
     }
 
     let mut raw_scores = vec![0.0; n];
@@ -76,7 +95,9 @@ fn discover_emergent_spans(
             }
         }
         let discont = 1.0 - (overlap / (left_slice.len().max(1) as f64));
-        raw_scores[i] = 0.55 * sym_boundary_affinity[u] + 0.25 * surprisal + 0.20 * discont;
+        // Double répétition locale (ex. deux délimiteurs consécutifs)
+        let double_sep = if u == sym_seq[i - 1] && emp_marginal[u] < 0.08 { 0.30 } else { 0.0 };
+        raw_scores[i] = 0.55 * sym_boundary_affinity[u] + 0.25 * surprisal + 0.20 * discont + double_sep;
     }
 
     let mean = raw_scores[1..(n - 1)].iter().sum::<f64>() / ((n - 2).max(1) as f64);
@@ -85,9 +106,10 @@ fn discover_emergent_spans(
         .map(|&x| (x - mean) * (x - mean))
         .sum::<f64>()
         / ((n - 2).max(1) as f64);
-    let threshold = mean + 0.85 * var.sqrt();
+    let threshold = mean + 0.90 * var.sqrt();
 
-    let min_span = (n / 32).clamp(12, 32);
+    // min_span bas (6..16) pour ne jamais avaler une requête courte dans le paragraphe précédent
+    let min_span = (n / 120).clamp(6, 16);
     let mut peaks: Vec<(f64, usize)> = Vec::new();
     for i in min_span..(n.saturating_sub(min_span)) {
         if raw_scores[i] > threshold
@@ -111,7 +133,7 @@ fn discover_emergent_spans(
 
     if cuts.len() < 2 {
         cuts.clear();
-        let segs = 6.min(n / 8).max(1);
+        let segs = 6.min(n / 6).max(1);
         for c in 1..segs {
             cuts.push((c * n) / segs);
         }
@@ -135,6 +157,159 @@ fn discover_emergent_spans(
     spans
 }
 
+/// Découvre des motifs multi-octets cohésifs par fusions itératives guidées par PMI
+/// (100 % invariant à toute permutation bijective π des octets).
+fn discover_emergent_motifs(
+    sym_seq: &[usize],
+    k: usize,
+    ctx_spans: &[(usize, usize)],
+) -> (Vec<Vec<usize>>, Vec<(usize, usize)>) {
+    let n = sym_seq.len();
+    if n < 12 || k < 2 {
+        return (Vec::new(), Vec::new());
+    }
+
+    // Chaque position porte (unit_id, start_in_sym_seq, len_in_sym_seq)
+    let mut units: Vec<Vec<usize>> = (0..k).map(|s| vec![s]).collect();
+    let mut seq: Vec<(usize, usize)> = sym_seq.iter().enumerate().map(|(pos, &s)| (s, pos)).collect();
+
+    // 4 passes de fusion cohésive (permet de découvrir des motifs jusqu'à 8-12 octets)
+    let mut merged_motifs: Vec<Vec<usize>> = Vec::new();
+    for pass in 0..4 {
+        if seq.len() < 6 || merged_motifs.len() >= MAX_MOTIFS {
+            break;
+        }
+        let u_count = units.len();
+        let mut counts = vec![0usize; u_count];
+        for &(u, _) in &seq {
+            counts[u] += 1;
+        }
+
+        let mut pair_counts: HashMap<(usize, usize), usize> = HashMap::new();
+        for w in seq.windows(2) {
+            // Évite de fusionner deux unités de longueur > 6 ensemble trop vite
+            if units[w[0].0].len() + units[w[1].0].len() <= 12 {
+                *pair_counts.entry((w[0].0, w[1].0)).or_insert(0) += 1;
+            }
+        }
+
+        let seq_f = seq.len() as f64;
+        let mut scored_pairs: Vec<(f64, (usize, usize), usize)> = Vec::new();
+        let min_freq = if n > 1000 { 3 } else { 2 };
+
+        for ((a, b), c_ab) in pair_counts {
+            if c_ab < min_freq {
+                continue;
+            }
+            let ca = counts[a] as f64;
+            let cb = counts[b] as f64;
+            let pmi = ((c_ab as f64) * seq_f / (ca * cb).max(1.0)).max(1e-6).ln();
+            if pmi <= 0.4 {
+                continue;
+            }
+            // Score de cohésion : PMI * sqrt(freq)
+            let score = pmi * (c_ab as f64).sqrt();
+            scored_pairs.push((score, (a, b), c_ab));
+        }
+
+        scored_pairs.sort_by(|x, y| y.0.total_cmp(&x.0));
+        let top_k_merge = if pass < 2 { 18 } else { 14 };
+        let mut merge_map: HashMap<(usize, usize), usize> = HashMap::new();
+
+        for &(_, pair, _) in scored_pairs.iter().take(top_k_merge) {
+            if merged_motifs.len() >= MAX_MOTIFS {
+                break;
+            }
+            let mut combined = units[pair.0].clone();
+            combined.extend_from_slice(&units[pair.1]);
+            let new_id = units.len();
+            units.push(combined.clone());
+            merged_motifs.push(combined);
+            merge_map.insert(pair, new_id);
+        }
+
+        if merge_map.is_empty() {
+            break;
+        }
+
+        let mut next_seq = Vec::with_capacity(seq.len());
+        let mut idx = 0;
+        while idx < seq.len() {
+            if idx + 1 < seq.len() {
+                if let Some(&new_u) = merge_map.get(&(seq[idx].0, seq[idx + 1].0)) {
+                    next_seq.push((new_u, seq[idx].1));
+                    idx += 2;
+                    continue;
+                }
+            }
+            next_seq.push(seq[idx]);
+            idx += 1;
+        }
+        seq = next_seq;
+    }
+
+    // Ajoute aussi les n-grammes récurrents multi-clauses (de longueur 2..6) qui apparaissent
+    // dans >= 2 clauses distinctes afin d'assurer la couverture des ponts référentiels inter-clauses.
+    if merged_motifs.len() < MAX_MOTIFS && ctx_spans.len() >= 2 {
+        let mut clause_of_pos = vec![0usize; n];
+        for (c_idx, &(st, en)) in ctx_spans.iter().enumerate() {
+            for p in st..en.min(n) {
+                clause_of_pos[p] = c_idx;
+            }
+        }
+        let mut span_clauses: HashMap<&[usize], (usize, usize)> = HashMap::new();
+        for len in [4usize, 3, 5, 2] {
+            if n < len {
+                continue;
+            }
+            span_clauses.clear();
+            for pos in 0..=(n - len) {
+                let slice = &sym_seq[pos..pos + len];
+                let c = clause_of_pos[pos];
+                span_clauses
+                    .entry(slice)
+                    .and_modify(|e| {
+                        e.0 += 1;
+                        if e.1 != c {
+                            e.1 = usize::MAX; // vu dans >= 2 clauses distinctes
+                        }
+                    })
+                    .or_insert((1, c));
+            }
+            let mut cross_candidates: Vec<(f64, Vec<usize>)> = span_clauses
+                .iter()
+                .filter(|&(_, &(cnt, marker))| marker == usize::MAX && cnt >= 2)
+                .map(|(sl, &(cnt, _))| ((cnt as f64) * (len as f64).sqrt(), sl.to_vec()))
+                .collect();
+            cross_candidates.sort_by(|a, b| b.0.total_cmp(&a.0));
+            for (_, cand) in cross_candidates {
+                if merged_motifs.len() >= MAX_MOTIFS {
+                    break;
+                }
+                if !merged_motifs.iter().any(|m| m == &cand) {
+                    merged_motifs.push(cand);
+                }
+            }
+        }
+    }
+
+    // Indexe toutes les occurrences des motifs retenus dans sym_seq
+    let mut occs = Vec::new();
+    for (mid, motif) in merged_motifs.iter().enumerate() {
+        let mlen = motif.len();
+        if mlen < 2 || mlen > n {
+            continue;
+        }
+        for pos in 0..=(n - mlen) {
+            if &sym_seq[pos..pos + mlen] == motif.as_slice() {
+                occs.push((pos, mid));
+            }
+        }
+    }
+    occs.sort_unstable_by_key(|x| x.0);
+    (merged_motifs, occs)
+}
+
 impl PerceivedGraph {
     pub fn from_bytes(bytes: &[u8]) -> Self {
         if bytes.is_empty() {
@@ -147,6 +322,11 @@ impl PerceivedGraph {
                 emp_trans2: vec![1.0],
                 emp_cooccur: vec![1.0],
                 emp_marginal: vec![1.0],
+                motifs: Vec::new(),
+                motif_occurrences: Vec::new(),
+                motif_idf: Vec::new(),
+                ctx_motif_weights: Vec::new(),
+                ctx_adj: vec![1.0],
                 ctx_features: vec![[0.0; CTX_FEAT_DIM]],
                 ctx_sym_weights: vec![1.0],
                 ctx_spans: vec![(0, 1)],
@@ -320,9 +500,59 @@ impl PerceivedGraph {
 
         let ctx_spans = discover_emergent_spans(&sym_seq, &emp_trans1, &emp_marginal, &sym_features, k);
         let n_ctx = ctx_spans.len();
+        let (motifs, motif_occurrences) = discover_emergent_motifs(&sym_seq, k, &ctx_spans);
+        let n_motifs = motifs.len();
+
         let mut ctx_features = vec![[0.0; CTX_FEAT_DIM]; n_ctx];
         let mut ctx_sym_weights = vec![0.0; n_ctx * k];
+        let mut ctx_motif_raw = vec![0.0; n_ctx * n_motifs.max(1)];
+        let mut motif_df = vec![0usize; n_motifs.max(1)];
 
+        // Assigne les occurrences de motifs aux clauses
+        if n_motifs > 0 {
+            let mut c_ptr = 0usize;
+            for &(pos, mid) in &motif_occurrences {
+                while c_ptr + 1 < n_ctx && pos >= ctx_spans[c_ptr].1 {
+                    c_ptr += 1;
+                }
+                if pos >= ctx_spans[c_ptr].0 && pos < ctx_spans[c_ptr].1 {
+                    let mlen = motifs[mid].len() as f64;
+                    ctx_motif_raw[c_ptr * n_motifs + mid] += mlen.sqrt();
+                }
+            }
+            for mid in 0..n_motifs {
+                let mut df = 0usize;
+                for c in 0..n_ctx {
+                    if ctx_motif_raw[c * n_motifs + mid] > 0.0 {
+                        df += 1;
+                    }
+                }
+                motif_df[mid] = df;
+            }
+        }
+
+        let mut motif_idf = vec![0.0; n_motifs];
+        for mid in 0..n_motifs {
+            motif_idf[mid] = (((n_ctx as f64) + 1.0) / ((motif_df[mid] as f64) + 1.0)).ln().max(0.1);
+        }
+
+        let mut ctx_motif_weights = vec![0.0; n_ctx * n_motifs];
+        if n_motifs > 0 {
+            for c in 0..n_ctx {
+                let mut norm2 = 0.0;
+                for mid in 0..n_motifs {
+                    let w = ctx_motif_raw[c * n_motifs + mid] * motif_idf[mid];
+                    ctx_motif_weights[c * n_motifs + mid] = w;
+                    norm2 += w * w;
+                }
+                let inv = if norm2 > 1e-12 { 1.0 / norm2.sqrt() } else { 0.0 };
+                for mid in 0..n_motifs {
+                    ctx_motif_weights[c * n_motifs + mid] *= inv;
+                }
+            }
+        }
+
+        // Caractéristiques intrinsèques des clauses (invariantes à la permutation de clauses)
         for (c_idx, &(start, end)) in ctx_spans.iter().enumerate() {
             let span = &sym_seq[start..end];
             let span_len = (span.len() as f64).max(1.0);
@@ -349,12 +579,6 @@ impl PerceivedGraph {
                 / (k as f64).max(1.0))
             .clamp(0.0, 1.0);
 
-            let prev_overlap = if c_idx > 0 {
-                let prev_slice = &ctx_sym_weights[(c_idx - 1) * k..c_idx * k];
-                local_dist.iter().zip(prev_slice.iter()).map(|(a, b)| a.min(*b)).sum::<f64>()
-            } else {
-                0.0
-            };
             let global_overlap: f64 = local_dist.iter().zip(emp_marginal.iter()).map(|(a, b)| a.min(*b)).sum();
 
             let mut mean_asym = 0.0;
@@ -364,19 +588,62 @@ impl PerceivedGraph {
                 mean_branch += w * sym_features[s][13];
             }
 
-            let pos_norm = (c_idx as f64) / ((n_ctx.saturating_sub(1)).max(1) as f64);
+            // Densité de motifs partagés à l'extérieur (valence relationnelle ouverte)
+            let mut ext_pull = 0.0;
+            if n_motifs > 0 {
+                for mid in 0..n_motifs {
+                    if ctx_motif_weights[c_idx * n_motifs + mid] > 0.0 && motif_df[mid] > 1 {
+                        ext_pull += ctx_motif_weights[c_idx * n_motifs + mid] * motif_idf[mid];
+                    }
+                }
+            }
+
             ctx_features[c_idx] = [
-                pos_norm,
                 (span_len / nf).clamp(0.0, 1.0),
                 local_ent,
                 unique_ratio,
                 (local_trans_novelty / span_len).clamp(0.0, 1.0),
                 (local_rep / span_len).clamp(0.0, 1.0),
-                prev_overlap.clamp(0.0, 1.0),
                 global_overlap.clamp(0.0, 1.0),
                 mean_asym.clamp(0.0, 1.0),
                 mean_branch.clamp(0.0, 1.0),
+                (ext_pull / 3.0).clamp(0.0, 1.0),
+                (1.0 / span_len.sqrt()).clamp(0.0, 1.0),
             ];
+        }
+
+        // Graphe relationnel NON-SÉQUENTIEL `ctx_adj` entre clauses (invariante à tout réordonnancement)
+        let mut ctx_adj = vec![0.0; n_ctx * n_ctx];
+        for i in 0..n_ctx {
+            let mut row_sum = 0.0;
+            for j in 0..n_ctx {
+                if i == j {
+                    continue;
+                }
+                let motif_sim = if n_motifs > 0 {
+                    let mut s = 0.0;
+                    for mid in 0..n_motifs {
+                        s += ctx_motif_weights[i * n_motifs + mid] * ctx_motif_weights[j * n_motifs + mid];
+                    }
+                    s
+                } else {
+                    0.0
+                };
+                let sym_sim: f64 = ctx_sym_weights[i * k..(i + 1) * k]
+                    .iter()
+                    .zip(ctx_sym_weights[j * k..(j + 1) * k].iter())
+                    .map(|(a, b)| a.min(*b))
+                    .sum();
+                let w = 0.75 * motif_sim + 0.25 * sym_sim + 1e-4;
+                ctx_adj[i * n_ctx + j] = w;
+                row_sum += w;
+            }
+            if row_sum > 1e-12 {
+                let inv = 1.0 / row_sum;
+                for j in 0..n_ctx {
+                    ctx_adj[i * n_ctx + j] *= inv;
+                }
+            }
         }
 
         Self {
@@ -388,21 +655,20 @@ impl PerceivedGraph {
             emp_trans2,
             emp_cooccur,
             emp_marginal,
+            motifs,
+            motif_occurrences,
+            motif_idf,
+            ctx_motif_weights,
+            ctx_adj,
             ctx_features,
             ctx_sym_weights,
             ctx_spans,
         }
     }
 
-    #[inline]
-    pub fn k(&self) -> usize {
-        self.unique_bytes.len()
-    }
-
-    #[inline]
-    pub fn n_ctx(&self) -> usize {
-        self.ctx_spans.len()
-    }
+    #[inline] pub fn k(&self) -> usize { self.unique_bytes.len() }
+    #[inline] pub fn n_ctx(&self) -> usize { self.ctx_spans.len() }
+    #[inline] pub fn n_motifs(&self) -> usize { self.motifs.len() }
 }
 
 #[derive(Clone, Debug)]
@@ -412,14 +678,12 @@ pub struct HypothesisState {
     pub ctx_states: Vec<[f64; D]>,
     pub sym_states: Vec<[f64; D]>,
     pub lat_couplings: [f64; N_LAT * N_LAT],
-    pub lat_to_sym: Vec<f64>, // N_LAT * K
-    pub sym_to_lat: Vec<f64>, // K * N_LAT
-    /// Modulateurs d'opérateurs causaux extraits de lat_states (N_LAT * D)
+    pub lat_to_sym: Vec<f64>,
+    pub sym_to_lat: Vec<f64>,
     pub lat_op_mods: [[f64; D]; N_LAT],
-    /// États de requête/clé symboliques pour le goulot multiplicatif
     pub sym_query_vecs: Vec<[f64; D]>,
     pub sym_key_vecs: Vec<[f64; D]>,
-    pub sym_trans: Vec<f64>,  // K * K
+    pub sym_trans: Vec<f64>,
     pub search_depth: usize,
 }
 
@@ -475,7 +739,6 @@ pub struct PhisharpNet {
     pub w_res_effect: Vec<f64>,
     pub w_res_cause: Vec<f64>,
     pub w_res_to_lat: Vec<f64>,
-    /// Opérateur de transformation causale latente (g_j = W_op_mod * lat_j)
     pub w_op_mod: Vec<f64>,
     pub w_policy: Vec<f64>,
     pub w_read_query: Vec<f64>,
@@ -784,8 +1047,6 @@ impl PhisharpNet {
             }
         }
 
-        // Opérateur multiplicatif latent : chaque règle latente j active une transformation g_j ⊙ rq_u
-        // routée EXCLUSIVEMENT via la distribution causale lat_after[u, j] !
         for u in 0..k {
             let mut lat_after = [0.0; N_LAT];
             for j in 0..N_LAT {
@@ -803,7 +1064,6 @@ impl PhisharpNet {
                     eff_op[d] += w * h.lat_op_mods[j][d];
                 }
             }
-
             let mut eff_vec = [0.0; D];
             for d in 0..D {
                 eff_vec[d] = eff_op[d] * h.sym_query_vecs[u][d];
@@ -902,6 +1162,7 @@ impl PhisharpNet {
         }
         h.sym_states = new_sym;
 
+        // Mise à jour NON-SÉQUENTIELLE des clauses via `pg.ctx_adj` (invariante à l'ordre des clauses)
         let mut new_ctx = vec![[0.0; D]; n_ctx];
         for c in 0..n_ctx {
             let mut agg_sym = [0.0; D];
@@ -911,11 +1172,22 @@ impl PhisharpNet {
                     agg_sym[d] += w * h.sym_states[s][d];
                 }
             }
-            let prev_c = if c > 0 { h.ctx_states[c - 1] } else { [0.0; D] };
-            let next_c = if c + 1 < n_ctx { h.ctx_states[c + 1] } else { [0.0; D] };
+            let mut agg_out_ctx = [0.0; D];
+            let mut agg_in_ctx = [0.0; D];
+            for other in 0..n_ctx {
+                if other == c {
+                    continue;
+                }
+                let w_out = pg.ctx_adj[c * n_ctx + other];
+                let w_in = pg.ctx_adj[other * n_ctx + c];
+                for d in 0..D {
+                    agg_out_ctx[d] += w_out * h.ctx_states[other][d];
+                    agg_in_ctx[d] += w_in * h.ctx_states[other][d];
+                }
+            }
 
-            matvec(&self.w_fwd_effect, D, D, &prev_c, &mut msg_eff);
-            matvec(&self.w_bwd_cause, D, D, &next_c, &mut msg_cau);
+            matvec(&self.w_fwd_effect, D, D, &agg_out_ctx, &mut msg_eff);
+            matvec(&self.w_bwd_cause, D, D, &agg_in_ctx, &mut msg_cau);
             matvec(&self.w_ctx_to_lat, D, D, &agg_sym, &mut msg_lat);
 
             for d in 0..D {
@@ -973,9 +1245,8 @@ impl PhisharpNet {
 
             let mut agg_ctx = [0.0; D];
             for c in 0..n_ctx {
-                let w = ((c + i) % 3 == 0) as usize as f64 * 0.5 + 0.5;
                 for d in 0..D {
-                    agg_ctx[d] += w * h.ctx_states[c][d];
+                    agg_ctx[d] += h.ctx_states[c][d];
                 }
             }
             for d in 0..D {
@@ -1025,7 +1296,7 @@ impl PhisharpNet {
         }
         let file = File::create(path)?;
         let mut w = BufWriter::new(file);
-        w.write_all(b"PHIS0003")?;
+        w.write_all(b"PHIS0004")?;
         let flat = self.to_flat_vec();
         let len_u64 = flat.len() as u64;
         w.write_all(&len_u64.to_le_bytes())?;
@@ -1041,10 +1312,10 @@ impl PhisharpNet {
         let mut r = BufReader::new(file);
         let mut magic = [0u8; 8];
         r.read_exact(&mut magic)?;
-        if &magic != b"PHIS0003" {
+        if &magic != b"PHIS0004" {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "En-tête .phis invalide (attendu PHIS0003)",
+                "En-tête .phis invalide (attendu PHIS0004)",
             ));
         }
         let mut len_buf = [0u8; 8];
