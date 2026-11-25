@@ -11,7 +11,6 @@ pub struct Span {
     pub end: usize,
 }
 
-/// Substrats précalculés une seule fois par épisode avant l'évaluation parallèle ES.
 #[derive(Clone, Debug)]
 pub struct PreparedEpisode {
     pub orig: RawSubstrate,
@@ -25,7 +24,6 @@ pub struct PreparedEpisode {
 #[derive(Clone, Debug)]
 pub struct PreparedComposite {
     pub blocks: Vec<RawSubstrate>,
-    pub neg_blocks: Vec<RawSubstrate>,
 }
 
 #[derive(Clone, Debug)]
@@ -165,7 +163,6 @@ impl PreparedEpisode {
         shift_bytes.rotate_left(shift);
         let shift_sub = RawSubstrate::from_bytes(&shift_bytes);
 
-        // Abstraction méta-relationnelle : permutation arbitraire complète des 256 octets + recadrage 75%
         let mut perm: [u8; 256] = std::array::from_fn(|i| i as u8);
         rng.shuffle(&mut perm);
         let sub_len = ((bytes.len() * 3) / 4).max(8).min(bytes.len());
@@ -192,97 +189,18 @@ impl PreparedComposite {
     pub fn from_bytes(bytes: &[u8]) -> Self {
         let spans = segment_effect(bytes);
         let mut blocks = Vec::with_capacity(spans.len());
-        let mut neg_blocks = Vec::with_capacity(spans.len());
         for sp in spans {
             let slice = &bytes[sp.start..sp.end];
-            blocks.push(RawSubstrate::from_bytes(slice));
-            let mut shuf = slice.to_vec();
-            let mut rng = Rng::new(fnv_hash(slice) ^ 0xA5A5_5A5A);
-            rng.shuffle(&mut shuf);
-            neg_blocks.push(RawSubstrate::from_bytes(&shuf));
-        }
-        Self { blocks, neg_blocks }
-    }
-}
-
-/// Isole la sous-zone contiguë où l'hypothèse structurée `H_Q` bat le contrefactuel
-/// non structuré `H_neg` (type Kadane). Élimine automatiquement les zones mortes (étiquettes).
-pub fn find_causal_core(
-    pos_err_q: &[f32],
-    pos_err_neg: &[f32],
-    min_win: usize,
-) -> (usize, usize, f32, f32) {
-    let n = pos_err_q.len();
-    if n == 0 {
-        return (0, 0, 0.0, 0.0);
-    }
-    let min_w = min_win.min(n).max(1);
-
-    let mut raw_adv = vec![0.0f32; n];
-    for t in 0..n {
-        raw_adv[t] = pos_err_neg[t] - pos_err_q[t];
-    }
-    // Lissage 3 points pour ne pas couper sur un unique octet pont
-    let mut adv = vec![0.0f32; n];
-    for t in 0..n {
-        let lo = t.saturating_sub(1);
-        let hi = (t + 1).min(n - 1);
-        let sum: f32 = raw_adv[lo..=hi].iter().sum();
-        adv[t] = sum / ((hi - lo + 1) as f32);
-    }
-
-    let mut pref_err = vec![0.0f32; n + 1];
-    let mut pref_adv = vec![0.0f32; n + 1];
-    for t in 0..n {
-        pref_err[t + 1] = pref_err[t] + pos_err_q[t];
-        pref_adv[t + 1] = pref_adv[t] + adv[t];
-    }
-
-    let step = if n > 128 { (n / 64).max(1) } else { 1 };
-    let mut best_s = 0usize;
-    let mut best_e = n;
-    let mut best_kadane = f32::NEG_INFINITY;
-
-    let mut s = 0usize;
-    while s + min_w <= n {
-        let mut e = s + min_w;
-        while e <= n {
-            let len = (e - s) as f32;
-            let k_score = (pref_adv[e] - pref_adv[s]) - 0.04 * len;
-            if k_score > best_kadane {
-                best_kadane = k_score;
-                best_s = s;
-                best_e = e;
-            }
-            if e == n {
-                break;
-            }
-            e = (e + step).min(n);
-        }
-        s += step;
-    }
-
-    if best_kadane <= 0.0 {
-        // Repli si aucun segment ne bat franchement H_neg : fenêtre d'erreur minimale
-        let w = ((n * 2) / 3).max(min_w).min(n);
-        let mut best_obj = f32::INFINITY;
-        for st in 0..=(n - w) {
-            let en = st + w;
-            let m_err = (pref_err[en] - pref_err[st]) / (w as f32);
-            let m_adv = (pref_adv[en] - pref_adv[st]) / (w as f32);
-            let obj = m_err - 0.5 * m_adv;
-            if obj < best_obj {
-                best_obj = obj;
-                best_s = st;
-                best_e = en;
+            let full_sub = RawSubstrate::from_bytes(slice);
+            let (cs, ce, _) = full_sub.intrinsic_causal_core();
+            if cs == 0 && ce == slice.len() {
+                blocks.push(full_sub);
+            } else {
+                blocks.push(RawSubstrate::from_bytes(&slice[cs..ce]));
             }
         }
+        Self { blocks }
     }
-
-    let len = (best_e - best_s).max(1) as f32;
-    let mean_err = (pref_err[best_e] - pref_err[best_s]) / len;
-    let mean_adv = (pref_adv[best_e] - pref_adv[best_s]) / len;
-    (best_s, best_e, mean_err, mean_adv)
 }
 
 fn byte_overlap_ratio(a: &[u8], b: &[u8]) -> f32 {
@@ -399,6 +317,7 @@ pub fn compute_phi_sharp(
     compute_phi_sharp_prepared(graph, &prep, exact_mip)
 }
 
+/// Signal non-supervisé de Projection Référentielle sur les noyaux intrinsèques de chaque bloc.
 pub fn compute_composite_phi_prepared(
     graph: &PhiGraph,
     prep: &PreparedComposite,
@@ -417,38 +336,22 @@ pub fn compute_composite_phi_prepared(
 
     let mut rels_list = Vec::with_capacity(m);
     let mut traces = Vec::with_capacity(m);
-    let mut neg_traces = Vec::with_capacity(m);
     let mut sum_res = 0.0f32;
 
-    for i in 0..m {
-        let r = graph.encode_relations(&prep.blocks[i]);
+    for block in &prep.blocks {
+        let r = graph.encode_relations(block);
         let tr = graph.abduce(&r, None);
-        let nr = graph.encode_relations(&prep.neg_blocks[i]);
-        let ntr = graph.abduce(&nr, None);
         sum_res += tr.final_mean_err;
         rels_list.push(r);
         traces.push(tr);
-        neg_traces.push(ntr);
     }
     let mean_residual = sum_res / (m as f32);
 
     let mut pairs: Vec<(f32, usize, usize)> = Vec::with_capacity(m * (m - 1) / 2);
     for i in 0..m {
         for j in (i + 1)..m {
-            let (_, pos_j, full_j) =
-                graph.evaluate_hypothesis(&traces[i].final_state, &rels_list[j]);
-            let (_, pos_j_neg, _) =
-                graph.evaluate_hypothesis(&neg_traces[i].final_state, &rels_list[j]);
-            let (_, _, foc_j, _) = find_causal_core(&pos_j, &pos_j_neg, 10);
-            let e_ij = 0.20 * full_j + 0.80 * foc_j;
-
-            let (_, pos_i, full_i) =
-                graph.evaluate_hypothesis(&traces[j].final_state, &rels_list[i]);
-            let (_, pos_i_neg, _) =
-                graph.evaluate_hypothesis(&neg_traces[j].final_state, &rels_list[i]);
-            let (_, _, foc_i, _) = find_causal_core(&pos_i, &pos_i_neg, 10);
-            let e_ji = 0.20 * full_i + 0.80 * foc_i;
-
+            let (_, _, e_ij) = graph.evaluate_hypothesis(&traces[i].final_state, &rels_list[j]);
+            let (_, _, e_ji) = graph.evaluate_hypothesis(&traces[j].final_state, &rels_list[i]);
             let cross_gen = (-2.2 * 0.5 * (e_ij + e_ji)).exp().clamp(0.0, 1.0);
             let cos_res = 0.5 * (1.0 + cosine_sim(&traces[i].final_state, &traces[j].final_state));
             let r_ij = (cross_gen * cos_res).sqrt();
@@ -481,6 +384,9 @@ pub fn compute_composite_phi(graph: &PhiGraph, bytes: &[u8]) -> CompositePhi {
     compute_composite_phi_prepared(graph, &prep)
 }
 
+/// Projection Référentielle réciproque sans cherry-picking :
+/// chaque moule est d'abord réduit à son noyau intrinsèque (détachant son référent passif),
+/// puis comparé réciproquement à la cible.
 pub fn project_query_to_molds(
     graph: &PhiGraph,
     bytes: &[u8],
@@ -489,15 +395,15 @@ pub fn project_query_to_molds(
 ) -> Vec<ProjectionMatch> {
     let q_sp = spans[query_idx];
     let q_bytes = &bytes[q_sp.start..q_sp.end];
-    let q_rels = graph.encode_bytes(q_bytes);
+    let q_sub = RawSubstrate::from_bytes(q_bytes);
+    let (qs, qe, _) = q_sub.intrinsic_causal_core();
+    let q_core_bytes = &q_bytes[qs..qe];
+    let q_rels = if qs == 0 && qe == q_bytes.len() {
+        graph.encode_relations(&q_sub)
+    } else {
+        graph.encode_bytes(q_core_bytes)
+    };
     let q_trace = graph.abduce(&q_rels, None);
-
-    // Contrefactuel non-structuré de la requête (pour isoler le corps causal des étiquettes)
-    let mut q_neg_bytes = q_bytes.to_vec();
-    let mut rng = Rng::new(fnv_hash(q_bytes) ^ 0xA5A5_5A5A);
-    rng.shuffle(&mut q_neg_bytes);
-    let q_neg_rels = graph.encode_bytes(&q_neg_bytes);
-    let q_neg_trace = graph.abduce(&q_neg_rels, None);
 
     let mut matches = Vec::with_capacity(spans.len().saturating_sub(1));
     for (idx, sp) in spans.iter().enumerate() {
@@ -505,30 +411,18 @@ pub fn project_query_to_molds(
             continue;
         }
         let d_bytes = &bytes[sp.start..sp.end];
-        let d_rels = graph.encode_bytes(d_bytes);
-
-        // 1. Projection avant H(Q) vs H(shuffle(Q)) -> isole le noyau causal M*
-        let (_, pos_d, full_fwd) = graph.evaluate_hypothesis(&q_trace.final_state, &d_rels);
-        let (_, pos_d_neg, _) = graph.evaluate_hypothesis(&q_neg_trace.final_state, &d_rels);
-        let (c_start, c_end, foc_fwd, core_adv) = find_causal_core(&pos_d, &pos_d_neg, 10);
-
-        // 2. Abduction réciproque sur M* -> H(M*) -> Q
+        let d_sub = RawSubstrate::from_bytes(d_bytes);
+        let (c_start, c_end, referent) = d_sub.intrinsic_causal_core();
         let core_bytes = &d_bytes[c_start..c_end];
-        let core_rels = graph.encode_bytes(core_bytes);
+        let core_rels = if c_start == 0 && c_end == d_bytes.len() {
+            graph.encode_relations(&d_sub)
+        } else {
+            graph.encode_bytes(core_bytes)
+        };
         let core_trace = graph.abduce(&core_rels, None);
 
-        let mut core_neg_bytes = core_bytes.to_vec();
-        let mut crng = Rng::new(fnv_hash(core_bytes) ^ 0x5A5A_A5A5);
-        crng.shuffle(&mut core_neg_bytes);
-        let core_neg_rels = graph.encode_bytes(&core_neg_bytes);
-        let core_neg_trace = graph.abduce(&core_neg_rels, None);
-
-        let (_, pos_q, full_bwd) = graph.evaluate_hypothesis(&core_trace.final_state, &q_rels);
-        let (_, pos_q_neg, _) = graph.evaluate_hypothesis(&core_neg_trace.final_state, &q_rels);
-        let (_, _, foc_bwd, _) = find_causal_core(&pos_q, &pos_q_neg, 10);
-
-        let fwd_err = 0.15 * full_fwd + 0.85 * foc_fwd;
-        let bwd_err = 0.25 * full_bwd + 0.75 * foc_bwd;
+        let (_, _, fwd_err) = graph.evaluate_hypothesis(&q_trace.final_state, &core_rels);
+        let (_, _, bwd_err) = graph.evaluate_hypothesis(&core_trace.final_state, &q_rels);
         let cross_err = 0.5 * (fwd_err + bwd_err);
 
         let cross_gen = (-2.2 * cross_err).exp().clamp(0.0, 1.0);
@@ -536,33 +430,7 @@ pub fn project_query_to_molds(
         let cos_pos = 0.5 * (1.0 + cos_sim);
         let score = (cross_gen * cos_pos).sqrt();
 
-        // 3. Référent induit : complément rejeté par le contraste contrefactuel
-        let referent = if c_start >= 3 && d_bytes.len().saturating_sub(c_end) <= 3 {
-            let comp_adv = (0..c_start)
-                .map(|t| pos_d_neg[t] - pos_d[t])
-                .sum::<f32>()
-                / (c_start as f32);
-            if core_adv > comp_adv + 0.04 {
-                Some((0, c_start))
-            } else {
-                None
-            }
-        } else if d_bytes.len().saturating_sub(c_end) >= 3 && c_start <= 3 {
-            let comp_len = d_bytes.len() - c_end;
-            let comp_adv = (c_end..d_bytes.len())
-                .map(|t| pos_d_neg[t] - pos_d[t])
-                .sum::<f32>()
-                / (comp_len as f32);
-            if core_adv > comp_adv + 0.04 {
-                Some((c_end, d_bytes.len()))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        let byte_overlap = byte_overlap_ratio(q_bytes, core_bytes);
+        let byte_overlap = byte_overlap_ratio(q_core_bytes, core_bytes);
         matches.push(ProjectionMatch {
             dst_idx: idx,
             score,
