@@ -1,23 +1,18 @@
-//! Probabilistic Term Graph Rewriting System (PTGRS).
+//! Probabilistic Term Graph Rewriting System (PTGRS) v0.4.0.
 //!
-//! Séparation stricte des types :
-//! - `PtgrsSample` : contient UNIQUEMENT `observed_e: Vec<u8>`. C'est la seule structure vue à l'entraînement.
-//! - `PtgrsEvalCase` : contient `observed_e` + la cause cachée `HiddenCause` (pour l'évaluation post-hoc uniquement).
-//!
-//! Tout échantillon PTGRS utilise une bijection aléatoire d'octets pour que l'alphabet soit
-//! strictement auto-spécifié et exempt de tout prior lexical ou symbolique fixe.
+//! Inclut des épisodes à clauses réordonnées aléatoirement (non-séquentielles) à l'entraînement
+//! comme à l'évaluation pour tester l'universalité sur entrées non-séquentielles.
+//! Séparation stricte : `PtgrsSample` ne contient QUE `observed_e`.
 
 use crate::math::Rng;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RuleFamily {
-    /// Familles vues à l'entraînement (PTGRS fermé)
     Compose,
     PermuteBind,
     ShareFold,
     ContextualShift,
     ChainStep,
-    /// Familles hors-distribution (jamais vues à l'entraînement)
     OodDeepNested,
     OodCyclicEquiv,
     OodRelationalTransfer,
@@ -46,7 +41,7 @@ impl RuleFamily {
 #[derive(Clone, Debug)]
 pub struct TermNode {
     pub id: usize,
-    pub op: u8,          // identifiant abstrait d'opérateur (0..op_vocab)
+    pub op: u8,
     pub children: Vec<usize>,
 }
 
@@ -62,7 +57,6 @@ impl TermGraph {
             return 0x517C_C1B7_2722_0A95;
         }
         if let Some(pos) = visited.iter().position(|&x| x == node_id) {
-            // Partage / cycle dans le graphe de termes
             return 0x9E37_79B9_0000_0000u64 ^ (pos as u64);
         }
         visited.push(node_id);
@@ -76,8 +70,14 @@ impl TermGraph {
         h
     }
 
-    /// Sérialise le graphe sous forme d'expression relationnelle dans l'alphabet fourni.
-    pub fn render_in_alphabet(&self, node_id: usize, alphabet: &AlphabetMap, depth: usize, out: &mut Vec<u8>, visited: &mut Vec<usize>) {
+    pub fn render_in_alphabet(
+        &self,
+        node_id: usize,
+        alphabet: &AlphabetMap,
+        depth: usize,
+        out: &mut Vec<u8>,
+        visited: &mut Vec<usize>,
+    ) {
         if depth > 7 || node_id >= self.nodes.len() {
             out.push(alphabet.wildcard_byte());
             return;
@@ -106,21 +106,13 @@ impl TermGraph {
 
 #[derive(Clone, Debug)]
 pub enum RhsTemplate {
-    /// f(x, y) -> g(h(x), y)
     Compose { g: u8, h: u8 },
-    /// f(x, y) -> k(y, x)
     Permute { k: u8 },
-    /// f(x) -> d(x, x) (partage de sous-terme dans le graphe)
     Share { d: u8 },
-    /// c(a, x) -> r(x, a) avec permutation d'arité variable
     Shift { r: u8 },
-    /// x -> s(x) ou s(f(x)) en chaîne
     Chain { s: u8 },
-    /// OOD : f(g(x, y), z) -> h(z, m(x, y, x))
     OodDeep { h: u8, m: u8 },
-    /// OOD : transformation cyclique à parité alternée
     OodCyclic { p: u8, q: u8 },
-    /// OOD : composition transitive relationnelle (a~b, b~c -> a~c)
     OodTransitive { rel: u8 },
 }
 
@@ -140,17 +132,14 @@ pub struct HiddenCause {
     pub num_steps: usize,
 }
 
-/// Bijection aléatoire d'octets propre à chaque instance PTGRS.
 #[derive(Clone, Debug)]
 pub struct AlphabetMap {
-    pub bytes: Vec<u8>, // longueur >= 24 : [ops..., open, close, sep, arrow, clause_end, ref_mark, wildcard, query_mark]
+    pub bytes: Vec<u8>,
     pub num_ops: usize,
 }
 
 impl AlphabetMap {
     pub fn random(rng: &mut Rng, num_ops: usize) -> Self {
-        // On permute des octets imprimables ASCII (33..=126) ou octets quelconques (1..=254)
-        // L'usage d'octets quelconques garantit l'absence de tout biais ASCII.
         let mut pool: Vec<u8> = (1u8..=254u8).collect();
         rng.shuffle(&mut pool);
         let total = num_ops + 8;
@@ -164,35 +153,22 @@ impl AlphabetMap {
         self.num_ops
     }
 
-    #[inline]
-    pub fn op_byte(&self, op: u8) -> u8 {
-        self.bytes[(op as usize) % self.num_ops]
-    }
-    #[inline]
-    pub fn open_delim(&self) -> u8 { self.bytes[self.num_ops] }
-    #[inline]
-    pub fn close_delim(&self) -> u8 { self.bytes[self.num_ops + 1] }
-    #[inline]
-    pub fn sep_byte(&self) -> u8 { self.bytes[self.num_ops + 2] }
-    #[inline]
-    pub fn arrow_byte(&self) -> u8 { self.bytes[self.num_ops + 3] }
-    #[inline]
-    pub fn clause_end(&self) -> u8 { self.bytes[self.num_ops + 4] }
-    #[inline]
-    pub fn ref_marker(&self) -> u8 { self.bytes[self.num_ops + 5] }
-    #[inline]
-    pub fn wildcard_byte(&self) -> u8 { self.bytes[self.num_ops + 6] }
-    #[inline]
-    pub fn query_marker(&self) -> u8 { self.bytes[self.num_ops + 7] }
+    #[inline] pub fn op_byte(&self, op: u8) -> u8 { self.bytes[(op as usize) % self.num_ops] }
+    #[inline] pub fn open_delim(&self) -> u8 { self.bytes[self.num_ops] }
+    #[inline] pub fn close_delim(&self) -> u8 { self.bytes[self.num_ops + 1] }
+    #[inline] pub fn sep_byte(&self) -> u8 { self.bytes[self.num_ops + 2] }
+    #[inline] pub fn arrow_byte(&self) -> u8 { self.bytes[self.num_ops + 3] }
+    #[inline] pub fn clause_end(&self) -> u8 { self.bytes[self.num_ops + 4] }
+    #[inline] pub fn ref_marker(&self) -> u8 { self.bytes[self.num_ops + 5] }
+    #[inline] pub fn wildcard_byte(&self) -> u8 { self.bytes[self.num_ops + 6] }
+    #[inline] pub fn query_marker(&self) -> u8 { self.bytes[self.num_ops + 7] }
 }
 
-/// Donnée d'entraînement : UNIQUEMENT l'effet observé E en octets.
 #[derive(Clone, Debug)]
 pub struct PtgrsSample {
     pub observed_e: Vec<u8>,
 }
 
-/// Donnée d'évaluation : inclut la cause cachée C (jamais exposée à l'entraînement).
 #[derive(Clone, Debug)]
 pub struct PtgrsEvalCase {
     pub observed_e: Vec<u8>,
@@ -249,11 +225,7 @@ fn apply_rule_step(graph: &mut TermGraph, rules: &[RewriteRule], rng: &mut Rng, 
         }
         RhsTemplate::Permute { k } => {
             graph.nodes[nid].op = *k;
-            graph.nodes[nid].children = if existing_children.len() >= 2 {
-                vec![c1, c0]
-            } else {
-                vec![c0]
-            };
+            graph.nodes[nid].children = if existing_children.len() >= 2 { vec![c1, c0] } else { vec![c0] };
         }
         RhsTemplate::Share { d } => {
             graph.nodes[nid].op = *d;
@@ -291,22 +263,13 @@ fn apply_rule_step(graph: &mut TermGraph, rules: &[RewriteRule], rng: &mut Rng, 
         RhsTemplate::OodCyclic { p, q } => {
             let next_op = if step_idx % 2 == 0 { *p } else { *q };
             let prev_id = graph.nodes.len();
-            graph.nodes.push(TermNode {
-                id: prev_id,
-                op: next_op,
-                children: vec![c0],
-            });
+            graph.nodes.push(TermNode { id: prev_id, op: next_op, children: vec![c0] });
             graph.nodes[nid].op = if step_idx % 2 == 0 { *q } else { *p };
-            // Partage mutuel dans le graphe
             graph.nodes[nid].children = vec![prev_id, c1];
         }
         RhsTemplate::OodTransitive { rel } => {
             let bridge = graph.nodes.len();
-            graph.nodes.push(TermNode {
-                id: bridge,
-                op: *rel,
-                children: vec![c1, c0],
-            });
+            graph.nodes.push(TermNode { id: bridge, op: *rel, children: vec![c1, c0] });
             graph.nodes[nid].op = *rel;
             graph.nodes[nid].children = vec![c0, bridge];
         }
@@ -337,19 +300,24 @@ fn generate_rules(rng: &mut Rng, num_ops: usize, num_rules: usize, ood: bool) ->
     rules
 }
 
-fn build_eval_case_internal(rng: &mut Rng, ood: bool, num_ops: usize, num_steps: usize) -> PtgrsEvalCase {
+fn build_eval_case_internal(
+    rng: &mut Rng,
+    ood: bool,
+    num_ops: usize,
+    num_steps: usize,
+    shuffle_clauses: bool,
+) -> PtgrsEvalCase {
     let alphabet = AlphabetMap::random(rng, num_ops);
     let num_rules = if ood { 5 + rng.usize_below(4) } else { 3 + rng.usize_below(4) };
     let rules = generate_rules(rng, num_ops, num_rules, ood);
     let seed_graph = build_random_term_graph(rng, num_ops, if ood { 10 } else { 7 });
 
     let mut current = seed_graph.clone();
-    let mut observed_e = Vec::with_capacity(256);
+    let mut clauses: Vec<Vec<u8>> = Vec::with_capacity(num_steps + 1);
     let mut visited = Vec::new();
 
-    // Chaque pas de réécriture produit des paires relationnelles (avant -> après) qui composent E.
-    // E contient donc la trace des effets observables dans l'alphabet auto-spécifié.
     for step in 0..num_steps {
+        let mut clause = Vec::new();
         let mut before_bytes = Vec::new();
         current.render_in_alphabet(current.root, &alphabet, 0, &mut before_bytes, &mut visited);
         visited.clear();
@@ -361,27 +329,37 @@ fn build_eval_case_internal(rng: &mut Rng, ood: bool, num_ops: usize, num_steps:
         visited.clear();
 
         if applied {
-            observed_e.extend_from_slice(&before_bytes);
-            observed_e.push(alphabet.arrow_byte());
-            observed_e.extend_from_slice(&after_bytes);
-            observed_e.push(alphabet.clause_end());
+            clause.extend_from_slice(&before_bytes);
+            clause.push(alphabet.arrow_byte());
+            clause.extend_from_slice(&after_bytes);
+            clause.push(alphabet.clause_end());
         } else {
-            // Sonde d'un sous-terme actif pour entretenir la couverture relationnelle
             let sub = rng.usize_below(current.nodes.len());
-            current.render_in_alphabet(sub, &alphabet, 0, &mut observed_e, &mut visited);
+            current.render_in_alphabet(sub, &alphabet, 0, &mut clause, &mut visited);
             visited.clear();
-            observed_e.push(alphabet.clause_end());
+            clause.push(alphabet.clause_end());
         }
+        clauses.push(clause);
     }
 
-    // Dernière observation (état résultant / effet terminal)
-    observed_e.push(alphabet.query_marker());
     let mut target_explanation = Vec::new();
     current.render_in_alphabet(current.root, &alphabet, 0, &mut target_explanation, &mut visited);
-    observed_e.extend_from_slice(&target_explanation);
-    observed_e.push(alphabet.clause_end());
 
-    // Garantir une longueur exploitable et bornée
+    let mut query_clause = Vec::new();
+    query_clause.push(alphabet.query_marker());
+    query_clause.extend_from_slice(&target_explanation);
+    query_clause.push(alphabet.clause_end());
+    clauses.push(query_clause);
+
+    if shuffle_clauses {
+        // Entrée non-séquentielle : les clauses du graphe de termes sont dans un ordre arbitraire
+        rng.shuffle(&mut clauses);
+    }
+
+    let mut observed_e = Vec::with_capacity(512);
+    for cl in clauses {
+        observed_e.extend_from_slice(&cl);
+    }
     if observed_e.len() > 768 {
         observed_e.truncate(768);
     }
@@ -399,25 +377,30 @@ fn build_eval_case_internal(rng: &mut Rng, ood: bool, num_ops: usize, num_steps:
     }
 }
 
-/// Génère un échantillon d'entraînement FERMÉ : uniquement E (jamais C).
+/// Entraînement fermé PTGRS : alterne traces ordonnées et ensembles non-séquentiels de clauses.
 pub fn sample_training_effect(rng: &mut Rng) -> PtgrsSample {
     let num_ops = 6 + rng.usize_below(7);
     let num_steps = 5 + rng.usize_below(6);
-    let case = build_eval_case_internal(rng, false, num_ops, num_steps);
+    let nonseq = rng.next_f64() < 0.45;
+    let case = build_eval_case_internal(rng, false, num_ops, num_steps, nonseq);
     PtgrsSample {
         observed_e: case.observed_e,
     }
 }
 
-/// Génère un cas d'évaluation PTGRS complet (in-dist ou OOD) avec cause cachée post-hoc.
 pub fn sample_eval_case(rng: &mut Rng, ood: bool) -> PtgrsEvalCase {
     let num_ops = if ood { 9 + rng.usize_below(6) } else { 6 + rng.usize_below(7) };
     let num_steps = if ood { 8 + rng.usize_below(6) } else { 5 + rng.usize_below(6) };
-    build_eval_case_internal(rng, ood, num_ops, num_steps)
+    build_eval_case_internal(rng, ood, num_ops, num_steps, false)
 }
 
-/// Échelon 2 de l'échelle d'évaluation : Mini-dictionnaire généré par PTGRS (cause C connue post-hoc).
-/// Les règles de réécriture forment des "entrées de dictionnaire" relationnelles suivies d'une requête implicite.
+/// Cas d'évaluation PTGRS strictement non-séquentiel (ordre des clauses permuté).
+pub fn sample_nonseq_eval_case(rng: &mut Rng, ood: bool) -> PtgrsEvalCase {
+    let num_ops = if ood { 9 + rng.usize_below(6) } else { 6 + rng.usize_below(7) };
+    let num_steps = if ood { 8 + rng.usize_below(6) } else { 5 + rng.usize_below(6) };
+    build_eval_case_internal(rng, ood, num_ops, num_steps, true)
+}
+
 pub fn sample_mini_dictionary(rng: &mut Rng, ood: bool) -> PtgrsEvalCase {
     let num_ops = 10 + rng.usize_below(6);
     let alphabet = AlphabetMap::random(rng, num_ops);
@@ -427,7 +410,6 @@ pub fn sample_mini_dictionary(rng: &mut Rng, ood: bool) -> PtgrsEvalCase {
     let mut observed_e = Vec::with_capacity(512);
     let mut visited = Vec::new();
 
-    // Chaque règle génère plusieurs exemples définitionnels dans le mini-dictionnaire
     for r in &rules {
         let mut g = TermGraph {
             nodes: vec![
@@ -446,7 +428,6 @@ pub fn sample_mini_dictionary(rng: &mut Rng, ood: bool) -> PtgrsEvalCase {
         observed_e.push(alphabet.clause_end());
     }
 
-    // Requête composite finale dérivée par la composition des règles cachées
     let mut query_g = seed_graph.clone();
     observed_e.push(alphabet.query_marker());
     query_g.render_in_alphabet(query_g.root, &alphabet, 0, &mut observed_e, &mut visited);
@@ -472,8 +453,6 @@ pub fn sample_mini_dictionary(rng: &mut Rng, ood: bool) -> PtgrsEvalCase {
     }
 }
 
-/// Équivalence observationnelle entre deux causes cachées (pas égalité de graphes !) :
-/// Compare les signatures canoniques de réduction sur un ensemble de graphes-sondes déterministes.
 pub fn observational_equivalence(c1: &HiddenCause, c2: &HiddenCause) -> f64 {
     let mut probe_rng1 = Rng::new(0xA1B2_C3D4_E5F6_0001);
     let mut probe_rng2 = Rng::new(0xA1B2_C3D4_E5F6_0001);
@@ -496,7 +475,6 @@ pub fn observational_equivalence(c1: &HiddenCause, c2: &HiddenCause) -> f64 {
         if s1 == s2 {
             matches += 1.0;
         } else {
-            // Proximité structurelle (opérateurs racines et arité)
             let n1 = &g1.nodes[g1.root];
             let n2 = &g2.nodes[g2.root];
             if n1.op == n2.op && n1.children.len() == n2.children.len() {
@@ -507,8 +485,6 @@ pub fn observational_equivalence(c1: &HiddenCause, c2: &HiddenCause) -> f64 {
     matches / (probes as f64)
 }
 
-/// Mesure post-hoc de qualité de cause retrouvée à partir d'une distribution relationnelle
-/// estimée sur E, confrontée aux transitions réelles produites par la cause cachée C.
 pub fn cause_recovery_score(
     eval_case: &PtgrsEvalCase,
     predicted_transition_matrix: &[f64],
@@ -519,7 +495,6 @@ pub fn cause_recovery_score(
         return 0.0;
     }
 
-    // On exécute C sur une sonde fraîche pour obtenir les transitions causales vraies dans l'alphabet de C
     let mut probe_rng = Rng::new(0xDEAD_BEEF_1234_5678);
     let mut g = eval_case.cause.seed_graph.clone();
     let mut true_seq = Vec::new();
@@ -543,7 +518,6 @@ pub fn cause_recovery_score(
         let j = byte_to_idx[w[1] as usize];
         if i < k && j < k {
             let p = predicted_transition_matrix[i * k + j].clamp(0.0, 1.0);
-            // Comparé au hasard uniforme 1/k
             let lift = (p * (k as f64)).clamp(0.0, 4.0) / 4.0;
             hits += lift;
             count += 1.0;
