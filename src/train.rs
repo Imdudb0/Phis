@@ -1,10 +1,4 @@
-//! Entraînement FERMÉ de Phisharp :
-//! - Source de données UNIQUE : `ptgrs::sample_training_effect` (uniquement E, jamais C).
-//! - Signal UNIQUE : φ_sharp(H, E), Sens(H, E) et Résidu relatifs à E.
-//! - Aucun texte NL, aucune définition, aucun prior linguistique, aucun score MDL.
-//!
-//! Optimisation par NES antithétique (Natural Evolution Strategies avec variables antithétiques)
-//! + Adam, permettant d'optimiser exactement à travers la MIP discrète et les bifurcations abductives.
+//! Entraînement FERMÉ de Phisharp v0.2.0 : PTGRS (E seul) + φ_sharp + Sens + Résidu.
 
 use std::path::Path;
 
@@ -16,11 +10,11 @@ use crate::substrate::PhisharpNet;
 #[derive(Clone, Debug)]
 pub struct TrainConfig {
     pub iterations: usize,
-    pub pop_pairs: usize,       // Nombre de paires antithétiques (+eps, -eps) par itération
-    pub batch_size: usize,      // Échantillons PTGRS par évaluation
-    pub search_budget: usize,   // Pas abductifs par épisode d'entraînement
-    pub sigma: f64,             // Écart-type des perturbations NES
-    pub lr: f64,                // Taux d'apprentissage Adam
+    pub pop_pairs: usize,
+    pub batch_size: usize,
+    pub search_budget: usize,
+    pub sigma: f64,
+    pub lr: f64,
     pub seed: u64,
 }
 
@@ -28,11 +22,11 @@ impl Default for TrainConfig {
     fn default() -> Self {
         Self {
             iterations: 80,
-            pop_pairs: 10,
+            pop_pairs: 16,
             batch_size: 4,
             search_budget: 8,
-            sigma: 0.04,
-            lr: 0.012,
+            sigma: 0.045,
+            lr: 0.015,
             seed: 2026_11_24,
         }
     }
@@ -70,13 +64,8 @@ fn evaluate_batch_fitness(
         let phi0 = res.trajectory.first().map(|p| p.report.phi_sharp).unwrap_or(0.0);
         let rep = &res.final_report;
 
-        // Objectif fermé :
-        // 1) Puissance cause-effet intégrée φ_sharp terminale
-        // 2) Gain le long de la trajectoire (sens = trajectoire, empêche la triche à budget 0)
-        // 3) Sens non-compensatoire (min)
-        // 4) Pénalité explicite du résidu (empêche d'embellir H sans expliquer E)
-        let traj_gain = (rep.phi_sharp - phi0).max(-0.2);
-        let obj = rep.phi_sharp + 0.45 * traj_gain + 0.30 * rep.sens_min - 0.20 * rep.residue_score;
+        let traj_gain = (rep.phi_sharp - phi0).max(0.0);
+        let obj = rep.phi_sharp + 0.50 * traj_gain + 0.35 * rep.sens_min - 0.25 * rep.residue_score;
 
         sum_obj += obj;
         sum_phi += rep.phi_sharp;
@@ -101,7 +90,6 @@ pub fn train_closed_ptgrs(cfg: &TrainConfig, save_path: Option<&Path>) -> (Phish
     let n_params = net.param_count();
     let mut theta = net.to_flat_vec();
 
-    // État Adam
     let mut m = vec![0.0; n_params];
     let mut v = vec![0.0; n_params];
     let beta1 = 0.9_f64;
@@ -113,7 +101,6 @@ pub fn train_closed_ptgrs(cfg: &TrainConfig, save_path: Option<&Path>) -> (Phish
     let mut best_obj = f64::NEG_INFINITY;
 
     for it in 1..=cfg.iterations {
-        // Échantillonnage PTGRS fermé : UNIQUEMENT observed_e
         let mut batch = Vec::with_capacity(cfg.batch_size);
         for _ in 0..cfg.batch_size {
             batch.push(sample_training_effect(&mut rng));
@@ -127,12 +114,10 @@ pub fn train_closed_ptgrs(cfg: &TrainConfig, save_path: Option<&Path>) -> (Phish
         for _ in 0..cfg.pop_pairs {
             let eps: Vec<f64> = (0..n_params).map(|_| rng.next_normal()).collect();
 
-            // +eps
             let plus: Vec<f64> = theta.iter().zip(eps.iter()).map(|(&w, &e)| w + cfg.sigma * e).collect();
             probe_net.from_flat_vec(&plus);
             let (f_plus, _, _, _, _) = evaluate_batch_fitness(&probe_net, &batch, cfg.search_budget);
 
-            // -eps
             let minus: Vec<f64> = theta.iter().zip(eps.iter()).map(|(&w, &e)| w - cfg.sigma * e).collect();
             probe_net.from_flat_vec(&minus);
             let (f_minus, _, _, _, _) = evaluate_batch_fitness(&probe_net, &batch, cfg.search_budget);
@@ -141,7 +126,6 @@ pub fn train_closed_ptgrs(cfg: &TrainConfig, save_path: Option<&Path>) -> (Phish
             noises.push(eps);
         }
 
-        // Normalisation par rang/écart-type sur les différences antithétiques
         let mean_abs = diffs.iter().map(|d| d.abs()).sum::<f64>() / (diffs.len().max(1) as f64);
         let norm_scale = if mean_abs > 1e-8 { 1.0 / mean_abs } else { 1.0 };
 
@@ -153,7 +137,6 @@ pub fn train_closed_ptgrs(cfg: &TrainConfig, save_path: Option<&Path>) -> (Phish
             }
         }
 
-        // Mise à jour Adam en montée de gradient (+ léger rappel L2 pour éviter l'explosion)
         let b1_corr = 1.0 - beta1.powi(it as i32);
         let b2_corr = 1.0 - beta2.powi(it as i32);
         for i in 0..n_params {
