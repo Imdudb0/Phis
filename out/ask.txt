@@ -1,3 +1,23 @@
 [1m[92m    Finished[0m `release` profile [optimized] target(s) in 0.00s
-[1m[92m     Running[0m `target/release/ask --model out/sharp.phis --file perceived.eff`
-en symbols by means of which human beings, as members of a social group and participants in its culture, express themselves. The functions of language include communication, the expressers of attitude, emphasis, and purpose. The philologist is concerned primarily with the historical development of languages as it is ma
+[1m[92m     Running[0m `target/release/phisharp ask --model out/sharp.phis --file perceived.eff`
+=== PHISHARP ABDUCTION REPORT ===
+Effet (E)       : 'perceived.eff' (123 octets)
+φ_sharp         : +0.4503
+  Générativité  : 0.3726  (résidu moyen = 0.3949)
+  Discrimination: 0.0664
+  Projection    : 0.7460  [réfut=0.487 | dépl=0.999 | abst=0.752]
+  Intégration   : 0.1623  (MIP exacte sur 31 coupes : perte=0.0590, coupe {0,2,3,4,5} | {1})
+
+Trajectoire abductive (résidu) :
+  t0=0.794 -> t1=2.457 -> t2=2.354 -> t3=0.522 -> t4=0.417 -> t5=0.411 -> t6=0.395  (gain=+2.0617)
+
+Noyau causal auto-spécifié (offset 0, alphabet de E) :
+  ASCII : "personal"
+  HEX   : 70 65 72 73 6f 6e 61 6c
+
+Zones de tension (résidu maximal dans perceived.eff) :
+  offset  92 | 0x74 't' | résidu = 1.5928
+  offset  54 | 0x6e 'n' | résidu = 1.4883
+  offset  68 | 0x69 'i' | résidu = 1.4519
+  offset  21 | 0x20 ' ' | résidu = 1.2312
+  offset  91 | 0x20 ' ' | résidu = 1.2221
