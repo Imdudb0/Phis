@@ -1,5 +1,4 @@
 use crate::rng::Rng;
-use std::f32::consts::TAU;
 use std::fs;
 use std::io::{self, ErrorKind};
 use std::path::Path;
@@ -9,21 +8,21 @@ pub const DIM: usize = 4;
 pub const REL_DIM: usize = 8;
 pub const SEARCH_STEPS: usize = 6;
 pub const STATE_DIM: usize = NODES * DIM;
-pub const INPUT_DIM: usize = REL_DIM * 2;
+pub const INPUT_DIM: usize = REL_DIM * 3; // résidu moitié 1 + moitié 2 + corrélation contexte
 
 const OFF_EDGE: usize = 0; // NODES * NODES * DIM * DIM = 576
 const OFF_BIAS: usize = OFF_EDGE + NODES * NODES * DIM * DIM; // 576, len 24
-const OFF_IN: usize = OFF_BIAS + NODES * DIM; // 600, len 384
-const OFF_G1: usize = OFF_IN + NODES * DIM * INPUT_DIM; // 984, len 32
-const OFF_G2: usize = OFF_G1 + DIM * (2 * DIM); // 1016, len 32
-const OFF_BH: usize = OFF_G2 + DIM * (2 * DIM); // 1048, len 32
-const OFF_CTX: usize = OFF_BH + DIM * (2 * DIM); // 1080, len 32
-const OFF_U: usize = OFF_CTX + DIM * REL_DIM; // 1112, len 16
-const OFF_OUT: usize = OFF_U + DIM * DIM; // 1128, len 32
-pub const NUM_PARAMS: usize = OFF_OUT + REL_DIM * DIM; // 1160
+const OFF_IN: usize = OFF_BIAS + NODES * DIM; // 600, len 576
+const OFF_G1: usize = OFF_IN + NODES * DIM * INPUT_DIM; // 1176, len 32
+const OFF_G2: usize = OFF_G1 + DIM * (2 * DIM); // 1208, len 32
+const OFF_BH: usize = OFF_G2 + DIM * (2 * DIM); // 1240, len 32
+const OFF_CTX: usize = OFF_BH + DIM * (2 * DIM); // 1272, len 32
+const OFF_U: usize = OFF_CTX + DIM * REL_DIM; // 1304, len 16
+const OFF_OUT: usize = OFF_U + DIM * DIM; // 1320, len 32
+pub const NUM_PARAMS: usize = OFF_OUT + REL_DIM * DIM; // 1352
 
 const MAGIC: &[u8; 4] = b"PHIS";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 
 #[derive(Clone, Debug)]
 pub struct PhiGraph {
@@ -38,45 +37,110 @@ pub struct AbductionTrace {
     pub final_mean_err: f32,
 }
 
-/// Extrait un champ purement relationnel à partir des octets bruts de `perceived.eff`.
+/// Champ purement relationnel multi-échelle (jusqu'à 256 octets de portée).
+/// Toutes les composantes sont invariantes par bijection affine de l'alphabet :
+///   [0] const_step : pas arithmétique constant (Δ1(t) == Δ1(t-1) != 0)
+///   [1] uni_rec    : proximité log de la dernière occurrence du même octet
+///   [2] bi_rec     : récurrence de bigramme (motifs / morphèmes / mots courts)
+///   [3] tri_rec    : récurrence de trigramme (racines / syntagmes / clauses)
+///   [4] mirror     : symétrie miroir (bigramme inversé ou centre de palindrome)
+///   [5] hub        : centralité structurelle (délimiteurs / hubs vs symboles rares)
+///   [6] boundary   : gradient de frontière entre symboles fréquents et rares
+///   [7] scale_rec  : échelle de distance de la récurrence (locale vs longue portée)
 pub fn extract_relations(bytes: &[u8]) -> Vec<[f32; REL_DIM]> {
-    let mut out = Vec::with_capacity(bytes.len());
-    for t in 0..bytes.len() {
-        let d1 = if t >= 1 {
-            bytes[t].wrapping_sub(bytes[t - 1])
-        } else {
-            0
-        };
-        let d2 = if t >= 2 {
-            bytes[t].wrapping_sub(bytes[t - 2])
-        } else {
-            0
-        };
-        let a1 = (d1 as f32) * TAU / 256.0;
-        let a2 = (d2 as f32) * TAU / 256.0;
+    let n = bytes.len();
+    let mut freq = [0u32; 256];
+    let mut max_freq = 1u32;
+    for &b in bytes {
+        freq[b as usize] += 1;
+        if freq[b as usize] > max_freq {
+            max_freq = freq[b as usize];
+        }
+    }
+    let max_f = max_freq as f32;
+    let win_cap = 256usize;
+    let log_cap = (n.min(win_cap).max(2) as f32).ln();
 
-        let eq = |lag: usize| -> f32 {
-            if t >= lag && bytes[t] == bytes[t - lag] {
-                1.0
-            } else {
-                -1.0
-            }
-        };
-        let long_eq = if (5..=12).any(|lag| t >= lag && bytes[t] == bytes[t - lag]) {
-            1.0
+    let mut out = Vec::with_capacity(n);
+    for t in 0..n {
+        let b = bytes[t];
+        let start = t.saturating_sub(win_cap);
+
+        let const_step = if t >= 2 {
+            let d1 = b.wrapping_sub(bytes[t - 1]);
+            let d0 = bytes[t - 1].wrapping_sub(bytes[t - 2]);
+            if d1 != 0 && d1 == d0 { 1.0 } else { -1.0 }
         } else {
             -1.0
         };
 
+        let mut last_uni: Option<usize> = None;
+        for j in (start..t).rev() {
+            if bytes[j] == b {
+                last_uni = Some(t - j);
+                break;
+            }
+        }
+        let uni_rec = match last_uni {
+            Some(dist) => 1.0 - ((dist as f32).ln() / log_cap).clamp(0.0, 1.0),
+            None => -1.0,
+        };
+
+        let mut bi_dist: Option<usize> = None;
+        if t >= 1 {
+            let b_prev = bytes[t - 1];
+            for j in (start + 1..t).rev() {
+                if bytes[j] == b && bytes[j - 1] == b_prev {
+                    bi_dist = Some(t - j);
+                    break;
+                }
+            }
+        }
+        let bi_rec = if bi_dist.is_some() { 1.0 } else { -1.0 };
+        let scale_rec = match bi_dist {
+            Some(dist) => 2.0 * ((dist as f32).ln() / log_cap).clamp(0.0, 1.0) - 1.0,
+            None => -1.0,
+        };
+
+        let mut tri_hit = false;
+        if t >= 2 {
+            let b1 = bytes[t - 1];
+            let b2 = bytes[t - 2];
+            for j in (start + 2..t).rev() {
+                if bytes[j] == b && bytes[j - 1] == b1 && bytes[j - 2] == b2 {
+                    tri_hit = true;
+                    break;
+                }
+            }
+        }
+        let tri_rec = if tri_hit { 1.0 } else { -1.0 };
+
+        let mut mirror_hit = false;
+        if t >= 1 {
+            let b_prev = bytes[t - 1];
+            if b == b_prev {
+                mirror_hit = true;
+            } else {
+                let m_start = t.saturating_sub(24);
+                for j in (m_start + 1..t).rev() {
+                    if bytes[j - 1] == b && bytes[j] == b_prev {
+                        mirror_hit = true;
+                        break;
+                    }
+                }
+            }
+        }
+        let mirror = if mirror_hit { 1.0 } else { -1.0 };
+
+        let hub = 2.0 * (freq[b as usize] as f32 / max_f) - 1.0;
+        let boundary = if t >= 1 {
+            (freq[b as usize] as f32 - freq[bytes[t - 1] as usize] as f32) / max_f
+        } else {
+            0.0
+        };
+
         out.push([
-            a1.sin(),
-            a1.cos(),
-            a2.sin(),
-            eq(1),
-            eq(2),
-            eq(3),
-            eq(4),
-            long_eq,
+            const_step, uni_rec, bi_rec, tri_rec, mirror, hub, boundary, scale_rec,
         ]);
     }
     out
@@ -86,7 +150,7 @@ impl PhiGraph {
     pub fn random(rng: &mut Rng) -> Self {
         let mut weights = Vec::with_capacity(NUM_PARAMS);
         for _ in 0..NUM_PARAMS {
-            weights.push(rng.next_normal() * 0.25);
+            weights.push(rng.next_normal() * 0.22);
         }
         Self { weights }
     }
@@ -96,8 +160,6 @@ impl PhiGraph {
         Self { weights }
     }
 
-    /// Projette l'hypothèse courante `state` en loi générative relationnelle sur `rels`,
-    /// et retourne les prédictions, le résidu par position et le résidu moyen.
     pub fn evaluate_hypothesis(
         &self,
         state: &[f32; STATE_DIM],
@@ -145,7 +207,6 @@ impl PhiGraph {
                 for k in 0..DIM {
                     rec += w[OFF_U + d * DIM + k] * u[k];
                 }
-                // Modulation multiplicative par l'hypothèse H : sans H, rien n'est généré.
                 u_next[d] = (g1[d] * ctx + g2[d] * rec + bh[d]).tanh();
             }
             u = u_next;
@@ -175,20 +236,21 @@ impl PhiGraph {
         (preds, pos_err, mean_err)
     }
 
-    /// Recherche abductive itérative : transforme l'effet perçu R en cause latente H*
-    /// via des messages non-réciproques guidés par le résidu.
-    /// `cut_mask` optionnel sectionne les arêtes traversant la bipartition (IIT).
+    /// Recherche abductive itérative avec injection segmentée du résidu (moitié 1 / moitié 2 / contexte).
     pub fn abduce(&self, rels: &[[f32; REL_DIM]], cut_mask: Option<u8>) -> AbductionTrace {
         let w = &self.weights;
         let mut state = [0.0f32; STATE_DIM];
         let mut step_residuals = Vec::with_capacity(SEARCH_STEPS + 1);
+
+        let mid = (rels.len() / 2).max(1);
+        let inv_a = 1.0 / (mid as f32);
+        let inv_b = 1.0 / (rels.len().saturating_sub(mid).max(1) as f32);
         let len_inv = 1.0 / (rels.len().max(1) as f32);
 
         for _ in 0..SEARCH_STEPS {
             let (preds, _, mean_err) = self.evaluate_hypothesis(&state, rels);
             step_residuals.push(mean_err);
 
-            // Résumé relationnel du résidu (erreur moyenne + corrélation erreur x contexte)
             let mut inp = [0.0f32; INPUT_DIM];
             for t in 0..rels.len() {
                 let prev = if t == 0 {
@@ -198,8 +260,12 @@ impl PhiGraph {
                 };
                 for r in 0..REL_DIM {
                     let err = rels[t][r] - preds[t][r];
-                    inp[r] += err * len_inv;
-                    inp[REL_DIM + r] += (prev[r] * err) * len_inv;
+                    if t < mid {
+                        inp[r] += err * inv_a;
+                    } else {
+                        inp[REL_DIM + r] += err * inv_b;
+                    }
+                    inp[2 * REL_DIM + r] += (prev[r] * err) * len_inv;
                 }
             }
 
@@ -209,7 +275,6 @@ impl PhiGraph {
                 for d in 0..DIM {
                     let mut acc = w[OFF_BIAS + i * DIM + d];
 
-                    // Messages non-réciproques j -> i
                     for j in 0..NODES {
                         if let Some(pi) = part_i {
                             let pj = (cut_mask.unwrap() >> j) & 1;
@@ -223,7 +288,6 @@ impl PhiGraph {
                         }
                     }
 
-                    // Injection du résidu
                     let in_base = OFF_IN + (i * DIM + d) * INPUT_DIM;
                     for m in 0..INPUT_DIM {
                         acc += w[in_base + m] * inp[m];
@@ -276,7 +340,7 @@ impl PhiGraph {
         if version != VERSION || count != NUM_PARAMS || data.len() != 12 + count * 4 {
             return Err(io::Error::new(
                 ErrorKind::InvalidData,
-                "Version ou taille du modèle .phis incompatible",
+                "Version ou taille du modèle .phis incompatible (ré-entraîne avec v0.2)",
             ));
         }
         let mut weights = Vec::with_capacity(count);
