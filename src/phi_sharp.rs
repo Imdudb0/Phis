@@ -1,6 +1,8 @@
-//! φ_sharp (IIT 4.0) v0.3.1 :
-//! - Coupe MIP couplée à l'opérateur multiplicatif latent (g_j ⊙ rq_u) -> perte mesurée fidèlement.
-//! - Pente douce sur Discrimination (sigmoid/softplus) pour éviter le plateau à 0.0000 au démarrage.
+//! φ_sharp (IIT 4.0) v0.4.0 :
+//! - Réfutation calibrée à 15 % des arêtes fortes (protège les causes nettes -> Spearman > LL).
+//! - Score de projection invariant au réordonnancement des clauses.
+//! - Résidu enrichi : détecte à la fois le couple déficitaire ET les motifs émergents "trous"
+//!   (valences ouvertes ou sous-expliquées dans E).
 
 use crate::math::{iit_intrinsic_difference, iit_partition_loss, normalize_prob, sigmoid, tanh_clamped};
 use crate::substrate::{D, HypothesisState, N_LAT, PerceivedGraph};
@@ -21,6 +23,8 @@ pub struct PhiReport {
     pub stability_geo: f64,
     pub residue_score: f64,
     pub top_residue_pair: (usize, usize),
+    /// Motifs émergents présentant le plus fort déficit explicatif / valence ouverte ("trous")
+    pub residue_holes: Vec<Vec<u8>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -264,8 +268,8 @@ pub fn compute_iit_mip(h: &HypothesisState, pg: &PerceivedGraph) -> (f64, f64) {
     }
 
     let internal_mip = tanh_clamped(min_phi * 3.0 * non_trivial_factor);
-    let grounded_mip = tanh_clamped(min_e_loss * 3.0);
-    let phi_mip = (internal_mip * (0.35 + 0.65 * grounded_mip)).clamp(0.0, 1.0);
+    let grounded_mip = tanh_clamped(min_e_loss * 3.5);
+    let phi_mip = (internal_mip * (0.30 + 0.70 * grounded_mip)).clamp(0.0, 1.0);
     let ce_norm = tanh_clamped(cause_effect_power * 2.5 * non_trivial_factor);
     (phi_mip, ce_norm.max(0.0))
 }
@@ -278,7 +282,7 @@ pub fn score_generativity(h: &HypothesisState, pg: &PerceivedGraph) -> f64 {
     let uniform_ll = -(k as f64).ln();
 
     let mut ll1 = 0.0;
-    let mut count1: f64 = 0.0;
+    let mut count1 = 0.0;
     for w in pg.sym_seq.windows(2) {
         ll1 += h.sym_trans[w[0] * k + w[1]].max(1e-9).ln();
         count1 += 1.0;
@@ -352,13 +356,14 @@ pub fn score_discrimination(h: &HypothesisState, pg: &PerceivedGraph) -> f64 {
 
     let combined = 0.55 * (ll_true - ll_scr) + 0.30 * (ll_true - ll_rev) + 0.15 * (ll_true - ll_marg);
     if combined <= 0.0 {
-        // Pente douce sous 0 pour permettre à NES de sortir du plateau initial (reste ~0 sur aléatoire)
         0.04 * sigmoid(combined * 4.0)
     } else {
         tanh_clamped(combined * 2.5).clamp(0.0, 1.0)
     }
 }
 
+/// Projection(H, E) : partitionne les clauses selon un tri intrinsèque (longueur, entropie locale)
+/// pour être strictement INVARIANT au réordonnancement des clauses dans E.
 pub fn score_projection(h: &HypothesisState, pg: &PerceivedGraph) -> f64 {
     let k = pg.k();
     let n = pg.sym_seq.len();
@@ -380,27 +385,36 @@ pub fn score_projection(h: &HypothesisState, pg: &PerceivedGraph) -> f64 {
         ((mean_ll - uniform_ll) / (-uniform_ll).max(0.5)).clamp(0.0, 1.3)
     };
 
-    let mut even_ll = 0.0;
-    let mut even_n = 0.0;
-    let mut odd_ll = 0.0;
-    let mut odd_n = 0.0;
-    for (c_idx, &(st, en)) in pg.ctx_spans.iter().enumerate() {
-        if en > st + 1 {
-            let g = span_gain(&pg.sym_seq[st..en]);
-            if c_idx % 2 == 0 {
-                even_ll += g;
-                even_n += 1.0;
-            } else {
-                odd_ll += g;
-                odd_n += 1.0;
-            }
+    let mut ordered_spans: Vec<(usize, f64, usize)> = pg
+        .ctx_spans
+        .iter()
+        .enumerate()
+        .filter(|&(_, &(st, en))| en > st + 1)
+        .map(|(idx, &(st, en))| (en - st, pg.ctx_features[idx][1], idx))
+        .collect();
+    ordered_spans.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
+
+    let mut half_a_ll = 0.0;
+    let mut half_a_n = 0.0;
+    let mut half_b_ll = 0.0;
+    let mut half_b_n = 0.0;
+    for (rank, &(_, _, c_idx)) in ordered_spans.iter().enumerate() {
+        let (st, en) = pg.ctx_spans[c_idx];
+        let g = span_gain(&pg.sym_seq[st..en]);
+        if rank % 2 == 0 {
+            half_a_ll += g;
+            half_a_n += 1.0;
+        } else {
+            half_b_ll += g;
+            half_b_n += 1.0;
         }
     }
-    let g_even = if even_n > 0.0 { even_ll / even_n } else { span_gain(&pg.sym_seq[..n / 2]) };
-    let g_odd = if odd_n > 0.0 { odd_ll / odd_n } else { span_gain(&pg.sym_seq[n / 2..]) };
 
-    let min_view = g_even.min(g_odd);
-    let balance = 1.0 - (g_even - g_odd).abs().min(1.0);
+    let g_a = if half_a_n > 0.0 { half_a_ll / half_a_n } else { span_gain(&pg.sym_seq[..n / 2]) };
+    let g_b = if half_b_n > 0.0 { half_b_ll / half_b_n } else { span_gain(&pg.sym_seq[n / 2..]) };
+
+    let min_view = g_a.min(g_b);
+    let balance = 1.0 - (g_a - g_b).abs().min(1.0);
 
     let mut ctx_align = 0.0;
     let mut ctx_count = 0.0;
@@ -420,10 +434,11 @@ pub fn score_projection(h: &HypothesisState, pg: &PerceivedGraph) -> f64 {
     tanh_clamped(raw * 2.1).clamp(0.0, 1.0)
 }
 
-pub fn compute_residue(h: &HypothesisState, pg: &PerceivedGraph) -> (f64, (usize, usize)) {
+/// Résidu + identification des motifs émergents "trous" (sous-expliqués ou ouverts).
+pub fn compute_residue(h: &HypothesisState, pg: &PerceivedGraph) -> (f64, (usize, usize), Vec<Vec<u8>>) {
     let k = pg.k();
     if k <= 1 {
-        return (1.0, (0, 0));
+        return (1.0, (0, 0), Vec::new());
     }
 
     let mut total_deficit = 0.0;
@@ -457,9 +472,31 @@ pub fn compute_residue(h: &HypothesisState, pg: &PerceivedGraph) -> (f64, (usize
     }
 
     let res = (0.70 * total_deficit + 0.30 * skip_deficit).clamp(0.0, 1.0);
-    (res, max_pair)
+
+    // Identifie jusqu'à 5 motifs émergents présentant la plus forte surprise/ouverture résiduelle
+    let mut holes: Vec<(f64, Vec<u8>)> = Vec::new();
+    for (mid, motif) in pg.motifs.iter().enumerate() {
+        if motif.len() < 3 {
+            continue;
+        }
+        let mut surprise = 0.0;
+        for w in motif.windows(2) {
+            let emp = pg.emp_trans1[w[0] * k + w[1]];
+            let pred = h.sym_trans[w[0] * k + w[1]].max(1e-9);
+            surprise += (emp - pred).max(0.0) + 0.1 * (-pred.ln()).min(5.0) / 5.0;
+        }
+        let idf = pg.motif_idf.get(mid).copied().unwrap_or(1.0);
+        let hole_score = (surprise / ((motif.len() - 1) as f64)) * idf;
+        let bytes: Vec<u8> = motif.iter().map(|&s| pg.unique_bytes[s]).collect();
+        holes.push((hole_score, bytes));
+    }
+    holes.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let residue_holes = holes.into_iter().take(5).map(|x| x.1).collect();
+
+    (res, max_pair, residue_holes)
 }
 
+/// Réfutation calibrée à 15 % des couplages dominants.
 pub fn apply_refutation(h: &HypothesisState, pg: &PerceivedGraph) -> HypothesisState {
     let mut ref_h = h.clone();
     let mut edges: Vec<(f64, usize)> = ref_h
@@ -471,9 +508,9 @@ pub fn apply_refutation(h: &HypothesisState, pg: &PerceivedGraph) -> HypothesisS
         .collect();
     edges.sort_by(|a, b| b.0.total_cmp(&a.0));
 
-    let cut_n = (edges.len() / 4).max(1);
+    let cut_n = (edges.len() * 15 / 100).max(1);
     for &(_, idx) in edges.iter().take(cut_n) {
-        ref_h.lat_couplings[idx] *= -0.15;
+        ref_h.lat_couplings[idx] *= -0.10;
     }
     rebuild_sym_trans_from_lat(&mut ref_h, pg);
     ref_h
@@ -612,7 +649,7 @@ pub fn evaluate_phi_sharp(h: &HypothesisState, pg: &PerceivedGraph, opts: EvalOp
 
     let sens_min = generativity.min(discrimination).min(projection);
     let sens_prod = generativity * discrimination * projection;
-    let (residue_score, top_residue_pair) = compute_residue(h, pg);
+    let (residue_score, top_residue_pair, residue_holes) = compute_residue(h, pg);
 
     let (stab_refutation, stab_displacement, stab_abstraction) = if opts.test_stability && h.search_depth > 0 {
         let base_g = generativity.max(1e-4);
@@ -665,5 +702,6 @@ pub fn evaluate_phi_sharp(h: &HypothesisState, pg: &PerceivedGraph, opts: EvalOp
         stability_geo,
         residue_score,
         top_residue_pair,
+        residue_holes,
     }
 }
