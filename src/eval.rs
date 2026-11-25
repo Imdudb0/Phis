@@ -374,7 +374,7 @@ pub fn phi_of_program(m: &Model, bytes: &[u8], v: &EffView, w: &Wiring, prog: &P
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AScores {
-    pub gen: f32,
+    pub generativity: f32,
     pub disc: f32,
     pub proj: f32,
     pub has_proj: bool,
@@ -395,7 +395,7 @@ pub fn a_scores(
     stab: f32,
 ) -> AScores {
     let (reg, _) = substrate::execute(bytes, v, w, prog);
-    let gen = 1.0 - ptgrs::behavior_distance(bytes, &reg);
+    let generativity = 1.0 - ptgrs::behavior_distance(bytes, &reg);
     let mut ds = Vec::new();
     for f in foreign.iter() {
         let fv = eff::build(f, cfg);
@@ -419,9 +419,13 @@ pub fn a_scores(
             has = true;
         }
     }
-    let a_known = if has { gen.min(disc).min(proj) } else { gen.min(disc) };
-    let a_free = gen.min(disc).min(phi).min(stab);
-    AScores { gen, disc, proj, has_proj: has, a_known, a_free }
+    let a_known = if has {
+        generativity.min(disc).min(proj)
+    } else {
+        generativity.min(disc)
+    };
+    let a_free = generativity.min(disc).min(phi).min(stab);
+    AScores { generativity, disc, proj, has_proj: has, a_known, a_free }
 }
 
 // ---------------------------------------------------------------- baselines
@@ -705,7 +709,8 @@ pub fn minilang(md: &MiniDict) -> (Vec<u8>, Vec<(usize, usize)>, (usize, usize))
         e.push(b'a' + (x & 15));
         e.push(b' ');
     }
-    (e.clone(), entries, (qs, e.len()))
+    let qe = e.len();
+    (e, entries, (qs, qe))
 }
 
 pub struct DictFile {
@@ -845,10 +850,16 @@ pub fn run_all(
         let r = ask(model_path, &ep.e, "", &work.join(format!("c{}", i)))?;
         let prog = prog_of(&r.diag, w.na);
         let ps = ptgrs::probes(&ep.cause, &mut rng, pre.probes);
-        let qual = 1.0 - ptgrs::obs_distance(&ep.cause, |x| substrate::execute(x, &{
-            let vv = eff::build(x, &m.view);
-            vv
-        }, &w, &prog).0, &ps);
+        let qual = 1.0
+            - ptgrs::obs_distance(
+                &ep.cause,
+                |x| {
+                    let xv = eff::build(x, &m.view);
+                    let xw = substrate::wire(&xv);
+                    substrate::execute(x, &xv, &xw, &prog).0
+                },
+                &ps,
+            );
         let id = substrate::identity_program(&ep.e, &v);
         let pid = phi_of_program(&m, &ep.e, &v, &w, &id);
         let prec = phi_of_program(&m, &ep.e, &v, &w, &prog);
