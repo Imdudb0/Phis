@@ -1,3 +1,3 @@
 [1m[92m    Finished[0m `release` profile [optimized] target(s) in 0.00s
 [1m[92m     Running[0m `target/release/ask --model out/sharp.phis --file perceived.eff`
-Human beings are anatomically similar and related to the great apes but are distinguished by a more highly developed brain and a resultant capacity for articulate speech and abstract reasoning. Jones in 1786 that Sanskrit was related to Latin, 
+en symbols by means of which human beings, as members of a social group and participants in its culture, express themselves. The functions of language include communication, the expressers of attitude, emphasis, and purpose. The philologist is concerned primarily with the historical development of languages as it is ma
