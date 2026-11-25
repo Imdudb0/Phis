@@ -30,7 +30,7 @@ jobs:
           #cargo check
           #cargo run --release -- train --out out/sharp.phis --steps 250 > out/out.txt 2>&1
           #cargo run --release -- sample --out out/comp.eff --family composite --seed 11 > out/eval.txt 2>&1
-          cargo run --release -- ask --model out/sharp.phis --file out/comp.eff > out/ask.txt 2>&1
+          cargo run --release -- ask --model out/sharp.phis --file molds.eff > out/ask.txt 2>&1
           #cargo run --release --bin phisharp -- train --steps 800 --batch 4 --nodes 16 --dim 16 --max-search 8 --out out/sharp.phis
         env:
           RUSTFLAGS: "-C target-cpu=native"
