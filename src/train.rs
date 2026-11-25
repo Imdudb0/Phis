@@ -1,10 +1,10 @@
 use crate::graph::{NUM_PARAMS, PhiGraph, STATE_DIM};
 use crate::phi::{
     PreparedComposite, PreparedEpisode, compute_composite_phi_prepared,
-    compute_phi_sharp_prepared, cosine_sim, project_query_to_molds, segment_effect,
+    compute_phi_sharp_prepared, cosine_sim, discover_causal_regimes, project_query_to_regimes,
 };
 use crate::ptgrs::{
-    CauseFamily, sample_composite_episode, sample_episode, sample_episode_in_range,
+    CauseFamily, SepMode, sample_composite_episode, sample_episode, sample_episode_in_range,
 };
 use crate::rng::Rng;
 use std::thread;
@@ -18,7 +18,17 @@ pub struct TrainConfig {
     pub seed: u64,
 }
 
-/// Pénalise la moyenne ET le pire chevauchement (empêche 2 familles de fusionner).
+fn span_iou(a: (usize, usize), b: (usize, usize)) -> f32 {
+    let inter_s = a.0.max(b.0);
+    let inter_e = a.1.min(b.1);
+    if inter_e <= inter_s {
+        return 0.0;
+    }
+    let inter = (inter_e - inter_s) as f32;
+    let union = ((a.1 - a.0) + (b.1 - b.0)) as f32 - inter;
+    if union <= 0.0 { 0.0 } else { inter / union }
+}
+
 fn batch_collapse_penalty(states: &[[f32; STATE_DIM]]) -> f32 {
     let mut sum = 0.0f32;
     let mut max_sq = 0.0f32;
@@ -41,8 +51,6 @@ fn batch_collapse_penalty(states: &[[f32; STATE_DIM]]) -> f32 {
     }
 }
 
-/// Spécificité générative croisée (non-supervisée) : chaque cause H_i doit expliquer E_i
-/// nettement mieux que le pire confondeur E_j du lot (bloque l'aplatissement du capteur).
 fn cross_specificity(
     graph: &PhiGraph,
     singles: &[PreparedEpisode],
@@ -122,7 +130,7 @@ pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
         .min(cfg.pop_pairs.max(1));
 
     println!(
-        "Entraînement Phisharp v0.4.1 ({} paramètres dont 140 capteur relationnel, {} étapes, {} paires ES, {} threads)...",
+        "Entraînement Phisharp v0.5 ({} paramètres : capteur + porte causale + graphe, {} étapes, {} paires ES, {} threads)...",
         NUM_PARAMS, cfg.steps, cfg.pop_pairs, n_threads
     );
 
@@ -136,12 +144,13 @@ pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
             })
             .collect();
 
+        // 2 flux continus bruts : 1 collé SANS séparateur, 1 étiqueté à séparateur aléatoire
         let composites = vec![
             PreparedComposite::from_bytes(
-                &sample_composite_episode(&mut rng, 3, false, false, false).effect,
+                &sample_composite_episode(&mut rng, 3, false, false, false, SepMode::None).effect,
             ),
             PreparedComposite::from_bytes(
-                &sample_composite_episode(&mut rng, 3, true, false, false).effect,
+                &sample_composite_episode(&mut rng, 3, true, false, false, SepMode::Random).effect,
             ),
         ];
 
@@ -221,6 +230,7 @@ pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
             let mut disc = 0.0;
             let mut proj = 0.0;
             let mut integ = 0.0;
+            let mut gate_c = 0.0;
             let mut res = 0.0;
             let mut states = Vec::with_capacity(singles.len());
             let mut residuals = Vec::with_capacity(singles.len());
@@ -231,6 +241,7 @@ pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
                 disc += r.discrimination;
                 proj += r.projection;
                 integ += r.integration;
+                gate_c += r.gate_contrast;
                 res += r.residual;
                 states.push(r.trace.final_state);
                 residuals.push(r.residual);
@@ -244,20 +255,21 @@ pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
                 .sum::<f32>()
                 / (composites.len() as f32);
             println!(
-                "step {:>4}/{:<4} | φ={:+.4} | Gen={:.3} Disc={:.3} Spec={:.3} Proj={:.3} IIT={:.3} RefSel={:.3} | res={:.3} coll={:.3} ({:.1}s)",
+                "step {:>4}/{:<4} | φ={:+.4} | Gen={:.3} Disc={:.3} Spec={:.3} Gate={:.3} IIT={:.3} RefSel={:.3} | res={:.3} coll={:.3} ({:.1}s)",
                 step,
                 cfg.steps,
                 phi / n,
                 gen_sum / n,
                 disc / n,
                 spec,
-                proj / n,
+                gate_c / n,
                 integ / n,
                 sel,
                 res / n,
                 coll,
                 start.elapsed().as_secs_f32()
             );
+            let _ = proj;
         }
     }
 
@@ -269,6 +281,7 @@ pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
 fn evaluate_post_hoc(model: &PhiGraph, seed: u64) {
     let mut rng = Rng::new(seed);
 
+    // 1. Abstraction Méta-relationnelle
     let mut same_sum = 0.0f32;
     let mut diff_sum = 0.0f32;
     let trials = 48;
@@ -292,35 +305,57 @@ fn evaluate_post_hoc(model: &PhiGraph, seed: u64) {
     let same_avg = same_sum / (trials as f32);
     let diff_avg = diff_sum / (trials as f32);
 
+    // 2. Projection Référentielle sur flux continus (découpe 100% auto-découverte)
     let proj_trials = 50;
-    let mut hits_raw = 0usize;
+    let mut hits_glued = 0usize;
     let mut hits_tagged = 0usize;
-    let mut ref_detected = 0usize;
+    let mut ref_hits = 0usize;
     let mut avg_margin = 0.0f32;
 
     for _ in 0..proj_trials {
-        let ep_raw = sample_composite_episode(&mut rng, 4, false, false, true);
-        let spans_raw = segment_effect(&ep_raw.effect);
-        let m_raw =
-            project_query_to_molds(model, &ep_raw.effect, &spans_raw, ep_raw.hidden_query_idx);
-        if m_raw.first().map(|m| m.dst_idx) == Some(ep_raw.hidden_match_idx) {
-            hits_raw += 1;
-        }
-
-        let ep_tag = sample_composite_episode(&mut rng, 4, true, true, true);
-        let spans_tag = segment_effect(&ep_tag.effect);
-        let m_tag =
-            project_query_to_molds(model, &ep_tag.effect, &spans_tag, ep_tag.hidden_query_idx);
-        if let Some(top) = m_tag.first() {
-            if top.dst_idx == ep_tag.hidden_match_idx {
-                hits_tagged += 1;
-                if top.referent.is_some() {
-                    ref_detected += 1;
+        // A. Flux continu collé SANS séparateur (4 moules + requête collés bout à bout)
+        let ep_raw = sample_composite_episode(&mut rng, 4, false, false, true, SepMode::None);
+        let regs_raw = discover_causal_regimes(model, &ep_raw.effect, true);
+        if regs_raw.len() >= 2 {
+            let q_idx = regs_raw.len() - 1;
+            let q_reg = regs_raw[q_idx];
+            let true_q = ep_raw.hidden_core_spans[ep_raw.hidden_query_idx];
+            let true_m = ep_raw.hidden_core_spans[ep_raw.hidden_match_idx];
+            if span_iou((q_reg.core_start, q_reg.core_end), true_q) >= 0.45 {
+                let matches = project_query_to_regimes(model, &ep_raw.effect, &regs_raw, q_idx);
+                if let Some(top) = matches.first()
+                    && span_iou((top.core_start, top.core_end), true_m) >= 0.45
+                {
+                    hits_glued += 1;
                 }
             }
         }
-        if m_tag.len() >= 2 {
-            avg_margin += m_tag[0].score - m_tag[1].score;
+
+        // B. Flux continu étiqueté à séparateur aléatoire ("", "\n", " | ", "; ")
+        let ep_tag = sample_composite_episode(&mut rng, 4, true, true, true, SepMode::Random);
+        let regs_tag = discover_causal_regimes(model, &ep_tag.effect, true);
+        if regs_tag.len() >= 2 {
+            let q_idx = regs_tag.len() - 1;
+            let q_reg = regs_tag[q_idx];
+            let true_q = ep_tag.hidden_core_spans[ep_tag.hidden_query_idx];
+            let true_m = ep_tag.hidden_core_spans[ep_tag.hidden_match_idx];
+            let true_tag = ep_tag.hidden_tag_spans[ep_tag.hidden_match_idx];
+            if span_iou((q_reg.core_start, q_reg.core_end), true_q) >= 0.45 {
+                let matches = project_query_to_regimes(model, &ep_tag.effect, &regs_tag, q_idx);
+                if let Some(top) = matches.first() {
+                    if span_iou((top.core_start, top.core_end), true_m) >= 0.45 {
+                        hits_tagged += 1;
+                        if let (Some(ext_ref), Some(gt_tag)) = (top.referent, true_tag)
+                            && span_iou(ext_ref, gt_tag) >= 0.50
+                        {
+                            ref_hits += 1;
+                        }
+                    }
+                    if matches.len() >= 2 {
+                        avg_margin += matches[0].score - matches[1].score;
+                    }
+                }
+            }
         }
     }
 
@@ -329,20 +364,20 @@ fn evaluate_post_hoc(model: &PhiGraph, seed: u64) {
     println!("  Causes différentes: cos = {:+.4}", diff_avg);
     println!("  Marge             : {:+.4}", same_avg - diff_avg);
 
-    println!("\n--- Évaluation post-hoc 2 : Projection Référentielle (4 moules, hasard = 25%) ---");
+    println!("\n--- Évaluation post-hoc 2 : Flux continu 100% auto-segmenté (4 moules, hasard = 25%) ---");
     println!(
-        "  Moules bruts (0 octet commun)      : {}/{} ({:.1}%)",
-        hits_raw,
+        "  Moules collés SANS séparateur (0 octet commun)     : {}/{} ({:.1}%)",
+        hits_glued,
         proj_trials,
-        100.0 * (hits_raw as f32) / (proj_trials as f32)
+        100.0 * (hits_glued as f32) / (proj_trials as f32)
     );
     println!(
-        "  Moules étiquetés (0 octet commun)  : {}/{} ({:.1}%)  [marge Top1-Top2 = {:+.4}, référent extrait = {}/{}]",
+        "  Moules étiquetés, sép. aléatoire (0 octet commun)  : {}/{} ({:.1}%)  [marge={:+.4}, référent exact={}/{}]",
         hits_tagged,
         proj_trials,
         100.0 * (hits_tagged as f32) / (proj_trials as f32),
         avg_margin / (proj_trials as f32),
-        ref_detected,
+        ref_hits,
         hits_tagged
     );
 }
