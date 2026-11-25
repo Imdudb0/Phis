@@ -1,40 +1,40 @@
 [1m[33mwarning[0m[1m: field `mean_residual` is never read[0m
-  [1m[94m--> [0msrc/phi.rs:67:9
+  [1m[94m--> [0msrc/phi.rs:65:9
    [1m[94m|[0m
-[1m[94m62[0m [1m[94m|[0m pub struct CompositePhi {
+[1m[94m60[0m [1m[94m|[0m pub struct CompositePhi {
    [1m[94m|[0m            [1m[94m------------[0m [1m[94mfield in this struct[0m
 [1m[94m...[0m
-[1m[94m67[0m [1m[94m|[0m     pub mean_residual: f32,
+[1m[94m65[0m [1m[94m|[0m     pub mean_residual: f32,
    [1m[94m|[0m         [1m[33m^^^^^^^^^^^^^[0m
    [1m[94m|[0m
    [1m[94m= [0m[1mnote[0m: `CompositePhi` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
    [1m[94m= [0m[1mnote[0m: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
 
 [1m[33mwarning[0m: `phisharp` (bin "phisharp") generated 1 warning
-[1m[92m    Finished[0m `release` profile [optimized] target(s) in 0.01s
+[1m[92m    Finished[0m `release` profile [optimized] target(s) in 0.00s
 [1m[92m     Running[0m `target/release/phisharp train --out out/sharp.phis --steps 300`
-Entraînement Phisharp v0.4 (1492 paramètres dont 140 capteur relationnel, 300 étapes, 24 paires ES, 4 threads)...
-step    1/300  | φ=+0.0852 | Gen=0.400 Disc=0.037 Proj=0.839 IIT=0.050 RefSel=0.238 | res=0.416 coll=0.923 (0.1s)
-step   25/300  | φ=+0.4022 | Gen=0.610 Disc=0.455 Proj=0.810 IIT=0.127 RefSel=0.408 | res=0.238 coll=0.294 (1.7s)
-step   50/300  | φ=+0.6106 | Gen=0.802 Disc=0.691 Proj=0.931 IIT=0.168 RefSel=0.420 | res=0.106 coll=0.419 (3.4s)
-step   75/300  | φ=+0.6094 | Gen=0.819 Disc=0.665 Proj=0.898 IIT=0.160 RefSel=0.198 | res=0.094 coll=0.247 (5.0s)
-step  100/300  | φ=+0.6530 | Gen=0.883 Disc=0.751 Proj=0.890 IIT=0.152 RefSel=0.489 | res=0.059 coll=0.272 (6.6s)
-step  125/300  | φ=+0.7030 | Gen=0.902 Disc=0.743 Proj=0.961 IIT=0.237 RefSel=0.576 | res=0.048 coll=0.433 (8.2s)
-step  150/300  | φ=+0.7242 | Gen=0.885 Disc=0.805 Proj=0.962 IIT=0.284 RefSel=0.643 | res=0.057 coll=0.373 (9.8s)
-step  175/300  | φ=+0.7189 | Gen=0.873 Disc=0.810 Proj=0.964 IIT=0.267 RefSel=0.102 | res=0.064 coll=0.455 (11.4s)
-step  200/300  | φ=+0.7439 | Gen=0.884 Disc=0.757 Proj=0.953 IIT=0.393 RefSel=0.355 | res=0.057 coll=0.356 (13.0s)
-step  225/300  | φ=+0.7911 | Gen=0.898 Disc=0.849 Proj=0.940 IIT=0.476 RefSel=0.539 | res=0.050 coll=0.401 (14.6s)
-step  250/300  | φ=+0.7692 | Gen=0.924 Disc=0.833 Proj=0.961 IIT=0.346 RefSel=0.493 | res=0.037 coll=0.450 (16.3s)
-step  275/300  | φ=+0.8077 | Gen=0.919 Disc=0.855 Proj=0.957 IIT=0.476 RefSel=0.512 | res=0.039 coll=0.437 (17.8s)
-step  300/300  | φ=+0.8258 | Gen=0.917 Disc=0.796 Proj=0.972 IIT=0.608 RefSel=0.376 | res=0.040 coll=0.380 (19.5s)
+Entraînement Phisharp v0.4.1 (1492 paramètres dont 140 capteur relationnel, 300 étapes, 24 paires ES, 4 threads)...
+step    1/300  | φ=+0.0312 | Gen=0.353 Disc=0.020 Spec=0.012 Proj=0.824 IIT=0.069 RefSel=0.248 | res=0.474 coll=0.961 (0.1s)
+step   25/300  | φ=+0.4234 | Gen=0.659 Disc=0.485 Spec=0.022 Proj=0.808 IIT=0.080 RefSel=0.437 | res=0.199 coll=0.597 (1.3s)
+step   50/300  | φ=+0.5807 | Gen=0.797 Disc=0.690 Spec=0.042 Proj=0.899 IIT=0.121 RefSel=0.477 | res=0.110 coll=0.664 (2.6s)
+step   75/300  | φ=+0.6063 | Gen=0.803 Disc=0.696 Spec=0.106 Proj=0.877 IIT=0.203 RefSel=0.122 | res=0.108 coll=0.600 (3.8s)
+step  100/300  | φ=+0.6097 | Gen=0.805 Disc=0.728 Spec=0.238 Proj=0.846 IIT=0.180 RefSel=0.596 | res=0.105 coll=0.564 (5.1s)
+step  125/300  | φ=+0.6192 | Gen=0.806 Disc=0.802 Spec=0.169 Proj=0.889 IIT=0.134 RefSel=0.564 | res=0.104 coll=0.501 (6.4s)
+step  150/300  | φ=+0.6648 | Gen=0.808 Disc=0.788 Spec=0.312 Proj=0.850 IIT=0.369 RefSel=0.588 | res=0.103 coll=0.412 (7.6s)
+step  175/300  | φ=+0.6578 | Gen=0.828 Disc=0.791 Spec=0.265 Proj=0.795 IIT=0.301 RefSel=0.313 | res=0.090 coll=0.551 (8.9s)
+step  200/300  | φ=+0.6578 | Gen=0.818 Disc=0.803 Spec=0.477 Proj=0.844 IIT=0.241 RefSel=0.554 | res=0.096 coll=0.230 (10.1s)
+step  225/300  | φ=+0.6280 | Gen=0.780 Disc=0.767 Spec=0.378 Proj=0.786 IIT=0.330 RefSel=0.665 | res=0.126 coll=0.157 (11.3s)
+step  250/300  | φ=+0.6627 | Gen=0.840 Disc=0.797 Spec=0.306 Proj=0.859 IIT=0.265 RefSel=0.482 | res=0.089 coll=0.541 (12.6s)
+step  275/300  | φ=+0.6875 | Gen=0.853 Disc=0.820 Spec=0.327 Proj=0.845 IIT=0.298 RefSel=0.484 | res=0.082 coll=0.531 (13.8s)
+step  300/300  | φ=+0.6969 | Gen=0.837 Disc=0.852 Spec=0.511 Proj=0.850 IIT=0.396 RefSel=0.555 | res=0.087 coll=0.096 (15.1s)
 
 --- Évaluation post-hoc 1 : Abstraction Méta-relationnelle (0 octet commun) ---
-  Même cause cachée : cos = +0.8865
-  Causes différentes: cos = +0.0806
-  Marge             : +0.8060
+  Même cause cachée : cos = +0.9265
+  Causes différentes: cos = -0.0411
+  Marge             : +0.9676
 
 --- Évaluation post-hoc 2 : Projection Référentielle (4 moules, hasard = 25%) ---
-  Moules bruts (0 octet commun)      : 27/50 (54.0%)
-  Moules étiquetés (0 octet commun)  : 26/50 (52.0%)  [marge Top1-Top2 = +0.1017]
+  Moules bruts (0 octet commun)      : 43/50 (86.0%)
+  Moules étiquetés (0 octet commun)  : 37/50 (74.0%)  [marge Top1-Top2 = +0.2813, référent extrait = 37/37]
 
 Modèle sauvegardé dans 'out/sharp.phis'.
