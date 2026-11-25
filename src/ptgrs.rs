@@ -6,7 +6,7 @@ pub enum CauseFamily {
     Symmetric,
     Nested,
     SharedMotif,
-    Arithmetic,
+    Substitution,
     Grammar,
 }
 
@@ -16,7 +16,7 @@ impl CauseFamily {
         CauseFamily::Symmetric,
         CauseFamily::Nested,
         CauseFamily::SharedMotif,
-        CauseFamily::Arithmetic,
+        CauseFamily::Substitution,
         CauseFamily::Grammar,
     ];
 
@@ -26,7 +26,7 @@ impl CauseFamily {
             CauseFamily::Symmetric => "symmetric",
             CauseFamily::Nested => "nested",
             CauseFamily::SharedMotif => "shared",
-            CauseFamily::Arithmetic => "arithmetic",
+            CauseFamily::Substitution => "substitution",
             CauseFamily::Grammar => "grammar",
         }
     }
@@ -37,7 +37,7 @@ impl CauseFamily {
             "symmetric" => Some(CauseFamily::Symmetric),
             "nested" => Some(CauseFamily::Nested),
             "shared" => Some(CauseFamily::SharedMotif),
-            "arithmetic" => Some(CauseFamily::Arithmetic),
+            "substitution" => Some(CauseFamily::Substitution),
             "grammar" => Some(CauseFamily::Grammar),
             _ => None,
         }
@@ -50,8 +50,6 @@ pub struct Episode {
     pub hidden_cause: CauseFamily,
 }
 
-/// Épisode composite PTGRS : plusieurs moules + une requête sur alphabet strictement disjoint.
-/// Les métadonnées `hidden_*` ne sont JAMAIS vues durant l'entraînement.
 #[derive(Clone, Debug)]
 pub struct CompositeEpisode {
     pub effect: Vec<u8>,
@@ -99,7 +97,7 @@ impl TermGraph {
     }
 
     fn dfs(&self, id: usize, depth: usize, max_len: usize, out: &mut Vec<u8>) {
-        if out.len() >= max_len || depth > 24 {
+        if out.len() >= max_len || depth > 28 {
             return;
         }
         let node = &self.nodes[id];
@@ -129,7 +127,7 @@ pub fn sample_episode(rng: &mut Rng, family: CauseFamily) -> Episode {
 
 pub fn sample_episode_in_range(rng: &mut Rng, family: CauseFamily, lo: u8, hi: u8) -> Episode {
     let mut tg = TermGraph::new();
-    let max_len = 28 + rng.next_usize(25); // longueurs variables 28..52
+    let max_len = 28 + rng.next_usize(25);
 
     let root = match family {
         CauseFamily::Periodic => {
@@ -141,11 +139,18 @@ pub fn sample_episode_in_range(rng: &mut Rng, family: CauseFamily, lo: u8, hi: u
             tg.add_branch(vec![motif; reps])
         }
         CauseFamily::Symmetric => {
-            let half = 4 + rng.next_usize(4);
-            let alpha = sample_alphabet(rng, half, lo, hi);
-            let fwd: Vec<usize> = alpha.iter().map(|&b| tg.add_leaf(b)).collect();
+            // Palindromes pairs (ABCDDCBA) et impairs (ABCDCBA)
+            let half = 3 + rng.next_usize(4);
+            let odd = rng.next_usize(2) == 1;
+            let alpha = sample_alphabet(rng, half + usize::from(odd), lo, hi);
+            let fwd: Vec<usize> = alpha[..half].iter().map(|&b| tg.add_leaf(b)).collect();
             let rev: Vec<usize> = fwd.iter().rev().copied().collect();
-            let pal = tg.add_branch([fwd, rev].concat());
+            let mut kids = fwd;
+            if odd {
+                kids.push(tg.add_leaf(alpha[half]));
+            }
+            kids.extend(rev);
+            let pal = tg.add_branch(kids);
             tg.add_branch(vec![pal, pal, pal, pal])
         }
         CauseFamily::Nested => {
@@ -177,19 +182,22 @@ pub fn sample_episode_in_range(rng: &mut Rng, family: CauseFamily, lo: u8, hi: u
                 shared, b0, shared, b1, shared, b2, shared, b3, shared, b4, shared,
             ])
         }
-        CauseFamily::Arithmetic => {
-            let span = (hi - lo) as usize;
-            let cycle = 5 + rng.next_usize(4);
-            let max_step = (span / cycle.max(1)).clamp(1, 6);
-            let step = (1 + rng.next_usize(max_step)) as u8;
-            let max_start_off = span.saturating_sub((step as usize) * (cycle - 1));
-            let start = lo + (rng.next_usize(max_start_off + 1) as u8);
-            let mut children = Vec::with_capacity(max_len);
-            for i in 0..max_len {
-                let v = start + step * ((i % cycle) as u8);
-                children.push(tg.add_leaf(v));
+        CauseFamily::Substitution => {
+            // Réécriture L-système quasi-périodique (DAG de Fibonacci : S_k = S_{k-1} + S_{k-2})
+            let alpha = sample_alphabet(rng, 5, lo, hi);
+            let a0 = tg.add_leaf(alpha[0]);
+            let a1 = tg.add_leaf(alpha[1]);
+            let a2 = tg.add_leaf(alpha[2]);
+            let a3 = tg.add_leaf(alpha[3]);
+            let a4 = tg.add_leaf(alpha[4]);
+            let mut prev = tg.add_branch(vec![a0, a1]);
+            let mut curr = tg.add_branch(vec![a2, a3, a4]);
+            for _ in 0..6 {
+                let next = tg.add_branch(vec![curr, prev]);
+                prev = curr;
+                curr = next;
             }
-            tg.add_branch(children)
+            curr
         }
         CauseFamily::Grammar => {
             let alpha = sample_alphabet(rng, 14, lo, hi);
@@ -234,12 +242,6 @@ pub fn sample_episode_in_range(rng: &mut Rng, family: CauseFamily, lo: u8, hi: u
     }
 }
 
-/// Génère un effet composite multi-moules :
-/// - `num_molds` moules candidats (tous de causes distinctes) dans l'alphabet `[33..90]`
-/// - 1 requête de même cause cachée qu'un des moules dans un alphabet strictement disjoint
-///   (`[97..122]` si `printable_query`, sinon `[140..220]`).
-/// - Si `with_tags` est vrai, chaque moule reçoit un préfixe/étiquette dans `[33..90]`.
-/// - Si `query_last` est vrai, la requête est placée en dernière ligne (format définitions + requête).
 pub fn sample_composite_episode(
     rng: &mut Rng,
     num_molds: usize,
@@ -261,7 +263,7 @@ pub fn sample_composite_episode(
             let mut prefix = if printable_query {
                 format!("MOLD_{}: ", fam.name().to_uppercase()).into_bytes()
             } else {
-                let tag_len = 6 + rng.next_usize(5);
+                let tag_len = 6 + rng.next_usize(6);
                 sample_alphabet(rng, tag_len, 33, 90)
             };
             prefix.extend_from_slice(&body);
