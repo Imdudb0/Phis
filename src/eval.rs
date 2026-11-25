@@ -705,7 +705,7 @@ pub fn minilang(md: &MiniDict) -> (Vec<u8>, Vec<(usize, usize)>, (usize, usize))
         e.push(b'a' + (x & 15));
         e.push(b' ');
     }
-    (e, entries, (qs, e.len()))
+    (e.clone(), entries, (qs, e.len()))
 }
 
 pub struct DictFile {
