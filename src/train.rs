@@ -1,153 +1,112 @@
-//! Entraînement FERMÉ v0.4.0 :
-//! - PTGRS uniquement (alternance de traces séquentielles et d'ensembles non-séquentiels de clauses)
-//! - Signal unique : φ_sharp, Sens, Trajectoire et Résidu.
+use crate::graph::{NUM_PARAMS, PhiGraph, extract_relations};
+use crate::phi::{compute_phi_sharp, cosine_sim};
+use crate::ptgrs::{CauseFamily, sample_episode, sample_episode_in_range};
+use crate::rng::Rng;
+use std::thread;
+use std::time::Instant;
 
-use std::path::Path;
-
-use crate::abduction::{SearchConfig, run_abductive_search};
-use crate::math::Rng;
-use crate::ptgrs::{PtgrsSample, sample_training_effect};
-use crate::substrate::PhisharpNet;
-
-#[derive(Clone, Debug)]
 pub struct TrainConfig {
-    pub iterations: usize,
+    pub steps: usize,
     pub pop_pairs: usize,
-    pub batch_size: usize,
-    pub search_budget: usize,
-    pub sigma: f64,
-    pub lr: f64,
+    pub sigma: f32,
+    pub lr: f32,
     pub seed: u64,
 }
 
-impl Default for TrainConfig {
-    fn default() -> Self {
-        Self {
-            iterations: 140,
-            pop_pairs: 20,
-            batch_size: 4,
-            search_budget: 10,
-            sigma: 0.055,
-            lr: 0.022,
-            seed: 2026_11_24,
-        }
+fn eval_batch(graph: &PhiGraph, batch: &[Vec<u8>], eval_seed: u64) -> f32 {
+    let mut rng = Rng::new(eval_seed);
+    let mut sum = 0.0f32;
+    for effect in batch {
+        let rep = compute_phi_sharp(graph, effect, &mut rng, false);
+        sum += rep.phi_sharp;
     }
+    sum / (batch.len() as f32)
 }
 
-#[derive(Clone, Debug)]
-pub struct TrainLogEntry {
-    pub iter: usize,
-    pub mean_phi_sharp: f64,
-    pub mean_phi_t0: f64,
-    pub mean_sens_min: f64,
-    pub mean_residue: f64,
-    pub non_reciprocity: f64,
-}
-
-fn evaluate_batch_fitness(
-    net: &PhisharpNet,
-    batch: &[PtgrsSample],
-    budget: usize,
-) -> (f64, f64, f64, f64, f64) {
-    let cfg = SearchConfig {
-        budget_steps: budget,
-        disable_refutation: false,
-        max_explain_len: 96,
-    };
-
-    let mut sum_obj = 0.0;
-    let mut sum_phi = 0.0;
-    let mut sum_phi0 = 0.0;
-    let mut sum_sens = 0.0;
-    let mut sum_res = 0.0;
-
-    for sample in batch {
-        let res = run_abductive_search(net, &sample.observed_e, cfg);
-        let phi0 = res.trajectory.first().map(|p| p.report.phi_sharp).unwrap_or(0.0);
-        let rep = &res.final_report;
-
-        let traj_gain = (rep.phi_sharp - phi0).max(0.0);
-        let sens_geo = rep.sens_prod.cbrt();
-        let obj = 1.4 * rep.phi_sharp
-            + 0.40 * traj_gain
-            + 0.35 * rep.phi_iit_mip
-            + 0.45 * sens_geo
-            + 0.35 * rep.sens_min
-            - 0.30 * rep.residue_score;
-
-        sum_obj += obj;
-        sum_phi += rep.phi_sharp;
-        sum_phi0 += phi0;
-        sum_sens += rep.sens_min;
-        sum_res += rep.residue_score;
-    }
-
-    let inv = 1.0 / (batch.len().max(1) as f64);
-    (
-        sum_obj * inv,
-        sum_phi * inv,
-        sum_phi0 * inv,
-        sum_sens * inv,
-        sum_res * inv,
-    )
-}
-
-pub fn train_closed_ptgrs(cfg: &TrainConfig, save_path: Option<&Path>) -> (PhisharpNet, Vec<TrainLogEntry>) {
+pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
+    let start = Instant::now();
     let mut rng = Rng::new(cfg.seed);
-    let mut net = PhisharpNet::new_random(&mut rng);
-    let n_params = net.param_count();
-    let mut theta = net.to_flat_vec();
+    let mut theta = PhiGraph::random(&mut rng).weights;
 
-    let mut m = vec![0.0; n_params];
-    let mut v = vec![0.0; n_params];
-    let beta1 = 0.9_f64;
-    let beta2 = 0.999_f64;
-    let eps_adam = 1e-8_f64;
+    // État Adam pour Evolution Strategies antithétique
+    let mut m = vec![0.0f32; NUM_PARAMS];
+    let mut v = vec![0.0f32; NUM_PARAMS];
+    let beta1 = 0.9f32;
+    let beta2 = 0.999f32;
+    let eps_adam = 1e-8f32;
 
-    let mut logs = Vec::with_capacity(cfg.iterations);
-    let mut best_theta = theta.clone();
-    let mut best_obj = f64::NEG_INFINITY;
+    let n_threads = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(cfg.pop_pairs.max(1));
 
-    for it in 1..=cfg.iterations {
-        let mut batch = Vec::with_capacity(cfg.batch_size);
-        for _ in 0..cfg.batch_size {
-            batch.push(sample_training_effect(&mut rng));
-        }
+    println!(
+        "Entraînement Phisharp ({} paramètres, {} étapes, {} paires ES, {} threads)...",
+        NUM_PARAMS, cfg.steps, cfg.pop_pairs, n_threads
+    );
 
-        let mut grad = vec![0.0; n_params];
-        let mut probe_net = net.clone();
-        let mut noises = Vec::with_capacity(cfg.pop_pairs);
-        let mut diffs = Vec::with_capacity(cfg.pop_pairs);
+    for step in 1..=cfg.steps {
+        // Lot synthétique PTGRS : E seul est vu par le modèle
+        let batch: Vec<Vec<u8>> = CauseFamily::ALL
+            .iter()
+            .map(|&fam| sample_episode(&mut rng, fam).effect)
+            .collect();
+        let eval_seed = rng.next_u64();
+        let pair_seeds: Vec<u64> = (0..cfg.pop_pairs).map(|_| rng.next_u64()).collect();
 
-        for _ in 0..cfg.pop_pairs {
-            let eps: Vec<f64> = (0..n_params).map(|_| rng.next_normal()).collect();
+        // Évaluation parallèle des perturbations +/- sigma * eps
+        let results: Vec<(u64, f32, f32)> = thread::scope(|s| {
+            let chunk_size = cfg.pop_pairs.div_ceil(n_threads);
+            let mut handles = Vec::new();
+            for chunk in pair_seeds.chunks(chunk_size) {
+                let theta_ref = &theta;
+                let batch_ref = &batch;
+                let sigma = cfg.sigma;
+                handles.push(s.spawn(move || {
+                    let mut local = Vec::with_capacity(chunk.len());
+                    for &pseed in chunk {
+                        let mut prng = Rng::new(pseed);
+                        let mut w_pos = Vec::with_capacity(NUM_PARAMS);
+                        let mut w_neg = Vec::with_capacity(NUM_PARAMS);
+                        for &w in theta_ref {
+                            let noise = prng.next_normal() * sigma;
+                            w_pos.push(w + noise);
+                            w_neg.push(w - noise);
+                        }
+                        let f_pos = eval_batch(&PhiGraph::from_weights(w_pos), batch_ref, eval_seed);
+                        let f_neg = eval_batch(&PhiGraph::from_weights(w_neg), batch_ref, eval_seed);
+                        local.push((pseed, f_pos, f_neg));
+                    }
+                    local
+                }));
+            }
+            let mut merged = Vec::with_capacity(cfg.pop_pairs);
+            for h in handles {
+                merged.extend(h.join().unwrap());
+            }
+            merged
+        });
 
-            let plus: Vec<f64> = theta.iter().zip(eps.iter()).map(|(&w, &e)| w + cfg.sigma * e).collect();
-            probe_net.from_flat_vec(&plus);
-            let (f_plus, _, _, _, _) = evaluate_batch_fitness(&probe_net, &batch, cfg.search_budget);
+        // Standardisation des différences pour stabiliser le pas
+        let diffs: Vec<f32> = results.iter().map(|&(_, fp, fn_)| fp - fn_).collect();
+        let var: f32 = diffs.iter().map(|d| d * d).sum::<f32>() / (diffs.len() as f32);
+        let std = var.sqrt().max(1e-6);
 
-            let minus: Vec<f64> = theta.iter().zip(eps.iter()).map(|(&w, &e)| w - cfg.sigma * e).collect();
-            probe_net.from_flat_vec(&minus);
-            let (f_minus, _, _, _, _) = evaluate_batch_fitness(&probe_net, &batch, cfg.search_budget);
-
-            diffs.push(f_plus - f_minus);
-            noises.push(eps);
-        }
-
-        let mean_abs = diffs.iter().map(|d| d.abs()).sum::<f64>() / (diffs.len().max(1) as f64);
-        let norm_scale = if mean_abs > 1e-8 { 1.0 / mean_abs } else { 1.0 };
-
-        let denom = 2.0 * (cfg.pop_pairs as f64) * cfg.sigma;
-        for (p_idx, eps) in noises.iter().enumerate() {
-            let w_diff = (diffs[p_idx] * norm_scale).clamp(-3.0, 3.0);
-            for i in 0..n_params {
-                grad[i] += w_diff * eps[i] / denom;
+        let mut grad = vec![0.0f32; NUM_PARAMS];
+        let scale = 1.0 / (2.0 * (cfg.pop_pairs as f32) * cfg.sigma * std);
+        for (&(pseed, _, _), &diff) in results.iter().zip(diffs.iter()) {
+            let mut prng = Rng::new(pseed);
+            let coeff = diff * scale;
+            for g in &mut grad {
+                *g += coeff * prng.next_normal();
             }
         }
 
-        let b1_corr = 1.0 - beta1.powi(it as i32);
-        let b2_corr = 1.0 - beta2.powi(it as i32);
-        for i in 0..n_params {
+        // Montée de gradient Adam + légère régularisation L2
+        let t = step as i32;
+        let b1_corr = 1.0 - beta1.powi(t);
+        let b2_corr = 1.0 - beta2.powi(t);
+        for i in 0..NUM_PARAMS {
             let g = grad[i] - 1e-4 * theta[i];
             m[i] = beta1 * m[i] + (1.0 - beta1) * g;
             v[i] = beta2 * v[i] + (1.0 - beta2) * g * g;
@@ -156,44 +115,78 @@ pub fn train_closed_ptgrs(cfg: &TrainConfig, save_path: Option<&Path>) -> (Phish
             theta[i] += cfg.lr * m_hat / (v_hat.sqrt() + eps_adam);
         }
 
-        net.from_flat_vec(&theta);
-        let (obj_cur, mean_phi, mean_phi0, mean_sens, mean_res) =
-            evaluate_batch_fitness(&net, &batch, cfg.search_budget);
-
-        if obj_cur > best_obj {
-            best_obj = obj_cur;
-            best_theta = theta.clone();
-        }
-
-        let entry = TrainLogEntry {
-            iter: it,
-            mean_phi_sharp: mean_phi,
-            mean_phi_t0: mean_phi0,
-            mean_sens_min: mean_sens,
-            mean_residue: mean_res,
-            non_reciprocity: net.non_reciprocity_index(),
-        };
-
-        if it == 1 || it % 10 == 0 || it == cfg.iterations {
-            eprintln!(
-                "[train {}/{}] phi_sharp={:.4} (t0={:.4}) sens_min={:.4} res={:.4} non_recip={:.3}",
-                entry.iter,
-                cfg.iterations,
-                entry.mean_phi_sharp,
-                entry.mean_phi_t0,
-                entry.mean_sens_min,
-                entry.mean_residue,
-                entry.non_reciprocity
+        if step == 1 || step % 25 == 0 || step == cfg.steps {
+            let model = PhiGraph::from_weights(theta.clone());
+            let mut diag_rng = Rng::new(eval_seed);
+            let mut phi = 0.0;
+            let mut gen = 0.0;
+            let mut disc = 0.0;
+            let mut proj = 0.0;
+            let mut integ = 0.0;
+            let mut res = 0.0;
+            for eff in &batch {
+                let r = compute_phi_sharp(&model, eff, &mut diag_rng, false);
+                phi += r.phi_sharp;
+                gen += r.generativity;
+                disc += r.discrimination;
+                proj += r.projection;
+                integ += r.integration;
+                res += r.residual;
+            }
+            let n = batch.len() as f32;
+            println!(
+                "step {:>4}/{:<4} | phi_sharp={:+.4} | Gen={:.3} Disc={:.3} Proj={:.3} IIT={:.3} | res={:.4} ({:.1}s)",
+                step,
+                cfg.steps,
+                phi / n,
+                gen / n,
+                disc / n,
+                proj / n,
+                integ / n,
+                res / n,
+                start.elapsed().as_secs_f32()
             );
         }
-        logs.push(entry);
     }
 
-    net.from_flat_vec(&best_theta);
-    if let Some(p) = save_path {
-        if let Err(e) = net.save_to_file(p) {
-            eprintln!("Erreur sauvegarde modèle {:?}: {}", p, e);
+    let final_model = PhiGraph::from_weights(theta);
+    evaluate_meta_relational_abstraction(&final_model, cfg.seed ^ 0xDEAD_BEEF);
+    final_model
+}
+
+/// Évaluation post-hoc avec la cause cachée du PTGRS (jamais vue durant l'entraînement) :
+/// teste si deux effets aux alphabets d'octets DISJOINTS mais de même cause cachée
+/// convergent vers des trajectoires plus proches que deux causes différentes.
+fn evaluate_meta_relational_abstraction(model: &PhiGraph, seed: u64) {
+    let mut rng = Rng::new(seed);
+    let mut same_sum = 0.0f32;
+    let mut diff_sum = 0.0f32;
+    let trials = 40;
+
+    for _ in 0..trials {
+        let f1 = CauseFamily::ALL[rng.next_usize(CauseFamily::ALL.len())];
+        let mut f2 = CauseFamily::ALL[rng.next_usize(CauseFamily::ALL.len())];
+        while f2 == f1 {
+            f2 = CauseFamily::ALL[rng.next_usize(CauseFamily::ALL.len())];
         }
+
+        // Alphabets strictement disjoints : [32..75] vs [140..220]
+        let e_a = sample_episode_in_range(&mut rng, f1, 32, 75);
+        let e_b = sample_episode_in_range(&mut rng, f1, 140, 220);
+        let e_c = sample_episode_in_range(&mut rng, f2, 140, 220);
+
+        let h_a = model.abduce(&extract_relations(&e_a.effect), None).final_state;
+        let h_b = model.abduce(&extract_relations(&e_b.effect), None).final_state;
+        let h_c = model.abduce(&extract_relations(&e_c.effect), None).final_state;
+
+        same_sum += cosine_sim(&h_a, &h_b);
+        diff_sum += cosine_sim(&h_a, &h_c);
     }
-    (net, logs)
+
+    let same_avg = same_sum / (trials as f32);
+    let diff_avg = diff_sum / (trials as f32);
+    println!("\n--- Évaluation post-hoc (Abstraction Méta-relationnelle, alphabets disjoints) ---");
+    println!("  Même cause cachée (0 octet commun) : cos = {:+.4}", same_avg);
+    println!("  Causes cachées différentes         : cos = {:+.4}", diff_avg);
+    println!("  Marge d'abstraction                : {:+.4}", same_avg - diff_avg);
 }
