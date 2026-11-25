@@ -1,6 +1,7 @@
-use crate::graph::{NUM_PARAMS, PhiGraph, STATE_DIM, extract_relations};
+use crate::graph::{NUM_PARAMS, PhiGraph, STATE_DIM};
 use crate::phi::{
-    compute_composite_phi, compute_phi_sharp, cosine_sim, project_query_to_molds, segment_effect,
+    PreparedComposite, PreparedEpisode, compute_composite_phi_prepared,
+    compute_phi_sharp_prepared, cosine_sim, project_query_to_molds, segment_effect,
 };
 use crate::ptgrs::{
     CauseFamily, sample_composite_episode, sample_episode, sample_episode_in_range,
@@ -36,15 +37,13 @@ fn batch_collapse_penalty(states: &[[f32; STATE_DIM]]) -> f32 {
 
 fn eval_batch(
     graph: &PhiGraph,
-    singles: &[Vec<u8>],
-    composites: &[Vec<u8>],
-    eval_seed: u64,
+    singles: &[PreparedEpisode],
+    composites: &[PreparedComposite],
 ) -> f32 {
-    let mut rng = Rng::new(eval_seed);
     let mut sum_phi = 0.0f32;
     let mut states = Vec::with_capacity(singles.len());
-    for effect in singles {
-        let rep = compute_phi_sharp(graph, effect, &mut rng, false);
+    for ep in singles {
+        let rep = compute_phi_sharp_prepared(graph, ep, false);
         sum_phi += rep.phi_sharp;
         states.push(rep.trace.final_state);
     }
@@ -53,7 +52,7 @@ fn eval_batch(
 
     let mut comp_sum = 0.0f32;
     for comp in composites {
-        comp_sum += compute_composite_phi(graph, comp).score;
+        comp_sum += compute_composite_phi_prepared(graph, comp).score;
     }
     let mean_comp = if composites.is_empty() {
         0.0
@@ -81,22 +80,29 @@ pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
         .min(cfg.pop_pairs.max(1));
 
     println!(
-        "Entraînement Phisharp v0.3 ({} paramètres, {} étapes, {} paires ES, {} threads)...",
+        "Entraînement Phisharp v0.4 ({} paramètres dont 140 capteur relationnel, {} étapes, {} paires ES, {} threads)...",
         NUM_PARAMS, cfg.steps, cfg.pop_pairs, n_threads
     );
 
     for step in 1..=cfg.steps {
-        let singles: Vec<Vec<u8>> = CauseFamily::ALL
+        let mut prep_rng = Rng::new(rng.next_u64());
+        let singles: Vec<PreparedEpisode> = CauseFamily::ALL
             .iter()
-            .map(|&fam| sample_episode(&mut rng, fam).effect)
+            .map(|&fam| {
+                let eff = sample_episode(&mut rng, fam).effect;
+                PreparedEpisode::from_bytes(&eff, &mut prep_rng)
+            })
             .collect();
-        // 2 scènes composites PTGRS (1 brute, 1 avec préfixes/étiquettes) — E seul est vu !
+
         let composites = vec![
-            sample_composite_episode(&mut rng, 3, false, false, false).effect,
-            sample_composite_episode(&mut rng, 3, true, false, false).effect,
+            PreparedComposite::from_bytes(
+                &sample_composite_episode(&mut rng, 3, false, false, false).effect,
+            ),
+            PreparedComposite::from_bytes(
+                &sample_composite_episode(&mut rng, 3, true, false, false).effect,
+            ),
         ];
 
-        let eval_seed = rng.next_u64();
         let pair_seeds: Vec<u64> = (0..cfg.pop_pairs).map(|_| rng.next_u64()).collect();
 
         let results: Vec<(u64, f32, f32)> = thread::scope(|s| {
@@ -122,13 +128,11 @@ pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
                             &PhiGraph::from_weights(w_pos),
                             singles_ref,
                             comp_ref,
-                            eval_seed,
                         );
                         let f_neg = eval_batch(
                             &PhiGraph::from_weights(w_neg),
                             singles_ref,
                             comp_ref,
-                            eval_seed,
                         );
                         local.push((pseed, f_pos, f_neg));
                     }
@@ -170,18 +174,17 @@ pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
 
         if step == 1 || step % 25 == 0 || step == cfg.steps {
             let model = PhiGraph::from_weights(theta.clone());
-            let mut diag_rng = Rng::new(eval_seed);
             let mut phi = 0.0;
-            let mut gen_sum = 0.0;
+            let mut gen = 0.0;
             let mut disc = 0.0;
             let mut proj = 0.0;
             let mut integ = 0.0;
             let mut res = 0.0;
             let mut states = Vec::with_capacity(singles.len());
-            for eff in &singles {
-                let r = compute_phi_sharp(&model, eff, &mut diag_rng, false);
+            for ep in &singles {
+                let r = compute_phi_sharp_prepared(&model, ep, false);
                 phi += r.phi_sharp;
-                gen_sum += r.generativity;
+                gen += r.generativity;
                 disc += r.discrimination;
                 proj += r.projection;
                 integ += r.integration;
@@ -192,7 +195,7 @@ pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
             let coll = batch_collapse_penalty(&states);
             let sel: f32 = composites
                 .iter()
-                .map(|c| compute_composite_phi(&model, c).selectivity)
+                .map(|c| compute_composite_phi_prepared(&model, c).selectivity)
                 .sum::<f32>()
                 / (composites.len() as f32);
             println!(
@@ -200,7 +203,7 @@ pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
                 step,
                 cfg.steps,
                 phi / n,
-                gen_sum / n,
+                gen / n,
                 disc / n,
                 proj / n,
                 integ / n,
@@ -220,7 +223,6 @@ pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
 fn evaluate_post_hoc(model: &PhiGraph, seed: u64) {
     let mut rng = Rng::new(seed);
 
-    // 1. Abstraction Méta-relationnelle (alphabets disjoints)
     let mut same_sum = 0.0f32;
     let mut diff_sum = 0.0f32;
     let trials = 48;
@@ -234,9 +236,9 @@ fn evaluate_post_hoc(model: &PhiGraph, seed: u64) {
         let e_b = sample_episode_in_range(&mut rng, f1, 140, 220);
         let e_c = sample_episode_in_range(&mut rng, f2, 140, 220);
 
-        let h_a = model.abduce(&extract_relations(&e_a.effect), None).final_state;
-        let h_b = model.abduce(&extract_relations(&e_b.effect), None).final_state;
-        let h_c = model.abduce(&extract_relations(&e_c.effect), None).final_state;
+        let h_a = model.abduce(&model.encode_bytes(&e_a.effect), None).final_state;
+        let h_b = model.abduce(&model.encode_bytes(&e_b.effect), None).final_state;
+        let h_c = model.abduce(&model.encode_bytes(&e_c.effect), None).final_state;
 
         same_sum += cosine_sim(&h_a, &h_b);
         diff_sum += cosine_sim(&h_a, &h_c);
@@ -244,7 +246,6 @@ fn evaluate_post_hoc(model: &PhiGraph, seed: u64) {
     let same_avg = same_sum / (trials as f32);
     let diff_avg = diff_sum / (trials as f32);
 
-    // 2. Projection Référentielle Top-1 sur 4 moules (0 octet commun, hasard = 25%)
     let proj_trials = 50;
     let mut hits_raw = 0usize;
     let mut hits_tagged = 0usize;
@@ -253,14 +254,16 @@ fn evaluate_post_hoc(model: &PhiGraph, seed: u64) {
     for _ in 0..proj_trials {
         let ep_raw = sample_composite_episode(&mut rng, 4, false, false, true);
         let spans_raw = segment_effect(&ep_raw.effect);
-        let m_raw = project_query_to_molds(model, &ep_raw.effect, &spans_raw, ep_raw.hidden_query_idx);
+        let m_raw =
+            project_query_to_molds(model, &ep_raw.effect, &spans_raw, ep_raw.hidden_query_idx);
         if m_raw.first().map(|m| m.dst_idx) == Some(ep_raw.hidden_match_idx) {
             hits_raw += 1;
         }
 
         let ep_tag = sample_composite_episode(&mut rng, 4, true, true, true);
         let spans_tag = segment_effect(&ep_tag.effect);
-        let m_tag = project_query_to_molds(model, &ep_tag.effect, &spans_tag, ep_tag.hidden_query_idx);
+        let m_tag =
+            project_query_to_molds(model, &ep_tag.effect, &spans_tag, ep_tag.hidden_query_idx);
         if m_tag.first().map(|m| m.dst_idx) == Some(ep_tag.hidden_match_idx) {
             hits_tagged += 1;
         }
