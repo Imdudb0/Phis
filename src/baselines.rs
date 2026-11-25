@@ -215,7 +215,7 @@ impl LikelihoodSearchBaseline {
         let pg = PerceivedGraph::from_bytes(observed_e);
         let (h, ll) = search_by_likelihood(&self.net, observed_e, budget);
         let proj = score_projection(&h, &pg);
-        let out = crate::abduction::emit_explanation(&h, &pg, 128);
+        let (out, _) = crate::abduction::emit_explanation(&h, &pg, 128);
         (h, ll, proj, out)
     }
 }
