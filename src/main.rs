@@ -6,10 +6,10 @@ mod train;
 
 use crate::graph::PhiGraph;
 use crate::phi::{
-    compute_composite_phi, compute_phi_sharp, extract_abductive_core, fnv_hash, format_partition,
-    project_query_to_molds, segment_effect,
+    DiscoveredRegime, compute_composite_phi, compute_phi_sharp, discover_causal_regimes,
+    extract_abductive_core, fnv_hash, format_partition, project_query_to_regimes,
 };
-use crate::ptgrs::{CauseFamily, sample_composite_episode, sample_episode};
+use crate::ptgrs::{CauseFamily, SepMode, sample_composite_episode, sample_episode};
 use crate::rng::Rng;
 use crate::train::{TrainConfig, train_phisharp};
 use std::env;
@@ -20,7 +20,7 @@ fn usage() -> ! {
     eprintln!("Usage:");
     eprintln!("  phisharp train --out out/sharp.phis [--steps 300] [--seed 42]");
     eprintln!(
-        "  phisharp sample --out perceived.eff [--family periodic|symmetric|nested|shared|substitution|grammar|composite] [--seed 7]"
+        "  phisharp sample --out perceived.eff [--family periodic|symmetric|nested|shared|substitution|grammar|composite|stream] [--seed 7]"
     );
     eprintln!("  phisharp ask --model out/sharp.phis --file perceived.eff");
     process::exit(1);
@@ -43,6 +43,18 @@ fn printable_preview(bytes: &[u8]) -> String {
             }
         })
         .collect()
+}
+
+fn trim_ctrl(bytes: &[u8]) -> &[u8] {
+    let mut s = 0usize;
+    let mut e = bytes.len();
+    while s < e && bytes[s] < 32 {
+        s += 1;
+    }
+    while e > s && bytes[e - 1] < 32 {
+        e -= 1;
+    }
+    &bytes[s..e]
 }
 
 fn hex_preview(bytes: &[u8]) -> String {
@@ -91,30 +103,48 @@ fn main() {
                 .unwrap_or(7);
             let mut rng = Rng::new(seed);
 
-            if arg_val(&args, "--family").as_deref() == Some("composite") {
-                let ep = sample_composite_episode(&mut rng, 4, true, true, true);
-                if let Err(e) = fs::write(&out_path, &ep.effect) {
-                    eprintln!("Erreur écriture '{}': {}", out_path, e);
-                    process::exit(1);
+            match arg_val(&args, "--family").as_deref() {
+                Some("composite") => {
+                    let ep =
+                        sample_composite_episode(&mut rng, 4, true, true, true, SepMode::Newline);
+                    if let Err(e) = fs::write(&out_path, &ep.effect) {
+                        eprintln!("Erreur écriture '{}': {}", out_path, e);
+                        process::exit(1);
+                    }
+                    println!(
+                        "Scène composite générée dans '{}' ({} octets, moule caché = bloc {} [{}])",
+                        out_path,
+                        ep.effect.len(),
+                        ep.hidden_match_idx,
+                        ep.hidden_families[ep.hidden_match_idx].name()
+                    );
+                    println!("  FLUX : {}", printable_preview(&ep.effect));
+                    return;
                 }
-                println!(
-                    "Scène composite générée dans '{}' ({} octets, requête = bloc {}, moule caché = bloc {} [{}])",
-                    out_path,
-                    ep.effect.len(),
-                    ep.hidden_query_idx,
-                    ep.hidden_match_idx,
-                    ep.hidden_families[ep.hidden_match_idx].name()
-                );
-                for (i, line) in ep.effect.split(|&b| b == b'\n').enumerate() {
-                    println!("  [{}] {}", i, printable_preview(line));
+                Some("stream") => {
+                    // Flux continu sans aucun retour à la ligne (étiquettes + moules + requête collés)
+                    let ep = sample_composite_episode(&mut rng, 4, true, true, true, SepMode::None);
+                    if let Err(e) = fs::write(&out_path, &ep.effect) {
+                        eprintln!("Erreur écriture '{}': {}", out_path, e);
+                        process::exit(1);
+                    }
+                    println!(
+                        "Flux continu SANS séparateur généré dans '{}' ({} octets, moule caché = {} [{}])",
+                        out_path,
+                        ep.effect.len(),
+                        ep.hidden_match_idx,
+                        ep.hidden_families[ep.hidden_match_idx].name()
+                    );
+                    println!("  FLUX : {}", printable_preview(&ep.effect));
+                    return;
                 }
-                return;
+                _ => {}
             }
 
             let family = match arg_val(&args, "--family") {
                 Some(name) => CauseFamily::from_name(&name).unwrap_or_else(|| {
                     eprintln!(
-                        "Famille inconnue '{}'. Choix: periodic, symmetric, nested, shared, substitution, grammar, composite.",
+                        "Famille inconnue '{}'. Choix: periodic, symmetric, nested, shared, substitution, grammar, composite, stream.",
                         name
                     );
                     process::exit(1);
@@ -152,9 +182,10 @@ fn main() {
                 process::exit(1);
             }
 
-            let spans = segment_effect(&bytes);
-            if spans.len() >= 2 {
-                run_ask_composite(&model, &file_path, &bytes, &spans);
+            // Découverte 100% connexionniste des régimes causaux sur le flux brut
+            let regimes = discover_causal_regimes(&model, &bytes, true);
+            if regimes.len() >= 2 {
+                run_ask_continuous(&model, &file_path, &bytes, &regimes);
             } else {
                 run_ask_monolithic(&model, &file_path, &bytes);
             }
@@ -169,7 +200,7 @@ fn run_ask_monolithic(model: &PhiGraph, file_path: &str, bytes: &[u8]) {
     let rep = compute_phi_sharp(model, bytes, &mut rng, true);
     let rels = model.encode_bytes(bytes);
 
-    println!("=== PHISHARP ABDUCTION REPORT (v0.4 — Monolithique) ===");
+    println!("=== PHISHARP ABDUCTION REPORT (v0.5 — Monolithique) ===");
     println!("Effet (E)       : '{}' ({} octets)", file_path, bytes.len());
     println!("φ_sharp         : {:+.4}", rep.phi_sharp);
     println!(
@@ -180,6 +211,10 @@ fn run_ask_monolithic(model: &PhiGraph, file_path: &str, bytes: &[u8]) {
     println!(
         "  Projection    : {:.4}  [réfut={:.3} | dépl={:.3} | abst={:.3}]",
         rep.projection, rep.refutation_stab, rep.displacement_stab, rep.abstraction_stab
+    );
+    println!(
+        "  Porte causale : {:.4}  (contraste={:.3})",
+        rep.mean_gate, rep.gate_contrast
     );
     println!(
         "  Intégration   : {:.4}  (MIP exacte sur 31 coupes : perte={:.4}, coupe {})",
@@ -235,74 +270,84 @@ fn run_ask_monolithic(model: &PhiGraph, file_path: &str, bytes: &[u8]) {
     }
 }
 
-fn run_ask_composite(model: &PhiGraph, file_path: &str, bytes: &[u8], spans: &[crate::phi::Span]) {
+fn run_ask_continuous(
+    model: &PhiGraph,
+    file_path: &str,
+    bytes: &[u8],
+    regimes: &[DiscoveredRegime],
+) {
     let comp = compute_composite_phi(model, bytes);
-    let q_idx = spans.len() - 1;
-    let q_sp = spans[q_idx];
-    let q_bytes = &bytes[q_sp.start..q_sp.end];
+    let q_idx = regimes.len() - 1;
+    let q_reg = regimes[q_idx];
+    let q_bytes = &bytes[q_reg.core_start..q_reg.core_end];
 
     let mut rng = Rng::new(fnv_hash(q_bytes));
     let q_rep = compute_phi_sharp(model, q_bytes, &mut rng, true);
-    let matches = project_query_to_molds(model, bytes, spans, q_idx);
+    let matches = project_query_to_regimes(model, bytes, regimes, q_idx);
 
-    println!("=== PHISHARP ABDUCTION REPORT (v0.4 — Projection Référentielle) ===");
+    println!("=== PHISHARP ABDUCTION REPORT (v0.5 — Flux Continu Auto-Segmenté) ===");
     println!(
-        "Effet (E)       : '{}' ({} octets, {} blocs détectés)",
+        "Effet (E)       : '{}' ({} octets, {} régimes causaux découverts sans séparateur)",
         file_path,
         bytes.len(),
-        spans.len()
+        regimes.len()
     );
     println!(
         "Cohérence scène : sélectivité={:.4} (R_top={:.3} vs R_rest={:.3}, paire [{}]<->[{}])",
         comp.selectivity, comp.r_top, comp.r_rest, comp.top_pair.0, comp.top_pair.1
     );
     println!(
-        "φ_sharp(cible)  : {:+.4}  [Gen={:.3} Disc={:.3} Proj={:.3} IIT={:.3}, res={:.4}]",
+        "φ_sharp(cible)  : {:+.4}  [Gen={:.3} Disc={:.3} Proj={:.3} Gate={:.3} IIT={:.3}, res={:.4}]",
         q_rep.phi_sharp,
         q_rep.generativity,
         q_rep.discrimination,
         q_rep.projection,
+        q_rep.mean_gate,
         q_rep.integration,
         q_rep.residual
     );
 
-    println!("\nBloc cible [{}] :", q_idx);
+    println!(
+        "\nRégime cible [{}] (octets {}..{}, gate={:.3}) :",
+        q_idx, q_reg.core_start, q_reg.core_end, q_reg.mean_gate
+    );
     println!("  \"{}\"", printable_preview(q_bytes));
 
-    println!("\nProjection référentielle vers les moules de perceived.eff :");
+    println!("\nProjection référentielle vers les régimes découverts dans perceived.eff :");
     for (rank, m) in matches.iter().enumerate() {
-        let sp = spans[m.dst_idx];
-        let d_bytes = &bytes[sp.start..sp.end];
-        let core = &d_bytes[m.core_start..m.core_end];
+        let reg = regimes[m.dst_idx];
+        let core = &bytes[m.core_start..m.core_end];
         println!(
-            "  #{} bloc [{}] | résonance={:.4} | err_croisée={:.4} | cos={:+.3} | octets_communs={:.0}%",
+            "  #{} régime [{}] ({}..{}, gate={:.3}) | résonance={:.4} | err_croisée={:.4} | cos={:+.3} | octets_communs={:.0}%",
             rank + 1,
             m.dst_idx,
+            m.core_start,
+            m.core_end,
+            reg.mean_gate,
             m.score,
             m.cross_err,
             m.cos_sim,
             m.byte_overlap * 100.0
         );
-        println!("     moule : \"{}\"", printable_preview(d_bytes));
-        println!("     noyau : \"{}\"", printable_preview(core));
+        println!("     noyau   : \"{}\"", printable_preview(core));
         if let Some((rs, re)) = m.referent {
             println!(
-                "     référent induit (auto-spécifié) : \"{}\"",
-                printable_preview(&d_bytes[rs..re])
+                "     référent ({}..{}) : \"{}\"",
+                rs,
+                re,
+                printable_preview(trim_ctrl(&bytes[rs..re]))
             );
         }
     }
 
     if let Some(best) = matches.first() {
-        let sp = spans[best.dst_idx];
-        let d_bytes = &bytes[sp.start..sp.end];
         let margin = matches
             .get(1)
             .map(|second| best.score - second.score)
             .unwrap_or(best.score);
         let out_slice = match best.referent {
-            Some((rs, re)) => &d_bytes[rs..re],
-            None => d_bytes,
+            Some((rs, re)) => trim_ctrl(&bytes[rs..re]),
+            None => &bytes[best.core_start..best.core_end],
         };
         println!(
             "\nExplication projetée (alphabet de E, marge={:+.4}) :",
