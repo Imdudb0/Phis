@@ -1,23 +1,3 @@
-[1m[92m    Finished[0m `release` profile [optimized] target(s) in 0.00s
-[1m[92m     Running[0m `target/release/phisharp ask --model out/sharp.phis --file perceived.eff`
-=== PHISHARP ABDUCTION REPORT (v0.2) ===
-Effet (E)       : 'perceived.eff' (123 octets)
-φ_sharp         : +0.2397
-  Générativité  : 0.3548  (résidu moyen = 0.4710)
-  Discrimination: 0.3374
-  Projection    : 0.6807  [réfut=0.216 | dépl=0.885 | abst=0.941]
-  Intégration   : 0.2824  (MIP exacte sur 31 coupes : perte=0.0948, coupe {0,1,3,4,5} | {2})
-
-Trajectoire abductive (résidu) :
-  t0=0.709 -> t1=0.822 -> t2=0.541 -> t3=0.511 -> t4=0.475 -> t5=0.499 -> t6=0.471  (gain/t0=+0.336, rebond=0.1369)
-
-Noyau causal auto-spécifié (offset 63, densité explicative max) :
-  ASCII : " the ident"
-  HEX   : 20 74 68 65 20 69 64 65 6e 74
-
-Zones de tension (résidu maximal dans perceived.eff) :
-  offset 122 | 0x2e '.' | résidu = 1.9195
-  offset 103 | 0x73 's' | résidu = 1.5765
-  offset 107 | 0x63 'c' | résidu = 1.4676
-  offset 114 | 0x75 'u' | résidu = 1.4459
-  offset 120 | 0x6d 'm' | résidu = 1.3989
+[1m[92m    Finished[0m `release` profile [optimized] target(s) in 0.02s
+[1m[92m     Running[0m `target/release/phisharp ask --model out/sharp.phis --file gram.eff`
+Erreur lecture effet 'gram.eff': No such file or directory (os error 2)
