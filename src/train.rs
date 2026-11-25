@@ -1,6 +1,10 @@
 use crate::graph::{NUM_PARAMS, PhiGraph, STATE_DIM, extract_relations};
-use crate::phi::{compute_phi_sharp, cosine_sim};
-use crate::ptgrs::{CauseFamily, sample_episode, sample_episode_in_range};
+use crate::phi::{
+    compute_composite_phi, compute_phi_sharp, cosine_sim, project_query_to_molds, segment_effect,
+};
+use crate::ptgrs::{
+    CauseFamily, sample_composite_episode, sample_episode, sample_episode_in_range,
+};
 use crate::rng::Rng;
 use std::thread;
 use std::time::Instant;
@@ -13,7 +17,6 @@ pub struct TrainConfig {
     pub seed: u64,
 }
 
-/// Pénalité anti-effondrement en cône (sans jamais utiliser les étiquettes cachées).
 fn batch_collapse_penalty(states: &[[f32; STATE_DIM]]) -> f32 {
     let mut sum = 0.0f32;
     let mut pairs = 0usize;
@@ -31,18 +34,34 @@ fn batch_collapse_penalty(states: &[[f32; STATE_DIM]]) -> f32 {
     }
 }
 
-fn eval_batch(graph: &PhiGraph, batch: &[Vec<u8>], eval_seed: u64) -> f32 {
+fn eval_batch(
+    graph: &PhiGraph,
+    singles: &[Vec<u8>],
+    composites: &[Vec<u8>],
+    eval_seed: u64,
+) -> f32 {
     let mut rng = Rng::new(eval_seed);
-    let mut sum = 0.0f32;
-    let mut states = Vec::with_capacity(batch.len());
-    for effect in batch {
+    let mut sum_phi = 0.0f32;
+    let mut states = Vec::with_capacity(singles.len());
+    for effect in singles {
         let rep = compute_phi_sharp(graph, effect, &mut rng, false);
-        sum += rep.phi_sharp;
+        sum_phi += rep.phi_sharp;
         states.push(rep.trace.final_state);
     }
-    let mean_phi = sum / (batch.len() as f32);
+    let mean_phi = sum_phi / (singles.len() as f32);
     let collapse = batch_collapse_penalty(&states);
-    mean_phi - 0.22 * collapse
+
+    let mut comp_sum = 0.0f32;
+    for comp in composites {
+        comp_sum += compute_composite_phi(graph, comp).score;
+    }
+    let mean_comp = if composites.is_empty() {
+        0.0
+    } else {
+        comp_sum / (composites.len() as f32)
+    };
+
+    mean_phi - 0.22 * collapse + 0.50 * mean_comp
 }
 
 pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
@@ -62,15 +81,21 @@ pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
         .min(cfg.pop_pairs.max(1));
 
     println!(
-        "Entraînement Phisharp v0.2 ({} paramètres, {} étapes, {} paires ES, {} threads)...",
+        "Entraînement Phisharp v0.3 ({} paramètres, {} étapes, {} paires ES, {} threads)...",
         NUM_PARAMS, cfg.steps, cfg.pop_pairs, n_threads
     );
 
     for step in 1..=cfg.steps {
-        let batch: Vec<Vec<u8>> = CauseFamily::ALL
+        let singles: Vec<Vec<u8>> = CauseFamily::ALL
             .iter()
             .map(|&fam| sample_episode(&mut rng, fam).effect)
             .collect();
+        // 2 scènes composites PTGRS (1 brute, 1 avec préfixes/étiquettes) — E seul est vu !
+        let composites = vec![
+            sample_composite_episode(&mut rng, 3, false, false, false).effect,
+            sample_composite_episode(&mut rng, 3, true, false, false).effect,
+        ];
+
         let eval_seed = rng.next_u64();
         let pair_seeds: Vec<u64> = (0..cfg.pop_pairs).map(|_| rng.next_u64()).collect();
 
@@ -79,7 +104,8 @@ pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
             let mut handles = Vec::new();
             for chunk in pair_seeds.chunks(chunk_size) {
                 let theta_ref = &theta;
-                let batch_ref = &batch;
+                let singles_ref = &singles;
+                let comp_ref = &composites;
                 let sigma = cfg.sigma;
                 handles.push(s.spawn(move || {
                     let mut local = Vec::with_capacity(chunk.len());
@@ -92,8 +118,18 @@ pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
                             w_pos.push(w + noise);
                             w_neg.push(w - noise);
                         }
-                        let f_pos = eval_batch(&PhiGraph::from_weights(w_pos), batch_ref, eval_seed);
-                        let f_neg = eval_batch(&PhiGraph::from_weights(w_neg), batch_ref, eval_seed);
+                        let f_pos = eval_batch(
+                            &PhiGraph::from_weights(w_pos),
+                            singles_ref,
+                            comp_ref,
+                            eval_seed,
+                        );
+                        let f_neg = eval_batch(
+                            &PhiGraph::from_weights(w_neg),
+                            singles_ref,
+                            comp_ref,
+                            eval_seed,
+                        );
                         local.push((pseed, f_pos, f_neg));
                     }
                     local
@@ -141,9 +177,8 @@ pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
             let mut proj = 0.0;
             let mut integ = 0.0;
             let mut res = 0.0;
-            let mut bounce = 0.0;
-            let mut states = Vec::with_capacity(batch.len());
-            for eff in &batch {
+            let mut states = Vec::with_capacity(singles.len());
+            for eff in &singles {
                 let r = compute_phi_sharp(&model, eff, &mut diag_rng, false);
                 phi += r.phi_sharp;
                 gen_sum += r.generativity;
@@ -151,13 +186,17 @@ pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
                 proj += r.projection;
                 integ += r.integration;
                 res += r.residual;
-                bounce += r.bounce_pen;
                 states.push(r.trace.final_state);
             }
-            let n = batch.len() as f32;
+            let n = singles.len() as f32;
             let coll = batch_collapse_penalty(&states);
+            let sel: f32 = composites
+                .iter()
+                .map(|c| compute_composite_phi(&model, c).selectivity)
+                .sum::<f32>()
+                / (composites.len() as f32);
             println!(
-                "step {:>4}/{:<4} | φ={:+.4} | Gen={:.3} Disc={:.3} Proj={:.3} IIT={:.3} | res={:.3} bnc={:.3} coll={:.3} ({:.1}s)",
+                "step {:>4}/{:<4} | φ={:+.4} | Gen={:.3} Disc={:.3} Proj={:.3} IIT={:.3} RefSel={:.3} | res={:.3} coll={:.3} ({:.1}s)",
                 step,
                 cfg.steps,
                 phi / n,
@@ -165,8 +204,8 @@ pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
                 disc / n,
                 proj / n,
                 integ / n,
+                sel,
                 res / n,
-                bounce / n,
                 coll,
                 start.elapsed().as_secs_f32()
             );
@@ -174,24 +213,24 @@ pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
     }
 
     let final_model = PhiGraph::from_weights(theta);
-    evaluate_meta_relational_abstraction(&final_model, cfg.seed ^ 0xDEAD_BEEF);
+    evaluate_post_hoc(&final_model, cfg.seed ^ 0xDEAD_BEEF);
     final_model
 }
 
-fn evaluate_meta_relational_abstraction(model: &PhiGraph, seed: u64) {
+fn evaluate_post_hoc(model: &PhiGraph, seed: u64) {
     let mut rng = Rng::new(seed);
+
+    // 1. Abstraction Méta-relationnelle (alphabets disjoints)
     let mut same_sum = 0.0f32;
     let mut diff_sum = 0.0f32;
     let trials = 48;
-
     for _ in 0..trials {
         let f1 = CauseFamily::ALL[rng.next_usize(CauseFamily::ALL.len())];
         let mut f2 = CauseFamily::ALL[rng.next_usize(CauseFamily::ALL.len())];
         while f2 == f1 {
             f2 = CauseFamily::ALL[rng.next_usize(CauseFamily::ALL.len())];
         }
-
-        let e_a = sample_episode_in_range(&mut rng, f1, 32, 75);
+        let e_a = sample_episode_in_range(&mut rng, f1, 33, 90);
         let e_b = sample_episode_in_range(&mut rng, f1, 140, 220);
         let e_c = sample_episode_in_range(&mut rng, f2, 140, 220);
 
@@ -202,11 +241,51 @@ fn evaluate_meta_relational_abstraction(model: &PhiGraph, seed: u64) {
         same_sum += cosine_sim(&h_a, &h_b);
         diff_sum += cosine_sim(&h_a, &h_c);
     }
-
     let same_avg = same_sum / (trials as f32);
     let diff_avg = diff_sum / (trials as f32);
-    println!("\n--- Évaluation post-hoc (Abstraction Méta-relationnelle, alphabets disjoints) ---");
-    println!("  Même cause cachée (0 octet commun) : cos = {:+.4}", same_avg);
-    println!("  Causes cachées différentes         : cos = {:+.4}", diff_avg);
-    println!("  Marge d'abstraction                : {:+.4}", same_avg - diff_avg);
+
+    // 2. Projection Référentielle Top-1 sur 4 moules (0 octet commun, hasard = 25%)
+    let proj_trials = 50;
+    let mut hits_raw = 0usize;
+    let mut hits_tagged = 0usize;
+    let mut avg_margin = 0.0f32;
+
+    for _ in 0..proj_trials {
+        let ep_raw = sample_composite_episode(&mut rng, 4, false, false, true);
+        let spans_raw = segment_effect(&ep_raw.effect);
+        let m_raw = project_query_to_molds(model, &ep_raw.effect, &spans_raw, ep_raw.hidden_query_idx);
+        if m_raw.first().map(|m| m.dst_idx) == Some(ep_raw.hidden_match_idx) {
+            hits_raw += 1;
+        }
+
+        let ep_tag = sample_composite_episode(&mut rng, 4, true, true, true);
+        let spans_tag = segment_effect(&ep_tag.effect);
+        let m_tag = project_query_to_molds(model, &ep_tag.effect, &spans_tag, ep_tag.hidden_query_idx);
+        if m_tag.first().map(|m| m.dst_idx) == Some(ep_tag.hidden_match_idx) {
+            hits_tagged += 1;
+        }
+        if m_tag.len() >= 2 {
+            avg_margin += m_tag[0].score - m_tag[1].score;
+        }
+    }
+
+    println!("\n--- Évaluation post-hoc 1 : Abstraction Méta-relationnelle (0 octet commun) ---");
+    println!("  Même cause cachée : cos = {:+.4}", same_avg);
+    println!("  Causes différentes: cos = {:+.4}", diff_avg);
+    println!("  Marge             : {:+.4}", same_avg - diff_avg);
+
+    println!("\n--- Évaluation post-hoc 2 : Projection Référentielle (4 moules, hasard = 25%) ---");
+    println!(
+        "  Moules bruts (0 octet commun)      : {}/{} ({:.1}%)",
+        hits_raw,
+        proj_trials,
+        100.0 * (hits_raw as f32) / (proj_trials as f32)
+    );
+    println!(
+        "  Moules étiquetés (0 octet commun)  : {}/{} ({:.1}%)  [marge Top1-Top2 = {:+.4}]",
+        hits_tagged,
+        proj_trials,
+        100.0 * (hits_tagged as f32) / (proj_trials as f32),
+        avg_margin / (proj_trials as f32)
+    );
 }
