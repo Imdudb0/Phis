@@ -119,7 +119,7 @@ pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
             let model = PhiGraph::from_weights(theta.clone());
             let mut diag_rng = Rng::new(eval_seed);
             let mut phi = 0.0;
-            let mut gen = 0.0;
+            let mut r#gen = 0.0;
             let mut disc = 0.0;
             let mut proj = 0.0;
             let mut integ = 0.0;
