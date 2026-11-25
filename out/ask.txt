@@ -1,23 +1,23 @@
-[1m[92m    Finished[0m `release` profile [optimized] target(s) in 0.02s
+[1m[92m    Finished[0m `release` profile [optimized] target(s) in 0.00s
 [1m[92m     Running[0m `target/release/phisharp ask --model out/sharp.phis --file perceived.eff`
-=== PHISHARP ABDUCTION REPORT ===
-Effet (E)       : 'perceived.eff' (16 octets)
-φ_sharp         : +0.5421
-  Générativité  : 0.4024  (résidu moyen = 0.3641)
-  Discrimination: 0.1283
-  Projection    : 0.8174  [réfut=0.567 | dépl=0.937 | abst=0.948]
-  Intégration   : 0.1814  (MIP exacte sur 31 coupes : perte=0.0667, coupe {5} | {0,1,2,3,4})
+=== PHISHARP ABDUCTION REPORT (v0.2) ===
+Effet (E)       : 'perceived.eff' (123 octets)
+φ_sharp         : +0.2397
+  Générativité  : 0.3548  (résidu moyen = 0.4710)
+  Discrimination: 0.3374
+  Projection    : 0.6807  [réfut=0.216 | dépl=0.885 | abst=0.941]
+  Intégration   : 0.2824  (MIP exacte sur 31 coupes : perte=0.0948, coupe {0,1,3,4,5} | {2})
 
 Trajectoire abductive (résidu) :
-  t0=0.809 -> t1=2.512 -> t2=2.339 -> t3=0.997 -> t4=0.364 -> t5=0.365 -> t6=0.364  (gain=+2.1477)
+  t0=0.709 -> t1=0.822 -> t2=0.541 -> t3=0.511 -> t4=0.475 -> t5=0.499 -> t6=0.471  (gain/t0=+0.336, rebond=0.1369)
 
-Noyau causal auto-spécifié (offset 0, alphabet de E) :
-  ASCII : "N:z\"
-  HEX   : 4e 3a 7a 5c
+Noyau causal auto-spécifié (offset 63, densité explicative max) :
+  ASCII : " the ident"
+  HEX   : 20 74 68 65 20 69 64 65 6e 74
 
 Zones de tension (résidu maximal dans perceived.eff) :
-  offset   5 | 0x7a 'z' | résidu = 0.8083
-  offset  13 | 0x7a 'z' | résidu = 0.6101
-  offset  12 | 0x5c '\' | résidu = 0.5783
-  offset   6 | 0x3a ':' | résidu = 0.5640
-  offset   4 | 0x5c '\' | résidu = 0.5599
+  offset 122 | 0x2e '.' | résidu = 1.9195
+  offset 103 | 0x73 's' | résidu = 1.5765
+  offset 107 | 0x63 'c' | résidu = 1.4676
+  offset 114 | 0x75 'u' | résidu = 1.4459
+  offset 120 | 0x6d 'm' | résidu = 1.3989
