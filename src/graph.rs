@@ -10,19 +10,144 @@ pub const SEARCH_STEPS: usize = 6;
 pub const STATE_DIM: usize = NODES * DIM;
 pub const INPUT_DIM: usize = REL_DIM * 3;
 
-const OFF_EDGE: usize = 0; // 576
-const OFF_BIAS: usize = OFF_EDGE + NODES * NODES * DIM * DIM; // 576, len 24
-const OFF_IN: usize = OFF_BIAS + NODES * DIM; // 600, len 576
-const OFF_G1: usize = OFF_IN + NODES * DIM * INPUT_DIM; // 1176, len 32
-const OFF_G2: usize = OFF_G1 + DIM * (2 * DIM); // 1208, len 32
-const OFF_BH: usize = OFF_G2 + DIM * (2 * DIM); // 1240, len 32
-const OFF_CTX: usize = OFF_BH + DIM * (2 * DIM); // 1272, len 32
-const OFF_U: usize = OFF_CTX + DIM * REL_DIM; // 1304, len 16
-const OFF_OUT: usize = OFF_U + DIM * DIM; // 1320, len 32
-pub const NUM_PARAMS: usize = OFF_OUT + REL_DIM * DIM; // 1352
+pub const EDGE_IN: usize = 12;
+pub const EDGE_HID: usize = 4;
+pub const NODE_IN: usize = EDGE_HID * 2 + 2;
+
+const OFF_REL_EDGE_W: usize = 0; // 48
+const OFF_REL_EDGE_B: usize = OFF_REL_EDGE_W + EDGE_HID * EDGE_IN; // 48, len 4
+const OFF_REL_NODE_W: usize = OFF_REL_EDGE_B + EDGE_HID; // 52, len 80
+const OFF_REL_NODE_B: usize = OFF_REL_NODE_W + REL_DIM * NODE_IN; // 132, len 8
+
+const OFF_EDGE: usize = OFF_REL_NODE_B + REL_DIM; // 140, len 576
+const OFF_BIAS: usize = OFF_EDGE + NODES * NODES * DIM * DIM; // 716, len 24
+const OFF_IN: usize = OFF_BIAS + NODES * DIM; // 740, len 576
+const OFF_G1: usize = OFF_IN + NODES * DIM * INPUT_DIM; // 1316, len 32
+const OFF_G2: usize = OFF_G1 + DIM * (2 * DIM); // 1348, len 32
+const OFF_BH: usize = OFF_G2 + DIM * (2 * DIM); // 1380, len 32
+const OFF_CTX: usize = OFF_BH + DIM * (2 * DIM); // 1412, len 32
+const OFF_U: usize = OFF_CTX + DIM * REL_DIM; // 1444, len 16
+const OFF_OUT: usize = OFF_U + DIM * DIM; // 1460, len 32
+pub const NUM_PARAMS: usize = OFF_OUT + REL_DIM * DIM; // 1492
 
 const MAGIC: &[u8; 4] = b"PHIS";
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
+
+/// Substrat relationnel brut (format CSR) extrait de la matrice d'auto-égalité M(a,b) = [a!=b & E[a]==E[b]].
+/// Aucun concept sémantique (bigramme, miroir, pas arithmétique...) n'est codé en dur :
+/// chaque lien stocke uniquement le voisinage brut autour de (t, j) dans M et l'écart relatif.
+#[derive(Clone, Debug)]
+pub struct RawSubstrate {
+    pub len: usize,
+    pub offsets: Vec<usize>,
+    pub edges: Vec<[f32; EDGE_IN]>,
+    pub deg: Vec<f32>,
+}
+
+impl RawSubstrate {
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        let n = bytes.len();
+        let win_cap = 128usize;
+        let max_edges = 12usize;
+        let log_cap = (n.min(win_cap).max(2) as f32).ln();
+
+        let m = |a: isize, b: isize| -> f32 {
+            if a >= 0 && b >= 0 && a != b {
+                let au = a as usize;
+                let bu = b as usize;
+                if au < n && bu < n && bytes[au] == bytes[bu] {
+                    return 1.0;
+                }
+            }
+            0.0
+        };
+
+        let mut offsets = Vec::with_capacity(n + 1);
+        let mut edges = Vec::with_capacity(n * 6);
+        let mut deg = Vec::with_capacity(n);
+        let mut candidates: Vec<(usize, usize, f32)> = Vec::with_capacity(32);
+
+        offsets.push(0);
+        for t in 0..n {
+            let b = bytes[t];
+            let lo = t.saturating_sub(win_cap);
+            let hi = (t + win_cap + 1).min(n);
+            let span_len = (hi - lo).saturating_sub(1).max(1);
+            let ti = t as isize;
+
+            candidates.clear();
+            for j in lo..hi {
+                if j != t && bytes[j] == b {
+                    let ji = j as isize;
+                    let neigh = m(ti - 1, ji - 1)
+                        + m(ti + 1, ji + 1)
+                        + m(ti - 2, ji - 2)
+                        + m(ti + 2, ji + 2)
+                        + m(ti - 1, ji + 1)
+                        + m(ti + 1, ji - 1)
+                        + m(ti - 2, ji + 2)
+                        + m(ti + 2, ji - 2);
+                    candidates.push((j, t.abs_diff(j), neigh));
+                }
+            }
+
+            let match_count = candidates.len();
+            deg.push(2.0 * (match_count as f32 / span_len as f32) - 1.0);
+
+            // Garde au plus 12 liens : 6 les plus proches + 6 au voisinage le plus dense
+            let mut selected: Vec<usize> = Vec::with_capacity(max_edges.min(match_count));
+            if match_count <= max_edges {
+                for &(j, _, _) in &candidates {
+                    selected.push(j);
+                }
+            } else {
+                let mut by_dist = candidates.clone();
+                by_dist.sort_unstable_by_key(|c| c.1);
+                for &(j, _, _) in by_dist.iter().take(6) {
+                    selected.push(j);
+                }
+                candidates.sort_by(|a, b| b.2.total_cmp(&a.2).then_with(|| a.1.cmp(&b.1)));
+                for &(j, _, _) in &candidates {
+                    if selected.len() >= max_edges {
+                        break;
+                    }
+                    if !selected.contains(&j) {
+                        selected.push(j);
+                    }
+                }
+            }
+
+            for j in selected {
+                let ji = j as isize;
+                let dist = t.abs_diff(j) as f32;
+                let log_dist = (dist.ln() / log_cap).clamp(0.0, 1.0);
+                let dir = if j < t { -1.0 } else { 1.0 };
+                edges.push([
+                    m(ti - 1, ji - 1),
+                    m(ti + 1, ji + 1),
+                    m(ti - 2, ji - 2),
+                    m(ti + 2, ji + 2),
+                    m(ti - 1, ji + 1),
+                    m(ti + 1, ji - 1),
+                    m(ti - 2, ji + 2),
+                    m(ti + 2, ji - 2),
+                    m(ti - 1, ji),
+                    m(ti, ji - 1),
+                    log_dist,
+                    dir,
+                ]);
+            }
+            offsets.push(edges.len());
+        }
+
+        Self {
+            len: n,
+            offsets,
+            edges,
+            deg,
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct PhiGraph {
@@ -37,106 +162,6 @@ pub struct AbductionTrace {
     pub final_mean_err: f32,
 }
 
-/// Champ purement relationnel multi-échelle (portée 256 octets, invariant par bijection affine).
-pub fn extract_relations(bytes: &[u8]) -> Vec<[f32; REL_DIM]> {
-    let n = bytes.len();
-    let mut freq = [0u32; 256];
-    let mut max_freq = 1u32;
-    for &b in bytes {
-        freq[b as usize] += 1;
-        if freq[b as usize] > max_freq {
-            max_freq = freq[b as usize];
-        }
-    }
-    let max_f = max_freq as f32;
-    let win_cap = 256usize;
-    let log_cap = (n.min(win_cap).max(2) as f32).ln();
-
-    let mut out = Vec::with_capacity(n);
-    for t in 0..n {
-        let b = bytes[t];
-        let start = t.saturating_sub(win_cap);
-
-        let const_step = if t >= 2 {
-            let d1 = b.wrapping_sub(bytes[t - 1]);
-            let d0 = bytes[t - 1].wrapping_sub(bytes[t - 2]);
-            if d1 != 0 && d1 == d0 { 1.0 } else { -1.0 }
-        } else {
-            -1.0
-        };
-
-        let mut last_uni: Option<usize> = None;
-        for j in (start..t).rev() {
-            if bytes[j] == b {
-                last_uni = Some(t - j);
-                break;
-            }
-        }
-        let uni_rec = match last_uni {
-            Some(dist) => 1.0 - ((dist as f32).ln() / log_cap).clamp(0.0, 1.0),
-            None => -1.0,
-        };
-
-        let mut bi_dist: Option<usize> = None;
-        if t >= 1 {
-            let b_prev = bytes[t - 1];
-            for j in (start + 1..t).rev() {
-                if bytes[j] == b && bytes[j - 1] == b_prev {
-                    bi_dist = Some(t - j);
-                    break;
-                }
-            }
-        }
-        let bi_rec = if bi_dist.is_some() { 1.0 } else { -1.0 };
-        let scale_rec = match bi_dist {
-            Some(dist) => 2.0 * ((dist as f32).ln() / log_cap).clamp(0.0, 1.0) - 1.0,
-            None => -1.0,
-        };
-
-        let mut tri_hit = false;
-        if t >= 2 {
-            let b1 = bytes[t - 1];
-            let b2 = bytes[t - 2];
-            for j in (start + 2..t).rev() {
-                if bytes[j] == b && bytes[j - 1] == b1 && bytes[j - 2] == b2 {
-                    tri_hit = true;
-                    break;
-                }
-            }
-        }
-        let tri_rec = if tri_hit { 1.0 } else { -1.0 };
-
-        let mut mirror_hit = false;
-        if t >= 1 {
-            let b_prev = bytes[t - 1];
-            if b == b_prev {
-                mirror_hit = true;
-            } else {
-                let m_start = t.saturating_sub(24);
-                for j in (m_start + 1..t).rev() {
-                    if bytes[j - 1] == b && bytes[j] == b_prev {
-                        mirror_hit = true;
-                        break;
-                    }
-                }
-            }
-        }
-        let mirror = if mirror_hit { 1.0 } else { -1.0 };
-
-        let hub = 2.0 * (freq[b as usize] as f32 / max_f) - 1.0;
-        let boundary = if t >= 1 {
-            (freq[b as usize] as f32 - freq[bytes[t - 1] as usize] as f32) / max_f
-        } else {
-            0.0
-        };
-
-        out.push([
-            const_step, uni_rec, bi_rec, tri_rec, mirror, hub, boundary, scale_rec,
-        ]);
-    }
-    out
-}
-
 impl PhiGraph {
     pub fn random(rng: &mut Rng) -> Self {
         let mut weights = Vec::with_capacity(NUM_PARAMS);
@@ -149,6 +174,89 @@ impl PhiGraph {
     pub fn from_weights(weights: Vec<f32>) -> Self {
         assert_eq!(weights.len(), NUM_PARAMS);
         Self { weights }
+    }
+
+    /// Capteur relationnel 100% appris : transforme le substrat d'auto-égalité brut en
+    /// champ relationnel normalisé (RMS) afin d'empêcher tout triche par réduction d'amplitude.
+    pub fn encode_relations(&self, sub: &RawSubstrate) -> Vec<[f32; REL_DIM]> {
+        let w = &self.weights;
+        let n = sub.len;
+        if n == 0 {
+            return Vec::new();
+        }
+
+        let mut pre = Vec::with_capacity(n);
+        let mut energy = 0.0f32;
+
+        for t in 0..n {
+            let slice = &sub.edges[sub.offsets[t]..sub.offsets[t + 1]];
+            let mut e_max = [-1.0f32; EDGE_HID];
+            let mut e_mean = [-1.0f32; EDGE_HID];
+            let has_edge;
+
+            if !slice.is_empty() {
+                has_edge = 1.0f32;
+                e_max = [f32::NEG_INFINITY; EDGE_HID];
+                e_mean = [0.0f32; EDGE_HID];
+                let inv_c = 1.0 / (slice.len() as f32);
+
+                for feat in slice {
+                    for h in 0..EDGE_HID {
+                        let base = OFF_REL_EDGE_W + h * EDGE_IN;
+                        let mut acc = w[OFF_REL_EDGE_B + h];
+                        for k in 0..EDGE_IN {
+                            acc += w[base + k] * feat[k];
+                        }
+                        let val = acc.tanh();
+                        if val > e_max[h] {
+                            e_max[h] = val;
+                        }
+                        e_mean[h] += val * inv_c;
+                    }
+                }
+            } else {
+                has_edge = -1.0f32;
+            }
+
+            let node_in = [
+                e_max[0],
+                e_max[1],
+                e_max[2],
+                e_max[3],
+                e_mean[0],
+                e_mean[1],
+                e_mean[2],
+                e_mean[3],
+                sub.deg[t],
+                has_edge,
+            ];
+
+            let mut row = [0.0f32; REL_DIM];
+            for r in 0..REL_DIM {
+                let base = OFF_REL_NODE_W + r * NODE_IN;
+                let mut acc = w[OFF_REL_NODE_B + r];
+                for k in 0..NODE_IN {
+                    acc += w[base + k] * node_in[k];
+                }
+                row[r] = acc;
+                energy += acc * acc;
+            }
+            pre.push(row);
+        }
+
+        let rms = (energy / ((n * REL_DIM) as f32) + 1e-4).sqrt();
+        let inv = 1.25 / rms;
+        for row in &mut pre {
+            for val in row.iter_mut() {
+                *val = (*val * inv).tanh();
+            }
+        }
+        pre
+    }
+
+    pub fn encode_bytes(&self, bytes: &[u8]) -> Vec<[f32; REL_DIM]> {
+        let sub = RawSubstrate::from_bytes(bytes);
+        self.encode_relations(&sub)
     }
 
     pub fn evaluate_hypothesis(
@@ -330,7 +438,7 @@ impl PhiGraph {
         if version != VERSION || count != NUM_PARAMS || data.len() != 12 + count * 4 {
             return Err(io::Error::new(
                 ErrorKind::InvalidData,
-                "Version ou taille du modèle .phis incompatible (ré-entraîne avec v0.3)",
+                "Version ou taille du modèle .phis incompatible (ré-entraîne avec v0.4)",
             ));
         }
         let mut weights = Vec::with_capacity(count);
