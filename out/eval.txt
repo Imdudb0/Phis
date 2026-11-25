@@ -1,0 +1,46 @@
+[1m[92m    Finished[0m `release` profile [optimized] target(s) in 0.01s
+[1m[92m     Running[0m `target/release/phis eval --model out/sharp.phis`
+=== PROTOCOLE PHISHARP v0.3.0 (HORS ENTRAINEMENT, SANS BEQUILLE) ===
+Non-reciprocite du modele : 1.0000
+
+[1. Etalonnage PTGRS (C connue post-hoc)]
+  Spearman(phi_sharp, cause)=0.584 | Spearman(LL, cause)=0.709 | Spearman(MDL, cause)=0.373
+  phi_sharp(PTGRS, b=12)=0.1621 | phi_sharp(octets aleatoires, b=12)=0.0139 | phi_sharp(H:=E)=0.0000
+  Verdict etalonnage : ECHOUE (A illisible)
+
+[2. Entrainement des Baselines a armes egales (PTGRS uniquement)]
+
+[3. Critere A : Echelle OOD -> Mini-Dict -> Mini-Langue & Comparaison Baselines]
+  PTGRS OOD : Gen=0.538 Disc=0.999 Proj=0.696 | Sens_min=0.538 Sens_prod=0.389
+  Recup Cause OOD : Phisharp=0.645 | BytePred=0.660 | LLSearch=0.539
+  Projection OOD  : Phisharp=0.696 | BytePred=0.589 | LLSearch=0.528
+  Mini-Dict PTGRS : phi_sharp=0.134, cause_rec=0.515
+  Mini-Langue     : phi_sharp=0.073
+
+  Courbe Anytime phi_sharp(t) sur OOD :
+    t= 0 : phi_sharp=0.0000 (mip=0.0000, sens_min=0.000, res=0.787)
+    t= 3 : phi_sharp=0.1851 (mip=0.3532, sens_min=0.647, res=0.313)
+    t= 6 : phi_sharp=0.1953 (mip=0.3599, sens_min=0.645, res=0.310)
+    t= 9 : phi_sharp=0.1953 (mip=0.3599, sens_min=0.645, res=0.310)
+    t=12 : phi_sharp=0.1953 (mip=0.3599, sens_min=0.645, res=0.310)
+  Ablations :
+    budget=12 : phi_sharp=0.1953, sens_min=0.6455, stab_ref=0.6303
+    budget=0  : phi_sharp=0.0000, sens_min=0.0000
+    no-refut  : phi_sharp=0.1953, stab_ref=0.6303
+  Test Residu : phi_sharp(E)=0.1953 -> phi_sharp(E + residu)=0.1884
+  Invariance Bijective : exact_equivariant=true (max_delta_phi=0.00e0)
+
+[4. Critere B : Appariement ambiguite <-> definition (0 mot commun, NL jamais entrainee)]
+  Cas 1 (Rattachement syntaxique (FR)) | 0 mot commun verifie | Rang cible: Phisharp=2 BytePred=1 LL=2 | Stabilite para=0.514 vs Rupture sens=0.472
+    [Paquet aveugle sortie] ": pluralite de lexicales differente"
+  Cas 2 (Double portee / syntagme (FR)) | 0 mot commun verifie | Rang cible: Phisharp=4 BytePred=1 LL=3 | Stabilite para=0.319 vs Rupture sens=0.717
+    [Paquet aveugle sortie] "raisonnement nt restitues par le contexte"
+  Cas 3 (Scope / Attachment (EN)) | 0 mot commun verifie | Rang cible: Phisharp=2 BytePred=4 LL=2 | Stabilite para=0.926 vs Rupture sens=0.723
+    [Paquet aveugle sortie] "figure pairing utterance to "
+
+  MRR NL Ambiguite : Phisharp=0.417 | BytePred=0.750 | LLSearch=0.444
+  Sensibilite B    : Stabilite paraphrase=0.586 | Changement si sens brise=0.638
+
+[5. Lecture croisee]
+  A atteint : false | B atteint : false
+  VERDICT : Sens non trouve ; seconde moitie non testee
