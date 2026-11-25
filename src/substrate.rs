@@ -1,11 +1,8 @@
-//! Substrat connexionniste 100% relationnel à matrices non-réciproques (v0.3.0).
+//! Substrat connexionniste 100% relationnel à matrices non-réciproques (v0.3.1).
 //!
-//! Nouveautés structurelles (sans béquille ni prior lexical) :
-//! - Suppression totale du raccourci `sym_rel_bias` : toute prédiction causale `sym_trans`
-//!   passe obligatoirement par le goulot causal non-réciproque V_sym -> V_lat -> V_lat -> V_sym.
-//! - Segmentation émergente `ctx_spans` par pics de branchement relationnel (aucun délimiteur codé en dur).
-//! - Matrices apprises `w_res_effect`, `w_res_cause`, `w_res_to_lat` pour que le réseau apprenne
-//!   lui-même à transformer le résidu en révision d'hypothèse dans V_lat.
+//! - Opérateur causal multiplicatif routé intégralement par V_lat (`w_op_mod`), sans table KxK directe.
+//! - Segmentation émergente par pics statistiques significatifs (> mean + 0.85 * std), sans couper les mots.
+//! - Invariance bijective exacte conservée.
 
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -36,8 +33,8 @@ pub struct PerceivedGraph {
     pub ctx_spans: Vec<(usize, usize)>,
 }
 
-/// Détecte de façon purement relationnelle (invariante à toute bijection π) les frontières
-/// naturelles de clauses / unités structurelles via la surprise de branchement local.
+/// Détecte uniquement les vraies frontières émergentes de clauses (pics locaux > mean + 0.85 * std),
+/// de façon strictement invariante sous renommage bijectif d'octets.
 fn discover_emergent_spans(
     sym_seq: &[usize],
     emp_trans1: &[f64],
@@ -46,69 +43,75 @@ fn discover_emergent_spans(
     k: usize,
 ) -> Vec<(usize, usize)> {
     let n = sym_seq.len();
-    if n < 12 || k < 2 {
+    if n < 16 || k < 2 {
         return vec![(0, n.max(1))];
     }
 
-    // Score de frontière pour chaque symbole : un séparateur structurel possède
-    // une forte fréquence relative, une forte entropie de sortie ET une forte asymétrie/portée.
     let mut sym_boundary_affinity = vec![0.0; k];
     for u in 0..k {
         let freq = emp_marginal[u];
         let h_out = sym_features[u][4];
         let h_in = sym_features[u][5];
         let asym = sym_features[u][7];
-        // Un délimiteur structurel a souvent une forte dispersion de voisins (h_out, h_in élevés)
-        sym_boundary_affinity[u] = freq.sqrt() * (0.45 * h_out + 0.35 * h_in + 0.20 * asym);
+        // Un séparateur de clause est fréquent, très dispersé en sortie/entrée et non-cohésif intérieurement
+        let cohesion = sym_features[u][12];
+        sym_boundary_affinity[u] = freq.sqrt() * (0.45 * h_out + 0.35 * h_in + 0.20 * asym) * (1.15 - 0.5 * cohesion);
     }
 
-    // Score positionnel de coupure juste APRÈS la position i (donc frontière à i+1)
-    let mut pos_scores: Vec<(f64, usize)> = Vec::with_capacity(n);
-    let min_span = (n / 40).clamp(4, 16);
-
-    for i in min_span..(n.saturating_sub(min_span)) {
+    let mut raw_scores = vec![0.0; n];
+    for i in 1..(n - 1) {
         let u = sym_seq[i];
         let v = sym_seq[i + 1];
         let p_uv = emp_trans1[u * k + v].max(1e-6);
         let surprisal = (-p_uv.ln()).clamp(0.0, 6.0) / 6.0;
 
-        // Discontinuité de fenêtre [i-3..=i] vs [i+1..=i+4]
         let lo = i.saturating_sub(3);
         let hi = (i + 5).min(n);
-        let mut overlap = 0.0;
         let left_slice = &sym_seq[lo..=i];
         let right_slice = &sym_seq[(i + 1)..hi];
+        let mut overlap = 0.0;
         for &ls in left_slice {
             if right_slice.contains(&ls) {
                 overlap += 1.0;
             }
         }
         let discont = 1.0 - (overlap / (left_slice.len().max(1) as f64));
-
-        // Combinaison purement relationnelle : affinité séparatrice du symbole courant + surprise + discontinuité
-        let score = 0.50 * sym_boundary_affinity[u] + 0.30 * surprisal + 0.20 * discont;
-        pos_scores.push((score, i + 1));
+        raw_scores[i] = 0.55 * sym_boundary_affinity[u] + 0.25 * surprisal + 0.20 * discont;
     }
 
-    pos_scores.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let mean = raw_scores[1..(n - 1)].iter().sum::<f64>() / ((n - 2).max(1) as f64);
+    let var = raw_scores[1..(n - 1)]
+        .iter()
+        .map(|&x| (x - mean) * (x - mean))
+        .sum::<f64>()
+        / ((n - 2).max(1) as f64);
+    let threshold = mean + 0.85 * var.sqrt();
 
-    let target_cuts = (MAX_CTX - 1).min((n / min_span.max(1)).saturating_sub(1));
-    let mut cuts: Vec<usize> = Vec::with_capacity(target_cuts);
+    let min_span = (n / 32).clamp(12, 32);
+    let mut peaks: Vec<(f64, usize)> = Vec::new();
+    for i in min_span..(n.saturating_sub(min_span)) {
+        if raw_scores[i] > threshold
+            && raw_scores[i] >= raw_scores[i - 1]
+            && raw_scores[i] >= raw_scores[i + 1]
+        {
+            peaks.push((raw_scores[i], i + 1));
+        }
+    }
+    peaks.sort_by(|a, b| b.0.total_cmp(&a.0));
 
-    for &(_, idx) in &pos_scores {
-        if cuts.len() >= target_cuts {
+    let mut cuts: Vec<usize> = Vec::with_capacity(MAX_CTX - 1);
+    for &(_, idx) in &peaks {
+        if cuts.len() >= MAX_CTX - 1 {
             break;
         }
-        let too_close = cuts.iter().any(|&c| c.abs_diff(idx) < min_span);
-        if !too_close {
+        if !cuts.iter().any(|&c| c.abs_diff(idx) < min_span) {
             cuts.push(idx);
         }
     }
 
-    // S'il y a très peu de coupures émergentes (ex: bruit uniforme), compléter par pas réguliers
-    if cuts.len() < 3 {
+    if cuts.len() < 2 {
         cuts.clear();
-        let segs = 8.min(n / 4).max(1);
+        let segs = 6.min(n / 8).max(1);
         for c in 1..segs {
             cuts.push((c * n) / segs);
         }
@@ -267,7 +270,6 @@ impl PerceivedGraph {
             }
             asym = (0.5 * asym).clamp(0.0, 1.0);
 
-            // Cohésion de motif : ce symbole forme-t-il des bigrammes/motifs très déterministes ?
             let mut motif_cohesion = 0.0;
             for v in 0..k {
                 let p_joint = emp_marginal[u] * p_out[v];
@@ -277,7 +279,6 @@ impl PerceivedGraph {
                 }
             }
 
-            // Multiplicité de branchement : nombre effectif de successeurs forts distincts (signature de choix/ambiguïté)
             let strong_branches = p_out.iter().filter(|&&p| p > 1.5 / (k as f64).max(2.0)).count() as f64;
             let branch_mult = (strong_branches / (k as f64).max(2.0)).clamp(0.0, 1.0);
 
@@ -413,7 +414,11 @@ pub struct HypothesisState {
     pub lat_couplings: [f64; N_LAT * N_LAT],
     pub lat_to_sym: Vec<f64>, // N_LAT * K
     pub sym_to_lat: Vec<f64>, // K * N_LAT
-    /// Transition causale sur Σ_E générée EXCLUSIVEMENT à travers le graphe latent non-réciproque
+    /// Modulateurs d'opérateurs causaux extraits de lat_states (N_LAT * D)
+    pub lat_op_mods: [[f64; D]; N_LAT],
+    /// États de requête/clé symboliques pour le goulot multiplicatif
+    pub sym_query_vecs: Vec<[f64; D]>,
+    pub sym_key_vecs: Vec<[f64; D]>,
     pub sym_trans: Vec<f64>,  // K * K
     pub search_depth: usize,
 }
@@ -443,6 +448,9 @@ impl HypothesisState {
             lat_couplings,
             lat_to_sym: vec![1.0 / (k as f64).max(1.0); N_LAT * k],
             sym_to_lat: vec![1.0 / (N_LAT as f64); k * N_LAT],
+            lat_op_mods: [[0.0; D]; N_LAT],
+            sym_query_vecs: vec![[0.0; D]; k],
+            sym_key_vecs: vec![[0.0; D]; k],
             sym_trans: pg.emp_trans1.clone(),
             search_depth: 0,
         }
@@ -464,14 +472,15 @@ pub struct PhisharpNet {
     pub w_edge_k: Vec<f64>,
     pub w_upd_gate: Vec<f64>,
     pub w_upd_cand: Vec<f64>,
-    /// Matrices apprises de révision abductive à partir du résidu (sans copie directe)
-    pub w_res_effect: Vec<f64>, // D * D
-    pub w_res_cause: Vec<f64>,  // D * D
-    pub w_res_to_lat: Vec<f64>, // D * D
+    pub w_res_effect: Vec<f64>,
+    pub w_res_cause: Vec<f64>,
+    pub w_res_to_lat: Vec<f64>,
+    /// Opérateur de transformation causale latente (g_j = W_op_mod * lat_j)
+    pub w_op_mod: Vec<f64>,
     pub w_policy: Vec<f64>,
     pub w_read_query: Vec<f64>,
     pub w_read_key: Vec<f64>,
-    pub w_temp_logits: Vec<f64>, // 4 échelles : [b_s2l, b_lat, b_l2s, b_out]
+    pub w_temp_logits: Vec<f64>,
 }
 
 impl PhisharpNet {
@@ -484,7 +493,7 @@ impl PhisharpNet {
         Self {
             w_sym_enc: init(rng, D * SYM_FEAT_DIM, (1.0 / (SYM_FEAT_DIM as f64)).sqrt()),
             w_ctx_enc: init(rng, D * CTX_FEAT_DIM, (1.0 / (CTX_FEAT_DIM as f64)).sqrt()),
-            w_lat_bias: init(rng, N_LAT * D, 0.40),
+            w_lat_bias: init(rng, N_LAT * D, 0.45),
             w_fwd_effect: init(rng, D * D, s_d),
             w_bwd_cause: init(rng, D * D, s_d),
             w_rel_lat_fwd: init(rng, D * D, s_d),
@@ -498,10 +507,11 @@ impl PhisharpNet {
             w_res_effect: init(rng, D * D, s_d),
             w_res_cause: init(rng, D * D, s_d),
             w_res_to_lat: init(rng, D * D, s_d),
+            w_op_mod: init(rng, D * D, s_d * 1.4),
             w_policy: init(rng, POLICY_OUT_DIM * POLICY_IN_DIM, (1.0 / (POLICY_IN_DIM as f64)).sqrt()),
             w_read_query: init(rng, D * D, s_d),
             w_read_key: init(rng, D * D, s_d),
-            w_temp_logits: vec![1.6, 1.4, 1.8, 2.0],
+            w_temp_logits: vec![1.6, 1.5, 1.8, 2.2],
         }
     }
 
@@ -522,6 +532,7 @@ impl PhisharpNet {
             + self.w_res_effect.len()
             + self.w_res_cause.len()
             + self.w_res_to_lat.len()
+            + self.w_op_mod.len()
             + self.w_policy.len()
             + self.w_read_query.len()
             + self.w_read_key.len()
@@ -546,6 +557,7 @@ impl PhisharpNet {
         v.extend_from_slice(&self.w_res_effect);
         v.extend_from_slice(&self.w_res_cause);
         v.extend_from_slice(&self.w_res_to_lat);
+        v.extend_from_slice(&self.w_op_mod);
         v.extend_from_slice(&self.w_policy);
         v.extend_from_slice(&self.w_read_query);
         v.extend_from_slice(&self.w_read_key);
@@ -576,6 +588,7 @@ impl PhisharpNet {
         take(&mut self.w_res_effect);
         take(&mut self.w_res_cause);
         take(&mut self.w_res_to_lat);
+        take(&mut self.w_op_mod);
         take(&mut self.w_policy);
         take(&mut self.w_read_query);
         take(&mut self.w_read_key);
@@ -642,6 +655,9 @@ impl PhisharpNet {
             lat_couplings: [0.0; N_LAT * N_LAT],
             lat_to_sym: vec![0.0; N_LAT * k],
             sym_to_lat: vec![0.0; k * N_LAT],
+            lat_op_mods: [[0.0; D]; N_LAT],
+            sym_query_vecs: vec![[0.0; D]; k],
+            sym_key_vecs: vec![[0.0; D]; k],
             sym_trans: vec![1.0 / (k as f64).max(1.0); k * k],
             search_depth: 0,
         };
@@ -664,6 +680,11 @@ impl PhisharpNet {
         for i in 0..N_LAT {
             matvec(&self.w_edge_q, D, D, &h.lat_states[i], &mut q_lat[i]);
             matvec(&self.w_edge_k, D, D, &h.lat_states[i], &mut k_lat[i]);
+            let mut mod_buf = [0.0; D];
+            matvec(&self.w_op_mod, D, D, &h.lat_states[i], &mut mod_buf);
+            for d in 0..D {
+                h.lat_op_mods[i][d] = 1.5 * tanh_clamped(mod_buf[d]);
+            }
         }
 
         for i in 0..N_LAT {
@@ -677,11 +698,9 @@ impl PhisharpNet {
             }
         }
 
-        let mut rq_sym = vec![[0.0; D]; k];
-        let mut rk_sym = vec![[0.0; D]; k];
         for s in 0..k {
-            matvec(&self.w_read_query, D, D, &h.sym_states[s], &mut rq_sym[s]);
-            matvec(&self.w_read_key, D, D, &h.sym_states[s], &mut rk_sym[s]);
+            matvec(&self.w_read_query, D, D, &h.sym_states[s], &mut h.sym_query_vecs[s]);
+            matvec(&self.w_read_key, D, D, &h.sym_states[s], &mut h.sym_key_vecs[s]);
         }
 
         for s in 0..k {
@@ -690,7 +709,7 @@ impl PhisharpNet {
             for l in 0..N_LAT {
                 let mut sc = 0.0;
                 for d in 0..D {
-                    sc += rq_sym[s][d] * k_lat[l][d];
+                    sc += h.sym_query_vecs[s][d] * k_lat[l][d];
                 }
                 let v = sc * base_scale * b_s2l;
                 scores[l] = v;
@@ -716,7 +735,7 @@ impl PhisharpNet {
             for s in 0..k {
                 let mut sc = 0.0;
                 for d in 0..D {
-                    sc += q_lat[l][d] * rk_sym[s][d];
+                    sc += q_lat[l][d] * h.sym_key_vecs[s][d];
                 }
                 let v = sc * base_scale * b_l2s;
                 scores[s] = v;
@@ -744,7 +763,6 @@ impl PhisharpNet {
             return;
         }
 
-        // sym_trans passe EXCLUSIVEMENT par le graphe causal latent V_sym -> V_lat -> V_lat -> V_sym
         let mut lat_trans = [0.0; N_LAT * N_LAT];
         for i in 0..N_LAT {
             let mut max_v = f64::NEG_INFINITY;
@@ -766,6 +784,8 @@ impl PhisharpNet {
             }
         }
 
+        // Opérateur multiplicatif latent : chaque règle latente j active une transformation g_j ⊙ rq_u
+        // routée EXCLUSIVEMENT via la distribution causale lat_after[u, j] !
         for u in 0..k {
             let mut lat_after = [0.0; N_LAT];
             for j in 0..N_LAT {
@@ -776,6 +796,19 @@ impl PhisharpNet {
                 lat_after[j] = acc;
             }
 
+            let mut eff_op = [0.0; D];
+            for j in 0..N_LAT {
+                let w = lat_after[j];
+                for d in 0..D {
+                    eff_op[d] += w * h.lat_op_mods[j][d];
+                }
+            }
+
+            let mut eff_vec = [0.0; D];
+            for d in 0..D {
+                eff_vec[d] = eff_op[d] * h.sym_query_vecs[u][d];
+            }
+
             let mut logits = vec![0.0; k];
             let mut max_logit = f64::NEG_INFINITY;
             for v in 0..k {
@@ -783,7 +816,11 @@ impl PhisharpNet {
                 for j in 0..N_LAT {
                     p_uv += lat_after[j] * h.lat_to_sym[j * k + v];
                 }
-                let l_uv = b_out * p_uv.max(1e-9).ln();
+                let mut bil = 0.0;
+                for d in 0..D {
+                    bil += eff_vec[d] * h.sym_key_vecs[v][d];
+                }
+                let l_uv = 0.5 * b_out * p_uv.max(1e-9).ln() + b_out * (bil * base_scale);
                 logits[v] = l_uv;
                 if l_uv > max_logit {
                     max_logit = l_uv;
@@ -815,7 +852,6 @@ impl PhisharpNet {
         let mut gate = [0.0; D];
         let mut cand = [0.0; D];
 
-        // 1. Flux asymétrique sur V_sym (incluant la révision apprise du résidu cause/effet)
         let mut new_sym = vec![[0.0; D]; k];
         for u in 0..k {
             let mut agg_fwd = [0.0; D];
@@ -853,8 +889,8 @@ impl PhisharpNet {
             matvec(&self.w_lat_to_ctx, D, D, &agg_lat, &mut msg_lat);
 
             for d in 0..D {
-                concat[d] = msg_eff[d] + 0.65 * res_e_proj[d];
-                concat[D + d] = msg_cau[d] + 0.65 * res_c_proj[d];
+                concat[d] = msg_eff[d] + 0.80 * res_e_proj[d];
+                concat[D + d] = msg_cau[d] + 0.80 * res_c_proj[d];
                 concat[2 * D + d] = msg_lat[d];
             }
             matvec(&self.w_upd_gate, D, 3 * D, &concat, &mut gate);
@@ -866,7 +902,6 @@ impl PhisharpNet {
         }
         h.sym_states = new_sym;
 
-        // 2. Flux asymétrique sur les clauses contextuelles émergentes V_ctx
         let mut new_ctx = vec![[0.0; D]; n_ctx];
         for c in 0..n_ctx {
             let mut agg_sym = [0.0; D];
@@ -897,7 +932,6 @@ impl PhisharpNet {
         }
         h.ctx_states = new_ctx;
 
-        // 3. Flux sur V_lat alimenté par sym_states, ctx_states ET l'erreur résiduelle vue par w_res_to_lat
         let mut sym_res_by_lat = [[0.0; D]; N_LAT];
         for u in 0..k {
             let m_u = pg.emp_marginal[u];
@@ -937,7 +971,6 @@ impl PhisharpNet {
                 agg_in[d] /= sum_in;
             }
 
-            // Agrégation des nœuds symboliques liés à ce nœud latent + contexte
             let mut agg_ctx = [0.0; D];
             for c in 0..n_ctx {
                 let w = ((c + i) % 3 == 0) as usize as f64 * 0.5 + 0.5;
@@ -959,7 +992,7 @@ impl PhisharpNet {
             for d in 0..D {
                 concat[d] = msg_eff[d];
                 concat[D + d] = msg_cau[d];
-                concat[2 * D + d] = msg_lat[d] + 0.85 * res_lat_proj[d];
+                concat[2 * D + d] = msg_lat[d] + 0.90 * res_lat_proj[d];
             }
             matvec(&self.w_upd_gate, D, 3 * D, &concat, &mut gate);
             matvec(&self.w_upd_cand, D, 3 * D, &concat, &mut cand);
