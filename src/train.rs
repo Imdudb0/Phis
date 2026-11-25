@@ -1,6 +1,6 @@
-//! Entraînement FERMÉ v0.3.1 : PTGRS (E seul) + φ_sharp + Sens + Résidu.
-//! L'objectif inclut une pente douce sur (phi_iit_mip + sens_geo) afin que NES
-//! décolle proprement dès l'itération 1 sans rester piégé sur un produit nul.
+//! Entraînement FERMÉ v0.4.0 :
+//! - PTGRS uniquement (alternance de traces séquentielles et d'ensembles non-séquentiels de clauses)
+//! - Signal unique : φ_sharp, Sens, Trajectoire et Résidu.
 
 use std::path::Path;
 
@@ -23,10 +23,10 @@ pub struct TrainConfig {
 impl Default for TrainConfig {
     fn default() -> Self {
         Self {
-            iterations: 100,
+            iterations: 140,
             pop_pairs: 20,
             batch_size: 4,
-            search_budget: 8,
+            search_budget: 10,
             sigma: 0.055,
             lr: 0.022,
             seed: 2026_11_24,
@@ -68,7 +68,6 @@ fn evaluate_batch_fitness(
 
         let traj_gain = (rep.phi_sharp - phi0).max(0.0);
         let sens_geo = rep.sens_prod.cbrt();
-        // Signal fermé : φ_sharp + trajectoire + termes de démarrage non-écrasés (MIP, Sens, -Résidu)
         let obj = 1.4 * rep.phi_sharp
             + 0.40 * traj_gain
             + 0.35 * rep.phi_iit_mip
