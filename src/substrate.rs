@@ -1,41 +1,36 @@
 //! Substrat connexionniste 100% relationnel à matrices de poids fondamentalement non-réciproques.
-//!
-//! Propriété fondamentale d'invariance :
-//! Aucune table de poids n'est indexée par la valeur brute d'un octet `u8`.
-//! L'entrée `observed_e` est convertie exclusivement en graphe relationnel sur l'alphabet
-//! auto-spécifié (ordonné par première apparition) et ses segments structurels.
-//! Toute permutation bijective π des octets d'entrée laisse `PerceivedGraph` structurellement
-//! identique (à la table `unique_bytes` près).
+//! v0.2.0 : Températures relationnelles apprises pour permettre des rôles causaux nets sans
+//! écraser sym_trans vers l'uniforme, tout en conservant l'invariance bijective exacte.
 
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
-use crate::math::{Rng, entropy_bits, matvec, normalize_prob, sigmoid, tanh_clamped};
+use crate::math::{Rng, entropy_bits, matvec, normalize_prob, sigmoid, softplus, tanh_clamped};
 
-pub const D: usize = 16;           // Dimension d'état par nœud
-pub const N_LAT: usize = 12;       // Nombre de nœuds causaux latents
-pub const N_CTX: usize = 16;       // Nombre de nœuds de segments contextuels
+pub const D: usize = 12;           // Dimension d'état par nœud
+pub const N_LAT: usize = 10;       // Nombre de nœuds causaux latents
+pub const N_CTX: usize = 12;       // Nombre de nœuds de segments contextuels
 pub const SYM_FEAT_DIM: usize = 12;
 pub const CTX_FEAT_DIM: usize = 10;
 pub const POLICY_IN_DIM: usize = 20;
-pub const POLICY_OUT_DIM: usize = 4; // [p_refute, p_displace, p_abstract, step_scale]
+pub const POLICY_OUT_DIM: usize = 4;
 
 /// Représentation purement relationnelle de E = perceived.eff.
 /// Strictement invariante sous renommage bijectif d'octets.
 #[derive(Clone, Debug)]
 pub struct PerceivedGraph {
     pub raw_len: usize,
-    pub unique_bytes: Vec<u8>,       // Ordre de première apparition (équivariant)
-    pub sym_seq: Vec<usize>,         // Séquence en indices symboliques 0..K-1
+    pub unique_bytes: Vec<u8>,
+    pub sym_seq: Vec<usize>,
     pub sym_features: Vec<[f64; SYM_FEAT_DIM]>,
-    pub emp_trans1: Vec<f64>,        // K * K : P_emp(v | u) à pas 1
-    pub emp_trans2: Vec<f64>,        // K * K : P_emp(v | u) à pas 2 (saut)
-    pub emp_cooccur: Vec<f64>,       // K * K : co-occurrence symétrique dans fenêtre ±3
-    pub emp_marginal: Vec<f64>,      // K : distribution marginale
-    pub ctx_features: Vec<[f64; CTX_FEAT_DIM]>, // N_CTX vecteurs
-    pub ctx_sym_weights: Vec<f64>,   // N_CTX * K : poids relationnel segment -> symbole
-    pub ctx_spans: Vec<(usize, usize)>, // bornes [start, end) dans sym_seq
+    pub emp_trans1: Vec<f64>,
+    pub emp_trans2: Vec<f64>,
+    pub emp_cooccur: Vec<f64>,
+    pub emp_marginal: Vec<f64>,
+    pub ctx_features: Vec<[f64; CTX_FEAT_DIM]>,
+    pub ctx_sym_weights: Vec<f64>,
+    pub ctx_spans: Vec<(usize, usize)>,
 }
 
 impl PerceivedGraph {
@@ -105,7 +100,6 @@ impl PerceivedGraph {
         }
         normalize_prob(&mut emp_marginal);
 
-        // Matrices empiriques de transition et co-occurrence
         let mut trans1_raw = vec![0.0; k * k];
         let mut trans1_rev = vec![0.0; k * k];
         let mut trans2_raw = vec![0.0; k * k];
@@ -140,16 +134,12 @@ impl PerceivedGraph {
         let log_k = (k as f64).max(2.0).log2();
 
         for u in 0..k {
-            let row_slice1 = &trans1_raw[u * k..(u + 1) * k];
-            let rev_slice1 = &trans1_rev[u * k..(u + 1) * k];
-            let mut p_out = row_slice1.to_vec();
+            let mut p_out = trans1_raw[u * k..(u + 1) * k].to_vec();
             normalize_prob(&mut p_out);
-            let mut p_in = rev_slice1.to_vec();
+            let mut p_in = trans1_rev[u * k..(u + 1) * k].to_vec();
             normalize_prob(&mut p_in);
-
             let mut p_skip = trans2_raw[u * k..(u + 1) * k].to_vec();
             normalize_prob(&mut p_skip);
-
             let mut p_co = cooccur_raw[u * k..(u + 1) * k].to_vec();
             normalize_prob(&mut p_co);
 
@@ -164,14 +154,12 @@ impl PerceivedGraph {
             let h_in = entropy_bits(&p_in) / log_k;
             let h_skip = entropy_bits(&p_skip) / log_k;
 
-            // Asymétrie directionnelle (propriété relationnelle clé)
             let mut asym = 0.0;
             for v in 0..k {
                 asym += (p_out[v] - p_in[v]).abs();
             }
             asym = (0.5 * asym).clamp(0.0, 1.0);
 
-            // Répétition / périodicité moyenne
             let period_est = if counts[u] > 1 {
                 let mut sum_gap = 0.0;
                 let mut prev = None;
@@ -185,11 +173,7 @@ impl PerceivedGraph {
                         prev = Some(pos);
                     }
                 }
-                if gaps > 0.0 {
-                    (sum_gap / gaps / nf.max(1.0)).clamp(0.0, 1.0)
-                } else {
-                    1.0
-                }
+                if gaps > 0.0 { (sum_gap / gaps / nf.max(1.0)).clamp(0.0, 1.0) } else { 1.0 }
             } else {
                 1.0
             };
@@ -213,7 +197,6 @@ impl PerceivedGraph {
             ];
         }
 
-        // Construction des N_CTX segments contextuels relationnels
         let mut ctx_features = vec![[0.0; CTX_FEAT_DIM]; N_CTX];
         let mut ctx_sym_weights = vec![0.0; N_CTX * k];
         let mut ctx_spans = Vec::with_capacity(N_CTX);
@@ -248,20 +231,14 @@ impl PerceivedGraph {
                 / (k as f64).max(1.0))
             .clamp(0.0, 1.0);
 
-            // Recouvrement avec le segment précédent et le reste du texte
             let prev_overlap = if c_idx > 0 {
                 let prev_slice = &ctx_sym_weights[(c_idx - 1) * k..c_idx * k];
                 local_dist.iter().zip(prev_slice.iter()).map(|(a, b)| a.min(*b)).sum::<f64>()
             } else {
                 0.0
             };
-            let global_overlap: f64 = local_dist
-                .iter()
-                .zip(emp_marginal.iter())
-                .map(|(a, b)| a.min(*b))
-                .sum();
+            let global_overlap: f64 = local_dist.iter().zip(emp_marginal.iter()).map(|(a, b)| a.min(*b)).sum();
 
-            // Degré moyen d'asymétrie des symboles actifs dans ce segment
             let mut mean_asym = 0.0;
             let mut mean_hout = 0.0;
             for (s, &w) in local_dist.iter().enumerate() {
@@ -305,35 +282,28 @@ impl PerceivedGraph {
     }
 }
 
-/// État dynamique complet d'une hypothèse H(t) dans le graphe connexionniste.
 #[derive(Clone, Debug)]
 pub struct HypothesisState {
     pub k: usize,
     pub lat_states: [[f64; D]; N_LAT],
     pub ctx_states: [[f64; D]; N_CTX],
     pub sym_states: Vec<[f64; D]>,
-    /// Couplages causaux NON-RÉCIPROQUES entre nœuds latents : J_{i->j} != J_{j->i}
     pub lat_couplings: [f64; N_LAT * N_LAT],
-    /// Matrice directionnelle lat -> sym (projection d'effet)
     pub lat_to_sym: Vec<f64>, // N_LAT * K
-    /// Matrice directionnelle sym -> lat (inférence de cause, indépendante de lat_to_sym)
     pub sym_to_lat: Vec<f64>, // K * N_LAT
-    /// Opérateur de transition causale sur Σ_E induit par le goulot latent (pas une copie de T_emp!)
-    pub sym_trans: Vec<f64>, // K * K
-    /// Rétention d'activation de recherche (0 à budget nul, >0 au fil de la trajectoire)
+    /// Biais relationnel appris entre paires de symboles (via projections non-réciproques)
+    pub sym_rel_bias: Vec<f64>, // K * K
+    pub sym_trans: Vec<f64>,    // K * K
     pub search_depth: usize,
 }
 
 impl HypothesisState {
-    /// Construit l'état trivial d'identité H := E (pour tests d'étalonnage : doit donner φ_sharp bas).
     pub fn trivial_identity_from(pg: &PerceivedGraph) -> Self {
         let k = pg.k();
         let mut lat_states = [[0.0; D]; N_LAT];
-        // Chaque nœud latent copie un sous-ensemble disjoint sans intégration croisée
         for i in 0..N_LAT {
             lat_states[i][0] = 0.05;
         }
-        // Couplages strictement diagonaux / découplés -> MIP nul
         let mut lat_couplings = [0.0; N_LAT * N_LAT];
         for i in 0..N_LAT {
             lat_couplings[i * N_LAT + i] = 0.1;
@@ -344,47 +314,41 @@ impl HypothesisState {
                 sym_states[s][d] = pg.sym_features[s][d];
             }
         }
-        let lat_to_sym = vec![1.0 / (k as f64).max(1.0); N_LAT * k];
-        let sym_to_lat = vec![1.0 / (N_LAT as f64); k * N_LAT];
         Self {
             k,
             lat_states,
             ctx_states: [[0.0; D]; N_CTX],
             sym_states,
             lat_couplings,
-            lat_to_sym,
-            sym_to_lat,
-            sym_trans: pg.emp_trans1.clone(), // Copie directe de E -> détectée comme H := E !
+            lat_to_sym: vec![1.0 / (k as f64).max(1.0); N_LAT * k],
+            sym_to_lat: vec![1.0 / (N_LAT as f64); k * N_LAT],
+            sym_rel_bias: vec![0.0; k * k],
+            sym_trans: pg.emp_trans1.clone(),
             search_depth: 0,
         }
     }
 }
 
-/// Paramètres connexionnistes du réseau Phisharp.
-/// Toutes les matrices directionnelles sont explicitement asymétriques (W_fwd != W_bwd^T).
 #[derive(Clone, Debug)]
 pub struct PhisharpNet {
-    pub w_sym_enc: Vec<f64>,         // D * SYM_FEAT_DIM
-    pub w_ctx_enc: Vec<f64>,         // D * CTX_FEAT_DIM
-    pub w_lat_bias: Vec<f64>,        // N_LAT * D
-    // Matrices de passage de messages fondamentalement NON-RÉCIPROQUES
-    pub w_fwd_effect: Vec<f64>,      // D * D (direction effet : cause -> conséquence)
-    pub w_bwd_cause: Vec<f64>,       // D * D (direction cause : effet -> origine)
-    pub w_rel_lat_fwd: Vec<f64>,     // D * D (interaction latente sortante)
-    pub w_rel_lat_bwd: Vec<f64>,     // D * D (interaction latente entrante)
-    pub w_ctx_to_lat: Vec<f64>,      // D * D
-    pub w_lat_to_ctx: Vec<f64>,      // D * D
-    // Gating des couplages non-réciproques J_{i->j}
-    pub w_edge_q: Vec<f64>,          // D * D (émetteur)
-    pub w_edge_k: Vec<f64>,          // D * D (récepteur)
-    // Mise à jour récurrente continue des nœuds
-    pub w_upd_gate: Vec<f64>,        // D * (3 * D)
-    pub w_upd_cand: Vec<f64>,        // D * (3 * D)
-    // Politique méta-abductive (réfutation, déplacement, abstraction, pas)
-    pub w_policy: Vec<f64>,          // POLICY_OUT_DIM * POLICY_IN_DIM
-    // Tête de lecture causale -> alphabet auto-spécifié (non-réciproque)
-    pub w_read_query: Vec<f64>,      // D * D
-    pub w_read_key: Vec<f64>,        // D * D
+    pub w_sym_enc: Vec<f64>,
+    pub w_ctx_enc: Vec<f64>,
+    pub w_lat_bias: Vec<f64>,
+    pub w_fwd_effect: Vec<f64>,
+    pub w_bwd_cause: Vec<f64>,
+    pub w_rel_lat_fwd: Vec<f64>,
+    pub w_rel_lat_bwd: Vec<f64>,
+    pub w_ctx_to_lat: Vec<f64>,
+    pub w_lat_to_ctx: Vec<f64>,
+    pub w_edge_q: Vec<f64>,
+    pub w_edge_k: Vec<f64>,
+    pub w_upd_gate: Vec<f64>,
+    pub w_upd_cand: Vec<f64>,
+    pub w_policy: Vec<f64>,
+    pub w_read_query: Vec<f64>,
+    pub w_read_key: Vec<f64>,
+    /// Paramètres d'échelle de sélectivité (inverse-températures) : [beta_s2l, beta_lat, beta_l2s, beta_out]
+    pub w_temp_logits: Vec<f64>,
 }
 
 impl PhisharpNet {
@@ -397,7 +361,7 @@ impl PhisharpNet {
         Self {
             w_sym_enc: init(rng, D * SYM_FEAT_DIM, (1.0 / (SYM_FEAT_DIM as f64)).sqrt()),
             w_ctx_enc: init(rng, D * CTX_FEAT_DIM, (1.0 / (CTX_FEAT_DIM as f64)).sqrt()),
-            w_lat_bias: init(rng, N_LAT * D, 0.35),
+            w_lat_bias: init(rng, N_LAT * D, 0.45),
             w_fwd_effect: init(rng, D * D, s_d),
             w_bwd_cause: init(rng, D * D, s_d),
             w_rel_lat_fwd: init(rng, D * D, s_d),
@@ -411,6 +375,7 @@ impl PhisharpNet {
             w_policy: init(rng, POLICY_OUT_DIM * POLICY_IN_DIM, (1.0 / (POLICY_IN_DIM as f64)).sqrt()),
             w_read_query: init(rng, D * D, s_d),
             w_read_key: init(rng, D * D, s_d),
+            w_temp_logits: vec![1.8, 1.6, 2.0, 2.2],
         }
     }
 
@@ -431,6 +396,7 @@ impl PhisharpNet {
             + self.w_policy.len()
             + self.w_read_query.len()
             + self.w_read_key.len()
+            + self.w_temp_logits.len()
     }
 
     pub fn to_flat_vec(&self) -> Vec<f64> {
@@ -451,6 +417,7 @@ impl PhisharpNet {
         v.extend_from_slice(&self.w_policy);
         v.extend_from_slice(&self.w_read_query);
         v.extend_from_slice(&self.w_read_key);
+        v.extend_from_slice(&self.w_temp_logits);
         v
     }
 
@@ -477,9 +444,9 @@ impl PhisharpNet {
         take(&mut self.w_policy);
         take(&mut self.w_read_query);
         take(&mut self.w_read_key);
+        take(&mut self.w_temp_logits);
     }
 
-    /// Mesure explicite de non-réciprocité ||W_fwd - W_bwd^T|| / (||W_fwd|| + ||W_bwd||).
     pub fn non_reciprocity_index(&self) -> f64 {
         let mut diff2 = 0.0;
         let mut norm2 = 0.0;
@@ -494,7 +461,16 @@ impl PhisharpNet {
         if norm2 < 1e-12 { 0.0 } else { (diff2.sqrt() / norm2.sqrt()).clamp(0.0, 1.0) }
     }
 
-    /// Pôle 1 : déclenchement perceptionnel régional R(E) à budget nul (avant recherche).
+    #[inline]
+    pub fn temp_scales(&self) -> [f64; 4] {
+        [
+            (1.0 + softplus(self.w_temp_logits[0])).clamp(1.0, 8.0),
+            (1.0 + softplus(self.w_temp_logits[1])).clamp(1.0, 8.0),
+            (1.0 + softplus(self.w_temp_logits[2])).clamp(1.0, 8.0),
+            (1.0 + softplus(self.w_temp_logits[3])).clamp(1.0, 10.0),
+        ]
+    }
+
     pub fn init_regional_state(&self, pg: &PerceivedGraph) -> HypothesisState {
         let k = pg.k();
         let mut sym_states = vec![[0.0; D]; k];
@@ -530,6 +506,7 @@ impl PhisharpNet {
             lat_couplings: [0.0; N_LAT * N_LAT],
             lat_to_sym: vec![0.0; N_LAT * k],
             sym_to_lat: vec![0.0; k * N_LAT],
+            sym_rel_bias: vec![0.0; k * k],
             sym_trans: vec![1.0 / (k as f64).max(1.0); k * k],
             search_depth: 0,
         };
@@ -537,15 +514,16 @@ impl PhisharpNet {
         h
     }
 
-    /// Recalcule les couplages asymétriques J_{i->j}, sym_to_lat, lat_to_sym et l'opérateur causal sym_trans.
-    /// Si `active_causal_bottleneck` est false (budget nul), la projection reste purement régionale/plate.
     pub fn recompute_relational_operators(
         &self,
         h: &mut HypothesisState,
-        pg: &PerceivedGraph,
+        _pg: &PerceivedGraph,
         active_causal_bottleneck: bool,
     ) {
         let k = h.k;
+        let [b_s2l, b_lat, b_l2s, b_out] = self.temp_scales();
+        let base_scale = 1.0 / (D as f64).sqrt();
+
         let mut q_lat = [[0.0; D]; N_LAT];
         let mut k_lat = [[0.0; D]; N_LAT];
         for i in 0..N_LAT {
@@ -553,20 +531,17 @@ impl PhisharpNet {
             matvec(&self.w_edge_k, D, D, &h.lat_states[i], &mut k_lat[i]);
         }
 
-        let scale = 1.0 / (D as f64).sqrt();
         for i in 0..N_LAT {
             for j in 0..N_LAT {
                 let mut dot_ij = 0.0;
                 for d in 0..D {
                     dot_ij += q_lat[i][d] * k_lat[j][d];
                 }
-                // Couplage fondamentalement non-réciproque (q_i . k_j != q_j . k_i)
-                let val = tanh_clamped(dot_ij * scale);
-                h.lat_couplings[i * N_LAT + j] = if i == j { val * 0.25 } else { val };
+                let val = tanh_clamped(dot_ij * base_scale * 1.6);
+                h.lat_couplings[i * N_LAT + j] = if i == j { val * 0.2 } else { val };
             }
         }
 
-        // Projections directionnelles sym <-> lat (asymétriques)
         let mut rq_sym = vec![[0.0; D]; k];
         let mut rk_sym = vec![[0.0; D]; k];
         for s in 0..k {
@@ -575,41 +550,58 @@ impl PhisharpNet {
         }
 
         for s in 0..k {
-            let mut row_sum = 0.0;
+            let mut max_sc = f64::NEG_INFINITY;
+            let mut scores = [0.0; N_LAT];
             for l in 0..N_LAT {
                 let mut sc = 0.0;
                 for d in 0..D {
                     sc += rq_sym[s][d] * k_lat[l][d];
                 }
-                let w = (sc * scale).clamp(-8.0, 8.0).exp();
+                let v = sc * base_scale * b_s2l;
+                scores[l] = v;
+                if v > max_sc {
+                    max_sc = v;
+                }
+            }
+            let mut row_sum = 0.0;
+            for l in 0..N_LAT {
+                let w = (scores[l] - max_sc).clamp(-12.0, 0.0).exp();
                 h.sym_to_lat[s * N_LAT + l] = w;
                 row_sum += w;
             }
-            let inv = if row_sum > 1e-12 { 1.0 / row_sum } else { 1.0 / (N_LAT as f64) };
+            let inv = 1.0 / row_sum.max(1e-12);
             for l in 0..N_LAT {
                 h.sym_to_lat[s * N_LAT + l] *= inv;
             }
         }
 
         for l in 0..N_LAT {
-            let mut row_sum = 0.0;
+            let mut max_sc = f64::NEG_INFINITY;
+            let mut scores = vec![0.0; k];
             for s in 0..k {
                 let mut sc = 0.0;
                 for d in 0..D {
                     sc += q_lat[l][d] * rk_sym[s][d];
                 }
-                let w = (sc * scale).clamp(-8.0, 8.0).exp();
+                let v = sc * base_scale * b_l2s;
+                scores[s] = v;
+                if v > max_sc {
+                    max_sc = v;
+                }
+            }
+            let mut row_sum = 0.0;
+            for s in 0..k {
+                let w = (scores[s] - max_sc).clamp(-12.0, 0.0).exp();
                 h.lat_to_sym[l * k + s] = w;
                 row_sum += w;
             }
-            let inv = if row_sum > 1e-12 { 1.0 / row_sum } else { 1.0 / (k as f64) };
+            let inv = 1.0 / row_sum.max(1e-12);
             for s in 0..k {
                 h.lat_to_sym[l * k + s] *= inv;
             }
         }
 
         if !active_causal_bottleneck {
-            // À budget nul (t = 0), aucune intégration causale n'a encore eu lieu : distribution quasi-uniforme
             let u = 1.0 / (k as f64).max(1.0);
             for x in h.sym_trans.iter_mut() {
                 *x = u;
@@ -617,14 +609,19 @@ impl PhisharpNet {
             return;
         }
 
-        // Passage causal par le graphe latent non-réciproque :
-        // sym u -> inférence cause lat i -> transition causale lat_couplings[i->j] -> effet sym v
-        // (et couplage relationnel direct via projections latentes, jamais par copie brute de emp_trans1)
+        // Passage net par le goulot causal non-réciproque + accentuation log-linéaire
         let mut lat_trans = [0.0; N_LAT * N_LAT];
         for i in 0..N_LAT {
+            let mut max_v = f64::NEG_INFINITY;
+            for j in 0..N_LAT {
+                let v = b_lat * h.lat_couplings[i * N_LAT + j];
+                if v > max_v {
+                    max_v = v;
+                }
+            }
             let mut sum = 0.0;
             for j in 0..N_LAT {
-                let w = (2.2 * h.lat_couplings[i * N_LAT + j]).clamp(-8.0, 8.0).exp();
+                let w = (b_lat * h.lat_couplings[i * N_LAT + j] - max_v).clamp(-12.0, 0.0).exp();
                 lat_trans[i * N_LAT + j] = w;
                 sum += w;
             }
@@ -635,7 +632,6 @@ impl PhisharpNet {
         }
 
         for u in 0..k {
-            // Distribution latente causale induite par u
             let mut lat_after = [0.0; N_LAT];
             for j in 0..N_LAT {
                 let mut acc = 0.0;
@@ -645,17 +641,32 @@ impl PhisharpNet {
                 lat_after[j] = acc;
             }
 
-            let mut row_sum = 0.0;
+            // Calcul des logits combinant le goulot latent et la projection bilinéaire asymétrique rq_sym . rk_sym
+            let mut logits = vec![0.0; k];
+            let mut max_logit = f64::NEG_INFINITY;
             for v in 0..k {
                 let mut p_uv = 0.0;
                 for j in 0..N_LAT {
                     p_uv += lat_after[j] * h.lat_to_sym[j * k + v];
                 }
-                // Modulation relationnelle de co-occurrence sans copie littérale de transition
-                let rel_mod = 0.85 + 0.30 * pg.emp_cooccur[u * k + v];
-                let val = (p_uv * rel_mod).max(1e-9);
-                h.sym_trans[u * k + v] = val;
-                row_sum += val;
+                let mut bil = 0.0;
+                for d in 0..D {
+                    bil += rq_sym[u][d] * rk_sym[v][d];
+                }
+                let l_uv = b_out * p_uv.max(1e-9).ln() * 0.45
+                    + (bil * base_scale * 1.4)
+                    + h.sym_rel_bias[u * k + v];
+                logits[v] = l_uv;
+                if l_uv > max_logit {
+                    max_logit = l_uv;
+                }
+            }
+
+            let mut row_sum = 0.0;
+            for v in 0..k {
+                let w = (logits[v] - max_logit).clamp(-14.0, 0.0).exp().max(1e-9);
+                h.sym_trans[u * k + v] = w;
+                row_sum += w;
             }
             let inv = 1.0 / row_sum.max(1e-12);
             for v in 0..k {
@@ -664,12 +675,10 @@ impl PhisharpNet {
         }
     }
 
-    /// Un pas de dynamique connexionniste relationnelle non-réciproque sur l'état H.
     pub fn propagate_step(&self, h: &mut HypothesisState, pg: &PerceivedGraph, step_gain: f64) {
         let k = h.k;
         let gain = step_gain.clamp(0.05, 1.0);
 
-        // 1. Mise à jour des nœuds symboliques par flux effet/cause asymétrique
         let mut new_sym = vec![[0.0; D]; k];
         let mut msg_eff = [0.0; D];
         let mut msg_cau = [0.0; D];
@@ -710,13 +719,11 @@ impl PhisharpNet {
             matvec(&self.w_upd_cand, D, 3 * D, &concat, &mut cand);
             for d in 0..D {
                 let z = sigmoid(gate[d]) * gain;
-                let c = tanh_clamped(cand[d]);
-                new_sym[u][d] = (1.0 - z) * h.sym_states[u][d] + z * c;
+                new_sym[u][d] = (1.0 - z) * h.sym_states[u][d] + z * tanh_clamped(cand[d]);
             }
         }
         h.sym_states = new_sym;
 
-        // 2. Mise à jour des nœuds de segments contextuels (chaîne bidirectionnelle asymétrique + symboles)
         let mut new_ctx = [[0.0; D]; N_CTX];
         for c in 0..N_CTX {
             let mut agg_sym = [0.0; D];
@@ -747,7 +754,6 @@ impl PhisharpNet {
         }
         h.ctx_states = new_ctx;
 
-        // 3. Mise à jour des nœuds causaux latents (flux entrant vs sortant non-réciproque + contexte)
         let mut new_lat = [[0.0; D]; N_LAT];
         for i in 0..N_LAT {
             let mut agg_out = [0.0; D];
@@ -770,7 +776,6 @@ impl PhisharpNet {
             }
             let mut agg_ctx = [0.0; D];
             for c in 0..N_CTX {
-                // Affinité relationnelle douce entre contexte c et latent i
                 let w = ((c + i) % 3 == 0) as usize as f64 * 0.5 + 0.5;
                 for d in 0..D {
                     agg_ctx[d] += w * h.ctx_states[c][d];
@@ -812,7 +817,6 @@ impl PhisharpNet {
         ]
     }
 
-    /// Sérialisation binaire pure vers fichier `.phis` (zéro dépendance).
     pub fn save_to_file(&self, path: &Path) -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -821,7 +825,7 @@ impl PhisharpNet {
         }
         let file = File::create(path)?;
         let mut w = BufWriter::new(file);
-        w.write_all(b"PHIS0001")?;
+        w.write_all(b"PHIS0002")?;
         let flat = self.to_flat_vec();
         let len_u64 = flat.len() as u64;
         w.write_all(&len_u64.to_le_bytes())?;
@@ -837,10 +841,10 @@ impl PhisharpNet {
         let mut r = BufReader::new(file);
         let mut magic = [0u8; 8];
         r.read_exact(&mut magic)?;
-        if &magic != b"PHIS0001" {
+        if &magic != b"PHIS0002" {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "En-tête .phis invalide",
+                "En-tête .phis invalide (attendu PHIS0002)",
             ));
         }
         let mut len_buf = [0u8; 8];
