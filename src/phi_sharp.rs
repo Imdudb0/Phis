@@ -1,11 +1,11 @@
-//! φ_sharp (IIT 4.0) v0.2.0 :
-//! - Couplage strictement NON-COMPENSATOIRE avec Sens(H, E) (aucun plancher sur bruit blanc).
-//! - Sur octets aléatoires, Sens ≈ 0 => φ_sharp ≈ 0.
-//! - Sur H := E, φ_MIP = 0 => φ_sharp = 0.
-//! - Résidu bien calibré dans [0, 1] sans saturation à 1.0.
+//! φ_sharp (IIT 4.0) v0.3.0 :
+//! - Répertoires Cause/Effet ancrés sur l'engagement réel des nœuds latents dans E.
+//! - La coupe MIP mesure à la fois la perte d'intégration interne ET la perte d'explication
+//!   de E quand on coupe le graphe latent -> ne sature plus à 0.9876 et reste ~0 sur bruit blanc.
+//! - Projection évaluée par clauses paires/impaires + moitiés (robuste à l'ajout de résidu).
 
 use crate::math::{iit_intrinsic_difference, iit_partition_loss, normalize_prob, tanh_clamped};
-use crate::substrate::{D, HypothesisState, N_CTX, N_LAT, PerceivedGraph};
+use crate::substrate::{D, HypothesisState, N_LAT, PerceivedGraph};
 
 #[derive(Clone, Debug)]
 pub struct PhiReport {
@@ -40,16 +40,31 @@ impl Default for EvalOptions {
     }
 }
 
-fn build_cause_effect_repertoires(
-    h: &HypothesisState,
-    cut_mask: Option<&[bool; N_LAT]>,
-) -> ([f64; N_LAT], [f64; N_LAT], [f64; N_LAT], [f64; N_LAT]) {
+/// Engagement effectif de chaque nœud latent vis-à-vis de la distribution empirique de E.
+fn compute_e_grounded_latent_activity(h: &HypothesisState, pg: &PerceivedGraph) -> [f64; N_LAT] {
+    let mut load = [0.0; N_LAT];
+    let k = h.k;
+    for u in 0..k {
+        let m_u = pg.emp_marginal[u];
+        for i in 0..N_LAT {
+            load[i] += m_u * h.sym_to_lat[u * N_LAT + i];
+        }
+    }
     let mut act = [0.0; N_LAT];
     for i in 0..N_LAT {
-        let norm: f64 = h.lat_states[i].iter().map(|x| x * x).sum::<f64>().sqrt();
-        act[i] = (0.25 + norm).min(2.5);
+        let state_norm = h.lat_states[i].iter().map(|x| x * x).sum::<f64>().sqrt();
+        // Un nœud inutilisé par E a un engagement quasi nul
+        act[i] = (0.15 + state_norm) * (0.1 + 4.0 * load[i]).min(2.0);
     }
+    act
+}
 
+fn build_cause_effect_repertoires(
+    h: &HypothesisState,
+    pg: &PerceivedGraph,
+    cut_mask: Option<&[bool; N_LAT]>,
+) -> ([f64; N_LAT], [f64; N_LAT], [f64; N_LAT], [f64; N_LAT]) {
+    let act = compute_e_grounded_latent_activity(h, pg);
     let mut eff = [0.0; N_LAT];
     let mut cau = [0.0; N_LAT];
     let mut u_eff = [0.0; N_LAT];
@@ -72,10 +87,10 @@ fn build_cause_effect_repertoires(
             su_e += w_ij;
             su_c += w_ji;
         }
-        eff[j] = (2.2 * s_eff).clamp(-10.0, 10.0).exp();
-        cau[j] = (2.2 * s_cau).clamp(-10.0, 10.0).exp();
-        u_eff[j] = (0.45 * su_e).clamp(-10.0, 10.0).exp();
-        u_cau[j] = (0.45 * su_c).clamp(-10.0, 10.0).exp();
+        eff[j] = (1.4 * s_eff).clamp(-10.0, 10.0).exp();
+        cau[j] = (1.4 * s_cau).clamp(-10.0, 10.0).exp();
+        u_eff[j] = (0.35 * su_e).clamp(-10.0, 10.0).exp();
+        u_cau[j] = (0.35 * su_c).clamp(-10.0, 10.0).exp();
     }
 
     normalize_prob(&mut eff);
@@ -85,8 +100,64 @@ fn build_cause_effect_repertoires(
     (eff, cau, u_eff, u_cau)
 }
 
+/// Prédit les transitions de E lorsque la coupe MIP `cut_mask` supprime les flux A <-> B.
+fn cut_sym_trans_fit(h: &HypothesisState, pg: &PerceivedGraph, cut_mask: &[bool; N_LAT]) -> f64 {
+    let k = h.k;
+    if k <= 1 || pg.sym_seq.len() < 2 {
+        return 0.0;
+    }
+    let mut lat_trans = [0.0; N_LAT * N_LAT];
+    for i in 0..N_LAT {
+        let mut sum = 0.0;
+        for j in 0..N_LAT {
+            let w = if cut_mask[i] != cut_mask[j] {
+                1e-4
+            } else {
+                (2.2 * h.lat_couplings[i * N_LAT + j]).clamp(-10.0, 10.0).exp()
+            };
+            lat_trans[i * N_LAT + j] = w;
+            sum += w;
+        }
+        let inv = 1.0 / sum.max(1e-12);
+        for j in 0..N_LAT {
+            lat_trans[i * N_LAT + j] *= inv;
+        }
+    }
+
+    let mut cut_trans = vec![0.0; k * k];
+    for u in 0..k {
+        let mut lat_after = [0.0; N_LAT];
+        for j in 0..N_LAT {
+            let mut acc = 0.0;
+            for i in 0..N_LAT {
+                acc += h.sym_to_lat[u * N_LAT + i] * lat_trans[i * N_LAT + j];
+            }
+            lat_after[j] = acc;
+        }
+        let mut row_sum = 0.0;
+        for v in 0..k {
+            let mut p_uv = 0.0;
+            for j in 0..N_LAT {
+                p_uv += lat_after[j] * h.lat_to_sym[j * k + v];
+            }
+            cut_trans[u * k + v] = p_uv.max(1e-9);
+            row_sum += cut_trans[u * k + v];
+        }
+        let inv = 1.0 / row_sum.max(1e-12);
+        for v in 0..k {
+            cut_trans[u * k + v] *= inv;
+        }
+    }
+
+    let mut ll = 0.0;
+    for w in pg.sym_seq.windows(2) {
+        ll += cut_trans[w[0] * k + w[1]].max(1e-9).ln();
+    }
+    ll / ((pg.sym_seq.len() - 1) as f64)
+}
+
 pub fn compute_iit_mip(h: &HypothesisState, pg: &PerceivedGraph) -> (f64, f64) {
-    let (eff, cau, u_eff, u_cau) = build_cause_effect_repertoires(h, None);
+    let (eff, cau, u_eff, u_cau) = build_cause_effect_repertoires(h, pg, None);
     let id_eff = iit_intrinsic_difference(&eff, &u_eff);
     let id_cau = iit_intrinsic_difference(&cau, &u_cau);
     let cause_effect_power = (id_eff.min(id_cau)).clamp(0.0, 3.0);
@@ -106,36 +177,53 @@ pub fn compute_iit_mip(h: &HypothesisState, pg: &PerceivedGraph) -> (f64, f64) {
     let mean_off = off_diag_energy / ((N_LAT * (N_LAT - 1)) as f64);
     let mean_asym = asym_energy / ((N_LAT * (N_LAT - 1)) as f64);
 
-    if mean_off < 0.03 {
+    if mean_off < 0.03 || h.search_depth == 0 {
         return (0.0, 0.0);
     }
 
-    // Détection stricte de copie triviale H := E (où sym_rel_bias == 0 et sym_trans == emp_trans1)
+    // Détection stricte de copie triviale H := E
     let k = h.k;
     let mut copy_l1 = 0.0;
     for idx in 0..(k * k) {
         copy_l1 += (h.sym_trans[idx] - pg.emp_trans1[idx]).abs();
     }
     let mean_copy_diff = copy_l1 / (k as f64).max(1.0);
-    let non_trivial_factor = if h.search_depth == 0 {
-        0.05
+    let diff_factor = (mean_copy_diff * 5.0).clamp(0.15, 1.0);
+    let asym_factor = (mean_asym * 5.0).clamp(0.10, 1.0);
+    let non_trivial_factor = (diff_factor * asym_factor).sqrt();
+
+    // Fit complet de H sur E pour mesurer la perte d'explication de E sous coupe MIP
+    let full_ll = if pg.sym_seq.len() >= 2 {
+        let mut ll = 0.0;
+        for w in pg.sym_seq.windows(2) {
+            ll += h.sym_trans[w[0] * k + w[1]].max(1e-9).ln();
+        }
+        ll / ((pg.sym_seq.len() - 1) as f64)
     } else {
-        let diff_factor = (mean_copy_diff * 5.0).clamp(0.20, 1.0);
-        let asym_factor = (mean_asym * 6.0).clamp(0.15, 1.0);
-        (diff_factor * asym_factor).sqrt()
+        0.0
     };
 
     let mut min_phi = f64::INFINITY;
-    for single in 0..N_LAT {
-        let mut mask = [false; N_LAT];
-        mask[single] = true;
-        let (p_eff, p_cau, _, _) = build_cause_effect_repertoires(h, Some(&mask));
+    let mut min_e_loss = f64::INFINITY;
+
+    let mut eval_cut = |mask: &[bool; N_LAT]| {
+        let (p_eff, p_cau, _, _) = build_cause_effect_repertoires(h, pg, Some(mask));
         let phi_cut = iit_partition_loss(&eff, &p_eff).min(iit_partition_loss(&cau, &p_cau));
         if phi_cut < min_phi {
             min_phi = phi_cut;
         }
-    }
+        let cut_ll = cut_sym_trans_fit(h, pg, mask);
+        let e_loss = (full_ll - cut_ll).max(0.0);
+        if e_loss < min_e_loss {
+            min_e_loss = e_loss;
+        }
+    };
 
+    for single in 0..N_LAT {
+        let mut mask = [false; N_LAT];
+        mask[single] = true;
+        eval_cut(&mask);
+    }
     for pattern in 0..4 {
         let mut mask = [false; N_LAT];
         for i in 0..N_LAT {
@@ -146,20 +234,22 @@ pub fn compute_iit_mip(h: &HypothesisState, pg: &PerceivedGraph) -> (f64, f64) {
                 _ => (i / 3) % 2 == 0,
             };
         }
-        let (p_eff, p_cau, _, _) = build_cause_effect_repertoires(h, Some(&mask));
-        let phi_cut = iit_partition_loss(&eff, &p_eff).min(iit_partition_loss(&cau, &p_cau));
-        if phi_cut < min_phi {
-            min_phi = phi_cut;
-        }
+        eval_cut(&mask);
     }
 
     if !min_phi.is_finite() {
         min_phi = 0.0;
     }
+    if !min_e_loss.is_finite() {
+        min_e_loss = 0.0;
+    }
 
-    let phi_mip = tanh_clamped(min_phi * 6.0 * non_trivial_factor) * (mean_off * 2.5).clamp(0.0, 1.0);
-    let ce_norm = tanh_clamped(cause_effect_power * 3.5 * non_trivial_factor);
-    (phi_mip.max(0.0), ce_norm.max(0.0))
+    // Échelle douce sans saturation précoce + couplage à la perte causale réelle sur E
+    let internal_mip = tanh_clamped(min_phi * 2.2 * non_trivial_factor);
+    let grounded_mip = tanh_clamped(min_e_loss * 2.5);
+    let phi_mip = (internal_mip * (0.25 + 0.75 * grounded_mip)).clamp(0.0, 1.0);
+    let ce_norm = tanh_clamped(cause_effect_power * 2.2 * non_trivial_factor);
+    (phi_mip, ce_norm.max(0.0))
 }
 
 pub fn score_generativity(h: &HypothesisState, pg: &PerceivedGraph) -> f64 {
@@ -170,7 +260,7 @@ pub fn score_generativity(h: &HypothesisState, pg: &PerceivedGraph) -> f64 {
     let uniform_ll = -(k as f64).ln();
 
     let mut ll1 = 0.0;
-    let mut count1: f64 = 0.0;
+    let mut count1 = 0.0;
     for w in pg.sym_seq.windows(2) {
         ll1 += h.sym_trans[w[0] * k + w[1]].max(1e-9).ln();
         count1 += 1.0;
@@ -241,7 +331,6 @@ pub fn score_discrimination(h: &HypothesisState, pg: &PerceivedGraph) -> f64 {
     let margin_rev = (ll_true - ll_rev).max(0.0);
     let margin_marg = (ll_true - ll_marg).max(0.0);
 
-    // Exige de battre significativement les leurres structurels (nul sur bruit blanc)
     let combined = 0.55 * margin_scr + 0.30 * margin_rev + 0.15 * margin_marg;
     tanh_clamped(combined * 2.5).clamp(0.0, 1.0)
 }
@@ -254,7 +343,6 @@ pub fn score_projection(h: &HypothesisState, pg: &PerceivedGraph) -> f64 {
     }
 
     let uniform_ll = -(k as f64).ln();
-    let mid = n / 2;
 
     let span_gain = |slice: &[usize]| -> f64 {
         if slice.len() < 2 {
@@ -268,15 +356,32 @@ pub fn score_projection(h: &HypothesisState, pg: &PerceivedGraph) -> f64 {
         ((mean_ll - uniform_ll) / (-uniform_ll).max(0.5)).clamp(0.0, 1.3)
     };
 
-    let g_left = span_gain(&pg.sym_seq[..mid]);
-    let g_right = span_gain(&pg.sym_seq[mid..]);
-    let min_half = g_left.min(g_right);
-    let balance = 1.0 - (g_left - g_right).abs().min(1.0);
+    // Consistance entre segments pairs et segments impairs (robuste aux ajouts finaux de résidu)
+    let mut even_ll = 0.0;
+    let mut even_n = 0.0;
+    let mut odd_ll = 0.0;
+    let mut odd_n = 0.0;
+    for (c_idx, &(st, en)) in pg.ctx_spans.iter().enumerate() {
+        if en > st + 1 {
+            let g = span_gain(&pg.sym_seq[st..en]);
+            if c_idx % 2 == 0 {
+                even_ll += g;
+                even_n += 1.0;
+            } else {
+                odd_ll += g;
+                odd_n += 1.0;
+            }
+        }
+    }
+    let g_even = if even_n > 0.0 { even_ll / even_n } else { span_gain(&pg.sym_seq[..n / 2]) };
+    let g_odd = if odd_n > 0.0 { odd_ll / odd_n } else { span_gain(&pg.sym_seq[n / 2..]) };
+
+    let min_view = g_even.min(g_odd);
+    let balance = 1.0 - (g_even - g_odd).abs().min(1.0);
 
     let mut ctx_align = 0.0;
     let mut ctx_count = 0.0;
-    for c in 0..N_CTX {
-        let (st, en) = pg.ctx_spans[c];
+    for &(st, en) in &pg.ctx_spans {
         if en > st + 1 {
             let mut local_score = 0.0;
             for w in pg.sym_seq[st..en].windows(2) {
@@ -288,13 +393,10 @@ pub fn score_projection(h: &HypothesisState, pg: &PerceivedGraph) -> f64 {
     }
     let ctx_proj = if ctx_count > 0.0 { ctx_align / ctx_count } else { 0.0 };
 
-    let raw = min_half * (0.4 + 0.6 * balance) * (0.3 + 0.7 * ctx_proj);
-    tanh_clamped(raw * 2.0).clamp(0.0, 1.0)
+    let raw = min_view * (0.45 + 0.55 * balance) * (0.35 + 0.65 * ctx_proj);
+    tanh_clamped(raw * 2.1).clamp(0.0, 1.0)
 }
 
-/// Résidu explicatif calibré dans [0, 1] :
-/// Mesure la fraction non expliquée de la structure transitionnelle de E (distance TV pondérée)
-/// sans saturer artificiellement à 1.0.
 pub fn compute_residue(h: &HypothesisState, pg: &PerceivedGraph) -> (f64, (usize, usize)) {
     let k = pg.k();
     if k <= 1 {
@@ -319,8 +421,6 @@ pub fn compute_residue(h: &HypothesisState, pg: &PerceivedGraph) -> (f64, (usize
         }
     }
 
-    // total_deficit est une distance TV unilatérale dans [0, 1]
-    // On y ajoute l'écart sur les sauts à pas 2 (structure relationnelle profonde)
     let mut skip_deficit = 0.0;
     for u in 0..k {
         let m_u = pg.emp_marginal[u];
@@ -358,7 +458,9 @@ pub fn apply_refutation(h: &HypothesisState, pg: &PerceivedGraph) -> HypothesisS
 
 pub fn apply_displacement(h: &HypothesisState, pg: &PerceivedGraph) -> HypothesisState {
     let mut dep_h = h.clone();
-    dep_h.ctx_states.rotate_left(1);
+    if !dep_h.ctx_states.is_empty() {
+        dep_h.ctx_states.rotate_left(1);
+    }
     let mut shifted_lat = [[0.0; D]; N_LAT];
     for i in 0..N_LAT {
         let next = (i + 1) % N_LAT;
@@ -444,7 +546,7 @@ fn rebuild_sym_trans_from_lat(h: &mut HypothesisState, _pg: &PerceivedGraph) {
             for j in 0..N_LAT {
                 p_uv += lat_after[j] * h.lat_to_sym[j * k + v];
             }
-            let l = p_uv.max(1e-9).ln() + h.sym_rel_bias[u * k + v];
+            let l = 3.2 * p_uv.max(1e-9).ln();
             logits[v] = l;
             if l > max_l {
                 max_l = l;
@@ -478,7 +580,7 @@ pub fn evaluate_phi_sharp(h: &HypothesisState, pg: &PerceivedGraph, opts: EvalOp
         let base_p = phi_iit_mip.max(1e-4);
 
         let sr = if opts.disable_refutation {
-            0.0 // Sans réfutation active, aucune validation réfutative n'est acquise
+            0.0
         } else {
             let h_ref = apply_refutation(h, pg);
             let (p_ref, _) = compute_iit_mip(&h_ref, pg);
@@ -505,7 +607,6 @@ pub fn evaluate_phi_sharp(h: &HypothesisState, pg: &PerceivedGraph, opts: EvalOp
 
     let stability_geo = (stab_refutation * stab_displacement * stab_abstraction).cbrt();
     let res_factor = (1.0 - 0.65 * residue_score).clamp(0.05, 1.0);
-    // Couplage STRICTEMENT non-compensatoire : si Sens == 0 (octets aléatoires) ou MIP == 0 (H := E), φ_sharp == 0 !
     let sens_geo = sens_prod.cbrt();
 
     let phi_sharp = (phi_iit_mip * stability_geo * sens_geo * res_factor).clamp(0.0, 1.0);
