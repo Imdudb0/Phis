@@ -1,3 +1,23 @@
-[1m[92m    Finished[0m `release` profile [optimized] target(s) in 0.02s
-[1m[92m     Running[0m `target/release/phisharp ask --model out/sharp.phis --file gram.eff`
-Erreur lecture effet 'gram.eff': No such file or directory (os error 2)
+[1m[92m    Finished[0m `release` profile [optimized] target(s) in 0.01s
+[1m[92m     Running[0m `target/release/phisharp ask --model out/sharp.phis --file out/gram.eff`
+=== PHISHARP ABDUCTION REPORT (v0.2) ===
+Effet (E)       : 'out/gram.eff' (40 octets)
+φ_sharp         : +0.6398
+  Générativité  : 0.6502  (résidu moyen = 0.1957)
+  Discrimination: 0.7718
+  Projection    : 0.7602  [réfut=0.542 | dépl=0.896 | abst=0.843]
+  Intégration   : 0.5242  (MIP exacte sur 31 coupes : perte=0.2122, coupe {0,2,3,4,5} | {1})
+
+Trajectoire abductive (résidu) :
+  t0=0.675 -> t1=0.588 -> t2=0.539 -> t3=0.524 -> t4=0.405 -> t5=0.220 -> t6=0.196  (gain/t0=+0.710, rebond=0.0000)
+
+Noyau causal auto-spécifié (offset 32, densité explicative max) :
+  ASCII : "o|,"9nf}"
+  HEX   : 6f 7c 2c 22 39 6e 66 7d
+
+Zones de tension (résidu maximal dans perceived.eff) :
+  offset  18 | 0x24 '$' | résidu = 1.4620
+  offset  12 | 0x7d '}' | résidu = 1.3319
+  offset  21 | 0x22 '"' | résidu = 0.4150
+  offset   9 | 0x39 '9' | résidu = 0.4150
+  offset  27 | 0x39 '9' | résidu = 0.4097
