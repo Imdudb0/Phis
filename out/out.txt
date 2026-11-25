@@ -1,21 +1,21 @@
-[1m[92m    Finished[0m `release` profile [optimized] target(s) in 0.02s
+[1m[92m    Finished[0m `release` profile [optimized] target(s) in 0.18s
 [1m[92m     Running[0m `target/release/phisharp train --out out/sharp.phis --steps 250`
-Entraînement Phisharp (1160 paramètres, 250 étapes, 24 paires ES, 4 threads)...
-step    1/250  | phi_sharp=-0.0767 | Gen=0.145 Disc=0.049 Proj=0.766 IIT=0.093 | res=0.7737 (0.0s)
-step   25/250  | phi_sharp=+0.4000 | Gen=0.359 Disc=0.229 Proj=0.821 IIT=0.632 | res=0.4432 (0.7s)
-step   50/250  | phi_sharp=+0.6737 | Gen=0.428 Disc=0.260 Proj=0.831 IIT=0.992 | res=0.3617 (1.3s)
-step   75/250  | phi_sharp=+0.7187 | Gen=0.416 Disc=0.397 Proj=0.826 IIT=0.959 | res=0.3752 (2.0s)
-step  100/250  | phi_sharp=+0.7798 | Gen=0.447 Disc=0.462 Proj=0.823 IIT=0.956 | res=0.3473 (2.6s)
-step  125/250  | phi_sharp=+0.7790 | Gen=0.406 Disc=0.449 Proj=0.808 IIT=0.993 | res=0.3691 (3.2s)
-step  150/250  | phi_sharp=+0.7266 | Gen=0.376 Disc=0.462 Proj=0.790 IIT=0.995 | res=0.4237 (3.8s)
-step  175/250  | phi_sharp=+0.8577 | Gen=0.464 Disc=0.615 Proj=0.823 IIT=0.995 | res=0.3228 (4.4s)
-step  200/250  | phi_sharp=+0.9774 | Gen=0.540 Disc=0.651 Proj=0.834 IIT=0.996 | res=0.2577 (5.1s)
-step  225/250  | phi_sharp=+1.0876 | Gen=0.644 Disc=0.708 Proj=0.888 IIT=0.986 | res=0.1949 (5.7s)
-step  250/250  | phi_sharp=+0.9614 | Gen=0.535 Disc=0.657 Proj=0.838 IIT=0.937 | res=0.2804 (6.3s)
+Entraînement Phisharp v0.2 (1352 paramètres, 250 étapes, 24 paires ES, 4 threads)...
+step    1/250  | φ=+0.0157 | Gen=0.200 Disc=0.242 Proj=0.746 IIT=0.058 | res=0.742 bnc=0.069 coll=0.292 (0.1s)
+step   25/250  | φ=+0.3255 | Gen=0.386 Disc=0.561 Proj=0.781 IIT=0.144 | res=0.453 bnc=0.005 coll=0.210 (0.9s)
+step   50/250  | φ=+0.4730 | Gen=0.560 Disc=0.617 Proj=0.841 IIT=0.177 | res=0.283 bnc=0.005 coll=0.109 (1.8s)
+step   75/250  | φ=+0.5111 | Gen=0.599 Disc=0.641 Proj=0.858 IIT=0.197 | res=0.249 bnc=0.001 coll=0.061 (2.6s)
+step  100/250  | φ=+0.5494 | Gen=0.624 Disc=0.674 Proj=0.856 IIT=0.259 | res=0.229 bnc=0.001 coll=0.079 (3.4s)
+step  125/250  | φ=+0.5284 | Gen=0.624 Disc=0.556 Proj=0.828 IIT=0.315 | res=0.229 bnc=0.007 coll=0.075 (4.3s)
+step  150/250  | φ=+0.6097 | Gen=0.661 Disc=0.748 Proj=0.833 IIT=0.390 | res=0.206 bnc=0.004 coll=0.121 (5.1s)
+step  175/250  | φ=+0.6270 | Gen=0.663 Disc=0.744 Proj=0.830 IIT=0.458 | res=0.202 bnc=0.003 coll=0.105 (6.0s)
+step  200/250  | φ=+0.6169 | Gen=0.663 Disc=0.720 Proj=0.823 IIT=0.443 | res=0.201 bnc=0.010 coll=0.133 (6.8s)
+step  225/250  | φ=+0.6188 | Gen=0.634 Disc=0.729 Proj=0.833 IIT=0.492 | res=0.214 bnc=0.014 coll=0.089 (7.6s)
+step  250/250  | φ=+0.6216 | Gen=0.685 Disc=0.618 Proj=0.836 IIT=0.502 | res=0.175 bnc=0.014 coll=0.067 (8.5s)
 
 --- Évaluation post-hoc (Abstraction Méta-relationnelle, alphabets disjoints) ---
-  Même cause cachée (0 octet commun) : cos = +0.6438
-  Causes cachées différentes         : cos = +0.4831
-  Marge d'abstraction                : +0.1607
+  Même cause cachée (0 octet commun) : cos = +0.9140
+  Causes cachées différentes         : cos = +0.0772
+  Marge d'abstraction                : +0.8369
 
 Modèle sauvegardé dans 'out/sharp.phis'.
