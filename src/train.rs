@@ -1,6 +1,6 @@
-//! Entraînement FERMÉ v0.3.0 : PTGRS (E seul) + φ_sharp + Sens + Résidu.
-//! Ici, aucune béquille externe ne donne sens_min gratuitement : le réseau doit
-//! véritablement apprendre à abduire via ses matrices non-réciproques et w_res_*.
+//! Entraînement FERMÉ v0.3.1 : PTGRS (E seul) + φ_sharp + Sens + Résidu.
+//! L'objectif inclut une pente douce sur (phi_iit_mip + sens_geo) afin que NES
+//! décolle proprement dès l'itération 1 sans rester piégé sur un produit nul.
 
 use std::path::Path;
 
@@ -24,11 +24,11 @@ impl Default for TrainConfig {
     fn default() -> Self {
         Self {
             iterations: 100,
-            pop_pairs: 16,
+            pop_pairs: 20,
             batch_size: 4,
             search_budget: 8,
-            sigma: 0.05,
-            lr: 0.018,
+            sigma: 0.055,
+            lr: 0.022,
             seed: 2026_11_24,
         }
     }
@@ -67,8 +67,14 @@ fn evaluate_batch_fitness(
         let rep = &res.final_report;
 
         let traj_gain = (rep.phi_sharp - phi0).max(0.0);
-        // Pression forte sur sens_min + phi_sharp - residue pour forcer V_lat à vraiment expliquer E
-        let obj = rep.phi_sharp + 0.40 * traj_gain + 0.55 * rep.sens_min - 0.30 * rep.residue_score;
+        let sens_geo = rep.sens_prod.cbrt();
+        // Signal fermé : φ_sharp + trajectoire + termes de démarrage non-écrasés (MIP, Sens, -Résidu)
+        let obj = 1.4 * rep.phi_sharp
+            + 0.40 * traj_gain
+            + 0.35 * rep.phi_iit_mip
+            + 0.45 * sens_geo
+            + 0.35 * rep.sens_min
+            - 0.30 * rep.residue_score;
 
         sum_obj += obj;
         sum_phi += rep.phi_sharp;
