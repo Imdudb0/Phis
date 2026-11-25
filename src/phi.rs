@@ -1,4 +1,4 @@
-use crate::graph::{AbductionTrace, NODES, PhiGraph, REL_DIM, RawSubstrate, STATE_DIM};
+use crate::graph::{AbductionTrace, NODES, PhiGraph, REL_DIM, RawSubstrate, SEARCH_STEPS, STATE_DIM};
 use crate::rng::Rng;
 
 const SINGLETON_MASKS: [u8; 6] = [
@@ -6,9 +6,11 @@ const SINGLETON_MASKS: [u8; 6] = [
 ];
 
 #[derive(Clone, Copy, Debug)]
-pub struct Span {
-    pub start: usize,
-    pub end: usize,
+pub struct DiscoveredRegime {
+    pub core_start: usize,
+    pub core_end: usize,
+    pub referent: Option<(usize, usize)>,
+    pub mean_gate: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -21,9 +23,10 @@ pub struct PreparedEpisode {
     pub cuts: [u8; 6],
 }
 
+/// Flux continu brut : aucun découpage préalable sur `\n` ou autre délimiteur.
 #[derive(Clone, Debug)]
 pub struct PreparedComposite {
-    pub blocks: Vec<RawSubstrate>,
+    pub stream: RawSubstrate,
 }
 
 #[derive(Clone, Debug)]
@@ -33,6 +36,8 @@ pub struct PhiReport {
     pub discrimination: f32,
     pub projection: f32,
     pub integration: f32,
+    pub gate_contrast: f32,
+    pub mean_gate: f32,
     pub mip_loss: f32,
     pub mip_mask: u8,
     pub residual: f32,
@@ -63,6 +68,7 @@ pub struct CompositePhi {
     pub r_rest: f32,
     pub selectivity: f32,
     pub mean_residual: f32,
+    pub regimes_found: usize,
     pub top_pair: (usize, usize),
 }
 
@@ -89,32 +95,6 @@ pub fn cosine_sim(a: &[f32; STATE_DIM], b: &[f32; STATE_DIM]) -> f32 {
         0.0
     } else {
         (dot / denom).clamp(-1.0, 1.0)
-    }
-}
-
-pub fn segment_effect(bytes: &[u8]) -> Vec<Span> {
-    let mut spans = Vec::new();
-    let mut start = 0usize;
-    for i in 0..=bytes.len() {
-        if i == bytes.len() || bytes[i] == b'\n' {
-            let s = start;
-            let mut e = i;
-            while e > s && bytes[e - 1] == b'\r' {
-                e -= 1;
-            }
-            if e.saturating_sub(s) >= 6 {
-                spans.push(Span { start: s, end: e });
-            }
-            start = i + 1;
-        }
-    }
-    if spans.len() >= 2 {
-        spans
-    } else {
-        vec![Span {
-            start: 0,
-            end: bytes.len(),
-        }]
     }
 }
 
@@ -187,19 +167,9 @@ impl PreparedEpisode {
 
 impl PreparedComposite {
     pub fn from_bytes(bytes: &[u8]) -> Self {
-        let spans = segment_effect(bytes);
-        let mut blocks = Vec::with_capacity(spans.len());
-        for sp in spans {
-            let slice = &bytes[sp.start..sp.end];
-            let full_sub = RawSubstrate::from_bytes(slice);
-            let (cs, ce, _) = full_sub.intrinsic_causal_core();
-            if cs == 0 && ce == slice.len() {
-                blocks.push(full_sub);
-            } else {
-                blocks.push(RawSubstrate::from_bytes(&slice[cs..ce]));
-            }
+        Self {
+            stream: RawSubstrate::from_bytes(bytes),
         }
-        Self { blocks }
     }
 }
 
@@ -215,12 +185,282 @@ fn byte_overlap_ratio(a: &[u8], b: &[u8]) -> f32 {
     (shared as f32) / (a.len() as f32)
 }
 
+fn abductive_discontinuity(
+    graph: &PhiGraph,
+    rels: &[[f32; REL_DIM]],
+    left: (usize, usize),
+    right: (usize, usize),
+    steps: usize,
+) -> f32 {
+    let l_rels = &rels[left.0..left.1];
+    let r_rels = &rels[right.0..right.1];
+    let hl = graph.abduce_with_steps(l_rels, None, steps);
+    let hr = graph.abduce_with_steps(r_rels, None, steps);
+
+    let cos_lr = cosine_sim(&hl.final_state, &hr.final_state);
+    let state_disc = 0.5 * (1.0 - cos_lr);
+
+    let (_, _, e_lr) = graph.evaluate_hypothesis(&hl.final_state, r_rels);
+    let (_, _, e_rl) = graph.evaluate_hypothesis(&hr.final_state, l_rels);
+    let self_e = 0.5 * (hl.final_mean_err + hr.final_mean_err);
+    let cross_e = 0.5 * (e_lr + e_rl);
+    let err_disc = ((cross_e - self_e) / (cross_e + 0.08)).clamp(0.0, 1.0);
+
+    0.55 * state_disc + 0.45 * err_disc
+}
+
+/// Scinde un îlot actif continu aux transitions de régime causal par discontinuité abductive D(t),
+/// sans aucun séparateur codé en dur.
+fn split_run_by_abduction(
+    graph: &PhiGraph,
+    rels: &[[f32; REL_DIM]],
+    s: usize,
+    e: usize,
+    exact: bool,
+) -> Vec<(usize, usize)> {
+    let len = e.saturating_sub(s);
+    if len < 34 {
+        return vec![(s, e)];
+    }
+
+    let step = if exact { 4 } else { 6 };
+    let win = if exact { 16 } else { 18 };
+    let steps = if exact { SEARCH_STEPS } else { 4 };
+    let offset = win / step;
+
+    let mut anchors = Vec::new();
+    let mut pos = s;
+    while pos + win <= e {
+        anchors.push(pos);
+        pos += step;
+    }
+    if anchors.len() <= offset {
+        return vec![(s, e)];
+    }
+
+    // Une seule abduction par fenêtre ancrée : chaque point de coupe compare fenêtre k et fenêtre k + offset.
+    let traces: Vec<AbductionTrace> = anchors
+        .iter()
+        .map(|&a| graph.abduce_with_steps(&rels[a..a + win], None, steps))
+        .collect();
+
+    let mut candidates: Vec<(usize, f32)> = Vec::new();
+    for k in 0..(anchors.len() - offset) {
+        let split_p = anchors[k] + win;
+        if split_p < s + 14 || e.saturating_sub(split_p) < 14 {
+            continue;
+        }
+        let hl = &traces[k];
+        let hr = &traces[k + offset];
+        let l_rels = &rels[anchors[k]..anchors[k] + win];
+        let r_rels = &rels[anchors[k + offset]..anchors[k + offset] + win];
+
+        let state_disc = 0.5 * (1.0 - cosine_sim(&hl.final_state, &hr.final_state));
+        let (_, _, e_lr) = graph.evaluate_hypothesis(&hl.final_state, r_rels);
+        let (_, _, e_rl) = graph.evaluate_hypothesis(&hr.final_state, l_rels);
+        let self_e = 0.5 * (hl.final_mean_err + hr.final_mean_err);
+        let cross_e = 0.5 * (e_lr + e_rl);
+        let err_disc = ((cross_e - self_e) / (cross_e + 0.08)).clamp(0.0, 1.0);
+        let disc = 0.55 * state_disc + 0.45 * err_disc;
+        candidates.push((split_p, disc));
+    }
+
+    // Sélection des pics locaux de discontinuité > 0.36 espacés d'au moins 14 octets
+    let mut peaks: Vec<(usize, f32)> = Vec::new();
+    for i in 0..candidates.len() {
+        let (p, d) = candidates[i];
+        if d <= 0.36 {
+            continue;
+        }
+        let left_ok = i == 0 || d >= candidates[i - 1].1;
+        let right_ok = i + 1 == candidates.len() || d >= candidates[i + 1].1;
+        if left_ok && right_ok {
+            peaks.push((p, d));
+        }
+    }
+    peaks.sort_by(|a, b| b.1.total_cmp(&a.1));
+
+    let mut chosen: Vec<usize> = Vec::new();
+    for (p, _) in peaks {
+        if chosen.iter().all(|&c| c.abs_diff(p) >= 14) {
+            chosen.push(p);
+        }
+    }
+    if chosen.is_empty() {
+        return vec![(s, e)];
+    }
+    chosen.sort_unstable();
+
+    // En mode `ask` (exact), raffine chaque frontière à l'octet près dans [p-3..=p+3]
+    if exact {
+        for p in &mut chosen {
+            let mut best_p = *p;
+            let mut best_d = f32::NEG_INFINITY;
+            let lo = (*p).saturating_sub(3).max(s + 12);
+            let hi = (*p + 3).min(e.saturating_sub(12));
+            for cand in lo..=hi {
+                let l_start = cand.saturating_sub(16).max(s);
+                let r_end = (cand + 16).min(e);
+                let d = abductive_discontinuity(graph, rels, (l_start, cand), (cand, r_end), SEARCH_STEPS);
+                if d > best_d {
+                    best_d = d;
+                    best_p = cand;
+                }
+            }
+            *p = best_p;
+        }
+    }
+
+    let mut segs = Vec::with_capacity(chosen.len() + 1);
+    let mut cur = s;
+    for p in chosen {
+        if p >= cur + 10 && e >= p + 10 {
+            segs.push((cur, p));
+            cur = p;
+        }
+    }
+    segs.push((cur, e));
+    segs
+}
+
+/// Découvre automatiquement les régimes causaux et leurs référents passifs sur un flux
+/// d'octets brut continu : zéro `\n`, zéro séparateur, 100% piloté par `PhiGraph`.
+pub fn discover_causal_regimes_from_encoded(
+    graph: &PhiGraph,
+    rels: &[[f32; REL_DIM]],
+    gates: &[f32],
+    exact: bool,
+) -> Vec<DiscoveredRegime> {
+    let n = rels.len();
+    if n < 12 {
+        let mg = if n == 0 {
+            0.0
+        } else {
+            gates.iter().sum::<f32>() / (n as f32)
+        };
+        return vec![DiscoveredRegime {
+            core_start: 0,
+            core_end: n,
+            referent: None,
+            mean_gate: mg,
+        }];
+    }
+
+    // Lissage minimal (rayon 1) pour éviter les micro-coupures d'un octet
+    let mut smooth = vec![0.0f32; n];
+    for t in 0..n {
+        let lo = t.saturating_sub(1);
+        let hi = (t + 1).min(n - 1);
+        let sum: f32 = gates[lo..=hi].iter().sum();
+        smooth[t] = sum / ((hi - lo + 1) as f32);
+    }
+
+    // 1. Îlots actifs issus de la porte causale neuronale g(t)
+    let mut raw_runs: Vec<(usize, usize)> = Vec::new();
+    let mut in_run = false;
+    let mut run_start = 0usize;
+    for t in 0..n {
+        if smooth[t] >= 0.45 {
+            if !in_run {
+                in_run = true;
+                run_start = t;
+            }
+        } else if in_run {
+            raw_runs.push((run_start, t));
+            in_run = false;
+        }
+    }
+    if in_run {
+        raw_runs.push((run_start, n));
+    }
+
+    // Fusionne les micro-trous <= 3 octets (ponts uniques internes à un moule)
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (s, e) in raw_runs {
+        if let Some(last) = merged.last_mut()
+            && s.saturating_sub(last.1) <= 3
+        {
+            last.1 = e;
+            continue;
+        }
+        merged.push((s, e));
+    }
+
+    // Élimine les micro-blips accidentels < 10 octets (ex: mini-palindrome dans une étiquette)
+    let active_runs: Vec<(usize, usize)> = merged
+        .into_iter()
+        .filter(|&(s, e)| e.saturating_sub(s) >= 10)
+        .collect();
+
+    if active_runs.is_empty() {
+        let mg = gates.iter().sum::<f32>() / (n as f32);
+        return vec![DiscoveredRegime {
+            core_start: 0,
+            core_end: n,
+            referent: None,
+            mean_gate: mg,
+        }];
+    }
+
+    // 2. Scinde les îlots qui contiennent plusieurs régimes causaux collés via D(t)
+    let mut cores: Vec<(usize, usize)> = Vec::new();
+    for (s, e) in active_runs {
+        let split = split_run_by_abduction(graph, rels, s, e, exact);
+        cores.extend(split);
+    }
+
+    // 3. Associe les zones passives adjacentes comme référents induits (préfixe ou suffixe)
+    let k = cores.len();
+    let lead_gap = cores[0].0;
+    let trail_gap = n.saturating_sub(cores[k - 1].1);
+    let suffix_mode = trail_gap >= 3 && lead_gap < 3;
+
+    let mut out = Vec::with_capacity(k);
+    for i in 0..k {
+        let (cs, ce) = cores[i];
+        let mg = gates[cs..ce].iter().sum::<f32>() / ((ce - cs).max(1) as f32);
+
+        let prev_end = if i == 0 { 0 } else { cores[i - 1].1 };
+        let next_start = if i + 1 == k { n } else { cores[i + 1].0 };
+
+        let referent = if suffix_mode {
+            if next_start.saturating_sub(ce) >= 3 {
+                Some((ce, next_start))
+            } else {
+                None
+            }
+        } else if cs.saturating_sub(prev_end) >= 3 {
+            Some((prev_end, cs))
+        } else {
+            None
+        };
+
+        out.push(DiscoveredRegime {
+            core_start: cs,
+            core_end: ce,
+            referent,
+            mean_gate: mg,
+        });
+    }
+    out
+}
+
+pub fn discover_causal_regimes(
+    graph: &PhiGraph,
+    bytes: &[u8],
+    exact: bool,
+) -> Vec<DiscoveredRegime> {
+    let sub = RawSubstrate::from_bytes(bytes);
+    let (rels, gates) = graph.encode_with_gate(&sub);
+    discover_causal_regimes_from_encoded(graph, &rels, &gates, exact)
+}
+
 pub fn compute_phi_sharp_prepared(
     graph: &PhiGraph,
     prep: &PreparedEpisode,
     exact_mip: bool,
 ) -> PhiReport {
-    let rels = graph.encode_relations(&prep.orig);
+    let (rels, gates_orig) = graph.encode_with_gate(&prep.orig);
     let trace = graph.abduce(&rels, None);
     let residual = trace.final_mean_err;
 
@@ -235,14 +475,18 @@ pub fn compute_phi_sharp_prepared(
 
     let generativity = (-2.2 * residual).exp().clamp(1e-4, 1.0);
 
-    // 1. Discrimination
-    let neg_rels = graph.encode_relations(&prep.neg);
+    // 1. Discrimination + contraste de la porte causale neuronale (structuré vs mélangé)
+    let (neg_rels, gates_neg) = graph.encode_with_gate(&prep.neg);
     let (_, _, cross_err) = graph.evaluate_hypothesis(&trace.final_state, &neg_rels);
     let neg_trace = graph.abduce(&neg_rels, None);
 
     let err_gap = ((cross_err - residual) / (cross_err + 0.05)).clamp(0.0, 1.0);
     let state_gap = (1.0 - cosine_sim(&trace.final_state, &neg_trace.final_state)).clamp(0.0, 1.0);
     let discrimination = (0.65 * err_gap + 0.35 * state_gap).clamp(1e-4, 1.0);
+
+    let mean_g_orig = gates_orig.iter().sum::<f32>() / (gates_orig.len().max(1) as f32);
+    let mean_g_neg = gates_neg.iter().sum::<f32>() / (gates_neg.len().max(1) as f32);
+    let gate_contrast = (mean_g_orig * (1.0 - mean_g_neg)).clamp(0.0, 1.0);
 
     // 2. Projection (réfutation, déplacement, abstraction par bijection arbitraire)
     let ref_rels = graph.encode_relations(&prep.refut);
@@ -287,7 +531,8 @@ pub fn compute_phi_sharp_prepared(
 
     // 4. Agrégation
     let conj = (generativity * discrimination * projection * (0.2 + 0.8 * integration)).powf(0.25);
-    let phi_sharp = 0.90 * conj + 0.10 * traj_gain - 0.30 * residual - 0.30 * bounce_pen;
+    let phi_sharp =
+        0.85 * conj + 0.10 * traj_gain + 0.15 * gate_contrast - 0.30 * residual - 0.30 * bounce_pen;
 
     PhiReport {
         phi_sharp,
@@ -295,6 +540,8 @@ pub fn compute_phi_sharp_prepared(
         discrimination,
         projection,
         integration,
+        gate_contrast,
+        mean_gate: mean_g_orig,
         mip_loss,
         mip_mask,
         residual,
@@ -317,41 +564,43 @@ pub fn compute_phi_sharp(
     compute_phi_sharp_prepared(graph, &prep, exact_mip)
 }
 
-/// Signal non-supervisé de Projection Référentielle sur les noyaux intrinsèques de chaque bloc.
+/// Signal non-supervisé sur flux continu brut : découvre les régimes via `PhiGraph` seul
+/// puis mesure la sélectivité causale de la matrice de résonance réciproque.
 pub fn compute_composite_phi_prepared(
     graph: &PhiGraph,
     prep: &PreparedComposite,
 ) -> CompositePhi {
-    let m = prep.blocks.len();
+    let (rels, gates) = graph.encode_with_gate(&prep.stream);
+    let regimes = discover_causal_regimes_from_encoded(graph, &rels, &gates, false);
+    let m = regimes.len();
     if m < 2 {
         return CompositePhi {
-            score: 0.0,
+            score: -0.25,
             r_top: 0.0,
             r_rest: 0.0,
             selectivity: 0.0,
             mean_residual: 1.0,
+            regimes_found: m,
             top_pair: (0, 0),
         };
     }
 
-    let mut rels_list = Vec::with_capacity(m);
     let mut traces = Vec::with_capacity(m);
     let mut sum_res = 0.0f32;
-
-    for block in &prep.blocks {
-        let r = graph.encode_relations(block);
-        let tr = graph.abduce(&r, None);
+    for reg in &regimes {
+        let tr = graph.abduce(&rels[reg.core_start..reg.core_end], None);
         sum_res += tr.final_mean_err;
-        rels_list.push(r);
         traces.push(tr);
     }
     let mean_residual = sum_res / (m as f32);
 
     let mut pairs: Vec<(f32, usize, usize)> = Vec::with_capacity(m * (m - 1) / 2);
     for i in 0..m {
+        let ri = &rels[regimes[i].core_start..regimes[i].core_end];
         for j in (i + 1)..m {
-            let (_, _, e_ij) = graph.evaluate_hypothesis(&traces[i].final_state, &rels_list[j]);
-            let (_, _, e_ji) = graph.evaluate_hypothesis(&traces[j].final_state, &rels_list[i]);
+            let rj = &rels[regimes[j].core_start..regimes[j].core_end];
+            let (_, _, e_ij) = graph.evaluate_hypothesis(&traces[i].final_state, rj);
+            let (_, _, e_ji) = graph.evaluate_hypothesis(&traces[j].final_state, ri);
             let cross_gen = (-2.2 * 0.5 * (e_ij + e_ji)).exp().clamp(0.0, 1.0);
             let cos_res = 0.5 * (1.0 + cosine_sim(&traces[i].final_state, &traces[j].final_state));
             let r_ij = (cross_gen * cos_res).sqrt();
@@ -367,7 +616,7 @@ pub fn compute_composite_phi_prepared(
         0.0
     };
     let selectivity = r_top * (1.0 - r_rest);
-    let score = selectivity - 0.15 * mean_residual;
+    let score = selectivity - 0.18 * mean_residual;
 
     CompositePhi {
         score,
@@ -375,6 +624,7 @@ pub fn compute_composite_phi_prepared(
         r_rest,
         selectivity,
         mean_residual,
+        regimes_found: m,
         top_pair: (top_i, top_j),
     }
 }
@@ -384,41 +634,25 @@ pub fn compute_composite_phi(graph: &PhiGraph, bytes: &[u8]) -> CompositePhi {
     compute_composite_phi_prepared(graph, &prep)
 }
 
-/// Projection Référentielle réciproque sans cherry-picking :
-/// chaque moule est d'abord réduit à son noyau intrinsèque (détachant son référent passif),
-/// puis comparé réciproquement à la cible.
-pub fn project_query_to_molds(
+/// Projection Référentielle réciproque sur les régimes découverts par `PhiGraph`.
+pub fn project_query_to_regimes(
     graph: &PhiGraph,
     bytes: &[u8],
-    spans: &[Span],
+    regimes: &[DiscoveredRegime],
     query_idx: usize,
 ) -> Vec<ProjectionMatch> {
-    let q_sp = spans[query_idx];
-    let q_bytes = &bytes[q_sp.start..q_sp.end];
-    let q_sub = RawSubstrate::from_bytes(q_bytes);
-    let (qs, qe, _) = q_sub.intrinsic_causal_core();
-    let q_core_bytes = &q_bytes[qs..qe];
-    let q_rels = if qs == 0 && qe == q_bytes.len() {
-        graph.encode_relations(&q_sub)
-    } else {
-        graph.encode_bytes(q_core_bytes)
-    };
+    let q_reg = regimes[query_idx];
+    let q_bytes = &bytes[q_reg.core_start..q_reg.core_end];
+    let q_rels = graph.encode_bytes(q_bytes);
     let q_trace = graph.abduce(&q_rels, None);
 
-    let mut matches = Vec::with_capacity(spans.len().saturating_sub(1));
-    for (idx, sp) in spans.iter().enumerate() {
+    let mut matches = Vec::with_capacity(regimes.len().saturating_sub(1));
+    for (idx, reg) in regimes.iter().enumerate() {
         if idx == query_idx {
             continue;
         }
-        let d_bytes = &bytes[sp.start..sp.end];
-        let d_sub = RawSubstrate::from_bytes(d_bytes);
-        let (c_start, c_end, referent) = d_sub.intrinsic_causal_core();
-        let core_bytes = &d_bytes[c_start..c_end];
-        let core_rels = if c_start == 0 && c_end == d_bytes.len() {
-            graph.encode_relations(&d_sub)
-        } else {
-            graph.encode_bytes(core_bytes)
-        };
+        let core_bytes = &bytes[reg.core_start..reg.core_end];
+        let core_rels = graph.encode_bytes(core_bytes);
         let core_trace = graph.abduce(&core_rels, None);
 
         let (_, _, fwd_err) = graph.evaluate_hypothesis(&q_trace.final_state, &core_rels);
@@ -430,15 +664,15 @@ pub fn project_query_to_molds(
         let cos_pos = 0.5 * (1.0 + cos_sim);
         let score = (cross_gen * cos_pos).sqrt();
 
-        let byte_overlap = byte_overlap_ratio(q_core_bytes, core_bytes);
+        let byte_overlap = byte_overlap_ratio(q_bytes, core_bytes);
         matches.push(ProjectionMatch {
             dst_idx: idx,
             score,
             cross_err,
             cos_sim,
-            core_start: c_start,
-            core_end: c_end,
-            referent,
+            core_start: reg.core_start,
+            core_end: reg.core_end,
+            referent: reg.referent,
             byte_overlap,
         });
     }
