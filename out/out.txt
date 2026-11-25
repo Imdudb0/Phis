@@ -1,0 +1,14 @@
+[1m[92m    Finished[0m `release` profile [optimized] target(s) in 0.04s
+[1m[92m     Running[0m `target/release/phis train --iters 100 --out out/sharp.phis`
+[train 1/100] phi_sharp=0.0000 (t0=0.0000) sens_min=0.0116 res=0.6950 non_recip=1.000
+[train 10/100] phi_sharp=0.0001 (t0=0.0000) sens_min=0.0196 res=0.7180 non_recip=1.000
+[train 20/100] phi_sharp=0.0023 (t0=0.0000) sens_min=0.2162 res=0.5495 non_recip=1.000
+[train 30/100] phi_sharp=0.0027 (t0=0.0000) sens_min=0.1571 res=0.6441 non_recip=1.000
+[train 40/100] phi_sharp=0.0093 (t0=0.0000) sens_min=0.4185 res=0.4827 non_recip=1.000
+[train 50/100] phi_sharp=0.0160 (t0=0.0000) sens_min=0.5044 res=0.4097 non_recip=1.000
+[train 60/100] phi_sharp=0.0221 (t0=0.0000) sens_min=0.5064 res=0.4304 non_recip=1.000
+[train 70/100] phi_sharp=0.0263 (t0=0.0000) sens_min=0.5635 res=0.3664 non_recip=1.000
+[train 80/100] phi_sharp=0.0553 (t0=0.0000) sens_min=0.5454 res=0.3712 non_recip=1.000
+[train 90/100] phi_sharp=0.1299 (t0=0.0000) sens_min=0.5564 res=0.3340 non_recip=1.000
+[train 100/100] phi_sharp=0.1783 (t0=0.0000) sens_min=0.6858 res=0.2465 non_recip=1.000
+Modele sauvegarde dans "out/sharp.phis"
