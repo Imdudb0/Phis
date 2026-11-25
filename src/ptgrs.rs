@@ -7,15 +7,17 @@ pub enum CauseFamily {
     Nested,
     SharedMotif,
     Arithmetic,
+    Grammar,
 }
 
 impl CauseFamily {
-    pub const ALL: [CauseFamily; 5] = [
+    pub const ALL: [CauseFamily; 6] = [
         CauseFamily::Periodic,
         CauseFamily::Symmetric,
         CauseFamily::Nested,
         CauseFamily::SharedMotif,
         CauseFamily::Arithmetic,
+        CauseFamily::Grammar,
     ];
 
     pub fn name(self) -> &'static str {
@@ -25,6 +27,7 @@ impl CauseFamily {
             CauseFamily::Nested => "nested",
             CauseFamily::SharedMotif => "shared",
             CauseFamily::Arithmetic => "arithmetic",
+            CauseFamily::Grammar => "grammar",
         }
     }
 
@@ -35,6 +38,7 @@ impl CauseFamily {
             "nested" => Some(CauseFamily::Nested),
             "shared" => Some(CauseFamily::SharedMotif),
             "arithmetic" => Some(CauseFamily::Arithmetic),
+            "grammar" => Some(CauseFamily::Grammar),
             _ => None,
         }
     }
@@ -103,8 +107,6 @@ impl TermGraph {
     }
 }
 
-/// Échantillonne un alphabet d'octets distincts, optionnellement dans une plage donnée
-/// pour tester l'abstraction méta-relationnelle sur alphabets disjoints.
 fn sample_alphabet(rng: &mut Rng, count: usize, lo: u8, hi: u8) -> Vec<u8> {
     let mut pool: Vec<u8> = (lo..=hi).collect();
     rng.shuffle(&mut pool);
@@ -118,7 +120,7 @@ pub fn sample_episode(rng: &mut Rng, family: CauseFamily) -> Episode {
 
 pub fn sample_episode_in_range(rng: &mut Rng, family: CauseFamily, lo: u8, hi: u8) -> Episode {
     let mut tg = TermGraph::new();
-    let max_len = 36;
+    let max_len = 48;
 
     let root = match family {
         CauseFamily::Periodic => {
@@ -126,7 +128,7 @@ pub fn sample_episode_in_range(rng: &mut Rng, family: CauseFamily, lo: u8, hi: u
             let alpha = sample_alphabet(rng, period, lo, hi);
             let leaves: Vec<usize> = alpha.into_iter().map(|b| tg.add_leaf(b)).collect();
             let motif = tg.add_branch(leaves);
-            let reps = (24 / period).max(5);
+            let reps = (36 / period).max(6);
             tg.add_branch(vec![motif; reps])
         }
         CauseFamily::Symmetric => {
@@ -135,7 +137,7 @@ pub fn sample_episode_in_range(rng: &mut Rng, family: CauseFamily, lo: u8, hi: u
             let fwd: Vec<usize> = alpha.iter().map(|&b| tg.add_leaf(b)).collect();
             let rev: Vec<usize> = fwd.iter().rev().copied().collect();
             let pal = tg.add_branch([fwd, rev].concat());
-            tg.add_branch(vec![pal, pal])
+            tg.add_branch(vec![pal, pal, pal])
         }
         CauseFamily::Nested => {
             let depth = 4 + rng.next_usize(3);
@@ -152,7 +154,7 @@ pub fn sample_episode_in_range(rng: &mut Rng, family: CauseFamily, lo: u8, hi: u
             tg.add_branch(vec![r, r])
         }
         CauseFamily::SharedMotif => {
-            let alpha = sample_alphabet(rng, 7, lo, hi);
+            let alpha = sample_alphabet(rng, 8, lo, hi);
             let m0 = tg.add_leaf(alpha[0]);
             let m1 = tg.add_leaf(alpha[1]);
             let m2 = tg.add_leaf(alpha[2]);
@@ -161,23 +163,55 @@ pub fn sample_episode_in_range(rng: &mut Rng, family: CauseFamily, lo: u8, hi: u
             let b1 = tg.add_leaf(alpha[4]);
             let b2 = tg.add_leaf(alpha[5]);
             let b3 = tg.add_leaf(alpha[6]);
-            tg.add_branch(vec![shared, b0, shared, b1, shared, b2, shared, b3, shared])
+            let b4 = tg.add_leaf(alpha[7]);
+            tg.add_branch(vec![
+                shared, b0, shared, b1, shared, b2, shared, b3, shared, b4, shared,
+            ])
         }
         CauseFamily::Arithmetic => {
             let start = lo.wrapping_add((rng.next_usize((hi - lo).max(1) as usize)) as u8);
             let step = (1 + rng.next_usize(7)) as u8;
-            let cycle = 4 + rng.next_usize(4);
-            let mut children = Vec::with_capacity(28);
-            for i in 0..28 {
+            let cycle = 5 + rng.next_usize(4);
+            let mut children = Vec::with_capacity(36);
+            for i in 0..36 {
                 let v = start.wrapping_add(step.wrapping_mul((i % cycle) as u8));
                 children.push(tg.add_leaf(v));
             }
             tg.add_branch(children)
         }
+        CauseFamily::Grammar => {
+            // Grammaire hiérarchique avec séparateur, racines morphologiques partagées et syntagmes
+            let alpha = sample_alphabet(rng, 14, lo, hi);
+            let sep = tg.add_leaf(alpha[0]);
+
+            let r0 = tg.add_leaf(alpha[1]);
+            let r1 = tg.add_leaf(alpha[2]);
+            let r2 = tg.add_leaf(alpha[3]);
+            let stem = tg.add_branch(vec![r0, r1, r2]);
+
+            let s0 = tg.add_leaf(alpha[4]);
+            let s1 = tg.add_leaf(alpha[5]);
+            let w0 = tg.add_branch(vec![stem, s0]);
+            let w1 = tg.add_branch(vec![stem, s1]);
+
+            let a0 = tg.add_leaf(alpha[6]);
+            let a1 = tg.add_leaf(alpha[7]);
+            let a2 = tg.add_leaf(alpha[8]);
+            let w2 = tg.add_branch(vec![a0, a1, a2]);
+
+            let b0 = tg.add_leaf(alpha[9]);
+            let b1 = tg.add_leaf(alpha[10]);
+            let b2 = tg.add_leaf(alpha[11]);
+            let w3 = tg.add_branch(vec![b0, b1, b2]);
+
+            let clause_a = tg.add_branch(vec![w0, sep, w2, sep, w1]);
+            let clause_b = tg.add_branch(vec![w2, sep, w3, sep, w0]);
+            tg.add_branch(vec![clause_a, sep, clause_b, sep, clause_a])
+        }
     };
 
     let mut effect = tg.linearize(root, max_len);
-    while effect.len() < 16 {
+    while effect.len() < 24 {
         let copy = effect.clone();
         effect.extend_from_slice(&copy);
     }
