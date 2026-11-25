@@ -242,11 +242,6 @@ pub fn derive(g: &Grammar, seed: &TermGraph, steps: &[Step], max_nodes: usize) -
     tg
 }
 
-// ---------------------------------------------------------------- sérialisation
-
-/// Encodage préfixe avec back-références pour le partage. Les valeurs d'octets
-/// n'ont AUCUN statut privilégié : ce sont les relations (égalités, ordre,
-/// répétitions) qui portent la structure, seule chose que le substrat encode.
 pub fn serialize(g: &Grammar, tg: &TermGraph) -> Vec<u8> {
     let mut out = Vec::new();
     if tg.is_empty() {
@@ -256,8 +251,15 @@ pub fn serialize(g: &Grammar, tg: &TermGraph) -> Vec<u8> {
     let mut counter = 0u32;
     let mut stack: Vec<u32> = vec![tg.root];
     let mut guard = 0usize;
-
     while let Some(v) = stack.pop() {
+        guard += 1;
+        if guard > 4 * MAX_PARSE_NODES + 16 {
+            break;
+        }
+        let vi = v as usize;
+        if vi >= tg.len() {
+            continue;
+        }
         let seen = index[vi] != u32::MAX;
         // Un index de partage tient sur un octet. Au-delà de 255 il n'est plus
         // représentable : on ré-émet le sous-graphe, jamais un index replié.
