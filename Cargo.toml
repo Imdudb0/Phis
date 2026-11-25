@@ -2,15 +2,5 @@
 name = "phisharp"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
-
-[lib]
-name = "phisharp"
-path = "src/lib.rs"
 
 [dependencies]
-
-[profile.release]
-opt-level = 3
-lto = true
-codegen-units = 1
