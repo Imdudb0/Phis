@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.85"
 
 [lib]
-name = "phis"
+name = "phisharp"
 path = "src/lib.rs"
 
 [dependencies]
