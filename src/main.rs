@@ -4,9 +4,9 @@ mod ptgrs;
 mod rng;
 mod train;
 
-use crate::graph::{PhiGraph, extract_relations};
+use crate::graph::PhiGraph;
 use crate::phi::{
-    compute_composite_phi, compute_phi_sharp, extract_abductive_core, format_partition,
+    compute_composite_phi, compute_phi_sharp, extract_abductive_core, fnv_hash, format_partition,
     project_query_to_molds, segment_effect,
 };
 use crate::ptgrs::{CauseFamily, sample_composite_episode, sample_episode};
@@ -20,7 +20,7 @@ fn usage() -> ! {
     eprintln!("Usage:");
     eprintln!("  phisharp train --out out/sharp.phis [--steps 300] [--seed 42]");
     eprintln!(
-        "  phisharp sample --out perceived.eff [--family periodic|symmetric|nested|shared|arithmetic|grammar|composite] [--seed 7]"
+        "  phisharp sample --out perceived.eff [--family periodic|symmetric|nested|shared|substitution|grammar|composite] [--seed 7]"
     );
     eprintln!("  phisharp ask --model out/sharp.phis --file perceived.eff");
     process::exit(1);
@@ -51,15 +51,6 @@ fn hex_preview(bytes: &[u8]) -> String {
         .map(|b| format!("{:02x}", b))
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-fn fnv_hash(bytes: &[u8]) -> u64 {
-    let mut hash = 0xCBF2_9CE4_8422_2325u64;
-    for &b in bytes {
-        hash ^= b as u64;
-        hash = hash.wrapping_mul(0x100_0000_01B3);
-    }
-    hash
 }
 
 fn main() {
@@ -123,7 +114,7 @@ fn main() {
             let family = match arg_val(&args, "--family") {
                 Some(name) => CauseFamily::from_name(&name).unwrap_or_else(|| {
                     eprintln!(
-                        "Famille inconnue '{}'. Choix: periodic, symmetric, nested, shared, arithmetic, grammar, composite.",
+                        "Famille inconnue '{}'. Choix: periodic, symmetric, nested, shared, substitution, grammar, composite.",
                         name
                     );
                     process::exit(1);
@@ -176,9 +167,9 @@ fn main() {
 fn run_ask_monolithic(model: &PhiGraph, file_path: &str, bytes: &[u8]) {
     let mut rng = Rng::new(fnv_hash(bytes));
     let rep = compute_phi_sharp(model, bytes, &mut rng, true);
-    let rels = extract_relations(bytes);
+    let rels = model.encode_bytes(bytes);
 
-    println!("=== PHISHARP ABDUCTION REPORT (v0.3 — Monolithique) ===");
+    println!("=== PHISHARP ABDUCTION REPORT (v0.4 — Monolithique) ===");
     println!("Effet (E)       : '{}' ({} octets)", file_path, bytes.len());
     println!("φ_sharp         : {:+.4}", rep.phi_sharp);
     println!(
@@ -254,7 +245,7 @@ fn run_ask_composite(model: &PhiGraph, file_path: &str, bytes: &[u8], spans: &[c
     let q_rep = compute_phi_sharp(model, q_bytes, &mut rng, true);
     let matches = project_query_to_molds(model, bytes, spans, q_idx);
 
-    println!("=== PHISHARP ABDUCTION REPORT (v0.3 — Projection Référentielle) ===");
+    println!("=== PHISHARP ABDUCTION REPORT (v0.4 — Projection Référentielle) ===");
     println!(
         "Effet (E)       : '{}' ({} octets, {} blocs détectés)",
         file_path,
