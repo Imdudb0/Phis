@@ -119,7 +119,7 @@ pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
             let model = PhiGraph::from_weights(theta.clone());
             let mut diag_rng = Rng::new(eval_seed);
             let mut phi = 0.0;
-            let mut r#gen = 0.0;
+            let mut gen_sum = 0.0;
             let mut disc = 0.0;
             let mut proj = 0.0;
             let mut integ = 0.0;
@@ -127,7 +127,7 @@ pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
             for eff in &batch {
                 let r = compute_phi_sharp(&model, eff, &mut diag_rng, false);
                 phi += r.phi_sharp;
-                gen += r.generativity;
+                gen_sum += r.generativity;
                 disc += r.discrimination;
                 proj += r.projection;
                 integ += r.integration;
@@ -139,7 +139,7 @@ pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
                 step,
                 cfg.steps,
                 phi / n,
-                gen / n,
+                gen_sum / n,
                 disc / n,
                 proj / n,
                 integ / n,
