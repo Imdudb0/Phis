@@ -511,4 +511,28 @@ mod tests {
         assert_eq!(t.scalar_of(integ), 0.0);
         assert_eq!(t.scalar_of(ph), 0.0);
     }
+
+    #[test]
+    fn un_pas_augmente_le_signal() {
+        let (_b, v, w, p0) = setup(96);
+        let mut p = p0.clone();
+        let cfg = PhiCfg::default();
+        let lecture = |p: &Params| -> f32 {
+            let mut t = Tape::new();
+            let f = substrate::forward(&mut t, p, &v, &w, &Itv::default());
+            let m = build_mech(&t, &f, &v, &w, &cfg);
+            evaluate(&mut t, p, &v, &w, &f, &m, &cfg).cov_f
+        };
+        let c0 = lecture(&p);
+        let mut t = Tape::new();
+        let f = substrate::forward(&mut t, &p, &v, &w, &Itv::default());
+        let m = build_mech(&t, &f, &v, &w, &cfg);
+        let pv = evaluate(&mut t, &p, &v, &w, &f, &m, &cfg);
+        let loss = t.neg(pv.cov);
+        let g = t.backward(loss, p.nblocks());
+        let mut opt = crate::ad::Adam::new(&p, 1e-3);
+        opt.step(&mut p, &g);
+        let c1 = lecture(&p);
+        assert!(c1 > c0, "le signal doit monter : {} -> {}", c0, c1);
+    }
 }
