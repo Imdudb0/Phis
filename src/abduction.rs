@@ -1,8 +1,4 @@
-//! Moteur de recherche abductive authentique v0.3.0 :
-//! - Aucune béquille codée en dur sur emp_trans1 : toute évolution passe par `net.propagate_step`
-//!   (matrices non-réciproques + projections apprises du résidu) et les défis abductifs.
-//! - Conclusion émise par résonance causale dans l'espace latent V_lat entre la clause cible
-//!   (requête) et les clauses explicatives émergentes de E (sans couper de mots ni babiller).
+//! Moteur de recherche abductive authentique v0.3.1.
 
 use crate::math::{cosine_similarity, entropy_bits, normalize_prob};
 use crate::phi_sharp::{
@@ -94,6 +90,11 @@ fn build_policy_features(
     ]
 }
 
+#[inline]
+fn search_potential(rep: &PhiReport) -> f64 {
+    rep.phi_sharp + 0.15 * rep.sens_prod.cbrt() + 0.10 * rep.phi_iit_mip
+}
+
 pub fn run_abductive_search(
     net: &PhisharpNet,
     observed_e: &[u8],
@@ -109,7 +110,6 @@ pub fn run_abductive_search(
         disable_refutation: false,
     };
 
-    // t = 0 : Pôle régional R(E), aucune recherche effectuée
     let mut current_h = net.init_regional_state(&pg);
     let mut current_rep = evaluate_phi_sharp(&current_h, &pg, full_eval_opts);
 
@@ -137,9 +137,8 @@ pub fn run_abductive_search(
         let policy = net.policy_select(&p_feat);
         let [p_ref, p_dep, p_abs, step_scale] = policy;
 
-        // Propagation purement connexionniste (aucune béquille sur emp_trans1)
         let mut cand_h = current_h.clone();
-        net.propagate_step(&mut cand_h, &pg, 0.28 + 0.50 * step_scale);
+        net.propagate_step(&mut cand_h, &pg, 0.30 + 0.55 * step_scale);
         let mut cand_rep = evaluate_phi_sharp(&cand_h, &pg, search_eval_opts);
 
         let mut proposals: Vec<(HypothesisState, PhiReport)> = Vec::with_capacity(4);
@@ -167,22 +166,21 @@ pub fn run_abductive_search(
         }
 
         for (ph, pr) in proposals {
-            if pr.phi_sharp > cand_rep.phi_sharp {
+            if search_potential(&pr) > search_potential(&cand_rep) {
                 cand_h = ph;
                 cand_rep = pr;
             }
         }
 
-        if cand_rep.phi_sharp >= best_search_rep.phi_sharp {
+        if search_potential(&cand_rep) >= search_potential(&best_search_rep) {
             current_h = cand_h;
             best_h = current_h.clone();
             best_search_rep = cand_rep;
         } else {
-            // Pas de raffinement connexionniste léger autour du meilleur attracteur
             let mut refined = best_h.clone();
-            net.propagate_step(&mut refined, &pg, 0.16);
+            net.propagate_step(&mut refined, &pg, 0.20);
             let ref_rep = evaluate_phi_sharp(&refined, &pg, search_eval_opts);
-            if ref_rep.phi_sharp >= best_search_rep.phi_sharp {
+            if search_potential(&ref_rep) >= search_potential(&best_search_rep) {
                 best_h = refined.clone();
                 best_search_rep = ref_rep;
             }
@@ -206,8 +204,6 @@ pub fn run_abductive_search(
     }
 }
 
-/// Calcule le profil latent causal (distribution sur N_LAT et vecteur de rôle moyen dans R^D)
-/// d'une séquence de symboles à travers les matrices de l'attracteur H*.
 fn span_latent_signature(h: &HypothesisState, span: &[usize]) -> ([f64; N_LAT], [f64; D], f64) {
     let mut lat_dist = [0.0; N_LAT];
     let mut vec_rep = [0.0; D];
@@ -216,7 +212,6 @@ fn span_latent_signature(h: &HypothesisState, span: &[usize]) -> ([f64; N_LAT], 
         return (lat_dist, vec_rep, 0.0);
     }
 
-    // Distribution de branchement / incertitude causale interne de cette clause dans H*
     let mut trans_ent_sum = 0.0;
     for (idx, &s) in span.iter().enumerate() {
         for l in 0..N_LAT {
@@ -243,12 +238,6 @@ fn span_latent_signature(h: &HypothesisState, span: &[usize]) -> ([f64; N_LAT], 
     (lat_dist, vec_rep, mean_branch_ent)
 }
 
-/// Projette l'attracteur causal H* dans Σ_E* pour émettre la conclusion maximale :
-/// 1. Infère la signature causale latente de la requête finale (incluant son entropie de branchement
-///    causal = multiplicité de lectures concurrentes dans H*).
-/// 2. Propulse les clauses candidates à travers les couplages causaux J_{i->j} de H*.
-/// 3. Émet les clauses émergentes entières qui unifient le mieux l'attracteur requête -> cause,
-///    sans troncature arbitraire au milieu des unités ni babil bigramme.
 pub fn emit_explanation(h: &HypothesisState, pg: &PerceivedGraph, max_len: usize) -> Vec<u8> {
     let k = pg.k();
     if k == 0 || max_len == 0 {
@@ -270,7 +259,6 @@ pub fn emit_explanation(h: &HypothesisState, pg: &PerceivedGraph, max_len: usize
 
     let (q_lat_raw, q_vec, q_branch_ent) = span_latent_signature(h, query_slice);
 
-    // Inversion causale arrière de la requête via J^T (quelle cause latente explique cette requête ?)
     let mut q_cause_lat = [0.0; N_LAT];
     for i in 0..N_LAT {
         let mut acc = 0.0;
@@ -291,7 +279,6 @@ pub fn emit_explanation(h: &HypothesisState, pg: &PerceivedGraph, max_len: usize
         let span = &pg.sym_seq[st..en];
         let (c_lat, c_vec, c_branch_ent) = span_latent_signature(h, span);
 
-        // Projection avant de cette clause à travers J_{i->j} vers l'espace des effets
         let mut c_eff_lat = [0.0; N_LAT];
         for j in 0..N_LAT {
             let mut acc = 0.0;
@@ -303,16 +290,11 @@ pub fn emit_explanation(h: &HypothesisState, pg: &PerceivedGraph, max_len: usize
         }
         normalize_prob(&mut c_eff_lat);
 
-        // Résonance cause-effet dans l'espace latent (pas de copie de surface)
         let lat_resonance: f64 = c_eff_lat.iter().zip(q_cause_lat.iter()).map(|(a, b)| (a * b).sqrt()).sum();
         let vec_resonance = cosine_similarity(&c_vec, &q_vec).max(-1.0);
-
-        // Concordance de multiplicité causale (si la requête a un fort branchement latent / ambiguïté,
-        // privilégie les clauses qui expriment structurellement une pluralité de chemins dans H*)
         let c_lat_entropy = entropy_bits(&c_lat) / (N_LAT as f64).log2();
         let branching_match = 1.0 - (q_branch_ent - c_branch_ent).abs() - 0.5 * (q_lat_entropy - c_lat_entropy).abs();
 
-        // Qualité générative intrinsèque de cette clause sous H*
         let mut log_fit = 0.0;
         for w in span.windows(2) {
             log_fit += h.sym_trans[w[0] * k + w[1]].max(1e-9).ln();
@@ -320,9 +302,7 @@ pub fn emit_explanation(h: &HypothesisState, pg: &PerceivedGraph, max_len: usize
         log_fit /= (span.len() - 1) as f64;
         let norm_fit = (log_fit / (k as f64).max(2.0).ln() + 1.0).clamp(0.0, 1.0);
 
-        // Pénalise la simple répétition de la requête elle-même
         let self_pen = if c_idx == last_ctx && n_ctx > 2 { 0.55 } else { 0.0 };
-
         let total = 2.2 * lat_resonance + 0.8 * vec_resonance + 1.1 * branching_match + 0.6 * norm_fit - self_pen;
         ranked_spans.push((total, c_idx));
     }
@@ -343,8 +323,6 @@ pub fn emit_explanation(h: &HypothesisState, pg: &PerceivedGraph, max_len: usize
     out_syms.into_iter().map(|s| pg.unique_bytes[s]).collect()
 }
 
-/// Construit une augmentation équilibrée de E en insérant la clause relationnelle manquante
-/// indiquée par le résidu (sans briser l'équilibre pairs/impairs de projection).
 pub fn build_residue_augmentation(observed_e: &[u8], report: &PhiReport) -> Vec<u8> {
     let pg = PerceivedGraph::from_bytes(observed_e);
     let k = pg.k();
@@ -372,7 +350,6 @@ pub fn build_residue_augmentation(observed_e: &[u8], report: &PhiReport) -> Vec<
         }
     }
 
-    // Symbole séparateur émergent (le plus fort en fin des spans découverts)
     let sep_sym = pg.sym_seq[pg.ctx_spans[0].1.saturating_sub(1)];
     let bridge = [
         pg.unique_bytes[prev_u],
@@ -382,7 +359,6 @@ pub fn build_residue_augmentation(observed_e: &[u8], report: &PhiReport) -> Vec<
         pg.unique_bytes[sep_sym],
     ];
 
-    // Insertion symétrique (milieu + fin) pour clarifier la causalité des deux vues
     let mid = observed_e.len() / 2;
     let mut augmented = Vec::with_capacity(observed_e.len() + 20);
     augmented.extend_from_slice(&observed_e[..mid]);
