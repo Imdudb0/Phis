@@ -14,26 +14,35 @@ pub const EDGE_IN: usize = 12;
 pub const EDGE_HID: usize = 4;
 pub const NODE_IN: usize = EDGE_HID * 2 + 2;
 
+pub const GATE_IN: usize = EDGE_HID * 2 + 2; // loc_max(4) + cur_max(4) + loc_deg(1) + loc_has(1)
+pub const GATE_HID: usize = 4;
+
 const OFF_REL_EDGE_W: usize = 0; // 48
 const OFF_REL_EDGE_B: usize = OFF_REL_EDGE_W + EDGE_HID * EDGE_IN; // 48, len 4
 const OFF_REL_NODE_W: usize = OFF_REL_EDGE_B + EDGE_HID; // 52, len 80
 const OFF_REL_NODE_B: usize = OFF_REL_NODE_W + REL_DIM * NODE_IN; // 132, len 8
 
-const OFF_EDGE: usize = OFF_REL_NODE_B + REL_DIM; // 140, len 576
-const OFF_BIAS: usize = OFF_EDGE + NODES * NODES * DIM * DIM; // 716, len 24
-const OFF_IN: usize = OFF_BIAS + NODES * DIM; // 740, len 576
-const OFF_G1: usize = OFF_IN + NODES * DIM * INPUT_DIM; // 1316, len 32
-const OFF_G2: usize = OFF_G1 + DIM * (2 * DIM); // 1348, len 32
-const OFF_BH: usize = OFF_G2 + DIM * (2 * DIM); // 1380, len 32
-const OFF_CTX: usize = OFF_BH + DIM * (2 * DIM); // 1412, len 32
-const OFF_U: usize = OFF_CTX + DIM * REL_DIM; // 1444, len 16
-const OFF_OUT: usize = OFF_U + DIM * DIM; // 1460, len 32
-pub const NUM_PARAMS: usize = OFF_OUT + REL_DIM * DIM; // 1492
+const OFF_GATE_W1: usize = OFF_REL_NODE_B + REL_DIM; // 140, len 40
+const OFF_GATE_B1: usize = OFF_GATE_W1 + GATE_HID * GATE_IN; // 180, len 4
+const OFF_GATE_W2: usize = OFF_GATE_B1 + GATE_HID; // 184, len 4
+const OFF_GATE_B2: usize = OFF_GATE_W2 + GATE_HID; // 188, len 1
+
+const OFF_EDGE: usize = OFF_GATE_B2 + 1; // 189, len 576
+const OFF_BIAS: usize = OFF_EDGE + NODES * NODES * DIM * DIM; // 765, len 24
+const OFF_IN: usize = OFF_BIAS + NODES * DIM; // 789, len 576
+const OFF_G1: usize = OFF_IN + NODES * DIM * INPUT_DIM; // 1365, len 32
+const OFF_G2: usize = OFF_G1 + DIM * (2 * DIM); // 1397, len 32
+const OFF_BH: usize = OFF_G2 + DIM * (2 * DIM); // 1429, len 32
+const OFF_CTX: usize = OFF_BH + DIM * (2 * DIM); // 1461, len 32
+const OFF_U: usize = OFF_CTX + DIM * REL_DIM; // 1493, len 16
+const OFF_OUT: usize = OFF_U + DIM * DIM; // 1509, len 32
+pub const NUM_PARAMS: usize = OFF_OUT + REL_DIM * DIM; // 1541
 
 const MAGIC: &[u8; 4] = b"PHIS";
-const VERSION: u32 = 4;
+const VERSION: u32 = 5;
 
 /// Substrat relationnel brut extrait de la matrice d'auto-égalité M(a,b) = [a!=b & E[a]==E[b]].
+/// Aucune règle de découpe (`\n`, `:`, etc.) ni feature sémantique n'est codée en dur.
 #[derive(Clone, Debug)]
 pub struct RawSubstrate {
     pub len: usize,
@@ -45,12 +54,11 @@ pub struct RawSubstrate {
 impl RawSubstrate {
     pub fn from_bytes(bytes: &[u8]) -> Self {
         let n = bytes.len();
-        let win_cap = 128usize;
+        let win_cap = 36usize;
         let max_edges = 12usize;
         let log_cap = (n.min(win_cap).max(2) as f32).ln();
 
-        // Exclut le self-swap trivial (j, t) pour qu'une lettre double isolée (ex: "ss")
-        // ne simule pas une symétrie miroir.
+        // Exclut le self-swap trivial (j, t) pour qu'une lettre double isolée ne simule pas un miroir.
         let m_nb = |a: isize, b: isize, ti: isize, ji: isize| -> f32 {
             if a >= 0 && b >= 0 && a != b && !(a == ji && b == ti) {
                 let au = a as usize;
@@ -146,75 +154,6 @@ impl RawSubstrate {
             deg,
         }
     }
-
-    /// Isole la sous-zone intrinsèquement 2-connectée du graphe d'auto-égalité (sans voir Q).
-    /// Sur un moule brut, renvoie [0..n]. Sur un moule étiqueté, détache automatiquement
-    /// le bord passif (préfixe ou suffixe) comme référent induit.
-    pub fn intrinsic_causal_core(&self) -> (usize, usize, Option<(usize, usize)>) {
-        let n = self.len;
-        if n < 12 {
-            return (0, n, None);
-        }
-
-        let mut pref = vec![0.0f32; n + 1];
-        for t in 0..n {
-            let mut max_supp = 0.0f32;
-            for feat in &self.edges[self.offsets[t]..self.offsets[t + 1]] {
-                let supp = feat[0] + feat[1] + feat[4] + feat[5];
-                if supp > max_supp {
-                    max_supp = supp;
-                }
-            }
-            let act = (max_supp / 2.0).min(1.0);
-            pref[t + 1] = pref[t] + (act - 0.35);
-        }
-
-        let min_w = (n / 2).max(10).min(n);
-        let step = if n > 256 { (n / 64).max(1) } else { 1 };
-        let mut best_s = 0usize;
-        let mut best_e = n;
-        let mut best_score = f32::NEG_INFINITY;
-
-        let mut s = 0usize;
-        while s + min_w <= n {
-            let mut e = s + min_w;
-            while e <= n {
-                let sc = pref[e] - pref[s];
-                if sc > best_score {
-                    best_score = sc;
-                    best_s = s;
-                    best_e = e;
-                }
-                if e == n {
-                    break;
-                }
-                e = (e + step).min(n);
-            }
-            s += step;
-        }
-
-        if best_score <= 0.0 {
-            return (0, n, None);
-        }
-
-        // Ne grignote pas 1 ou 2 octets de bord sur un moule brut
-        if best_s <= 2 {
-            best_s = 0;
-        }
-        if n.saturating_sub(best_e) <= 2 {
-            best_e = n;
-        }
-
-        let referent = if best_s >= 3 && n.saturating_sub(best_e) <= 2 {
-            Some((0, best_s))
-        } else if n.saturating_sub(best_e) >= 3 && best_s <= 2 {
-            Some((best_e, n))
-        } else {
-            None
-        };
-
-        (best_s, best_e, referent)
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -244,15 +183,17 @@ impl PhiGraph {
         Self { weights }
     }
 
-    /// Capteur relationnel 100% appris avec normalisation RMS.
-    pub fn encode_relations(&self, sub: &RawSubstrate) -> Vec<[f32; REL_DIM]> {
+    /// Capteur relationnel 100% appris + porte causale neuronale `g(t) ∈ (0, 1)`.
+    pub fn encode_with_gate(&self, sub: &RawSubstrate) -> (Vec<[f32; REL_DIM]>, Vec<f32>) {
         let w = &self.weights;
         let n = sub.len;
         if n == 0 {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
 
         let mut pre = Vec::with_capacity(n);
+        let mut e_max_all = Vec::with_capacity(n);
+        let mut has_all = Vec::with_capacity(n);
         let mut energy = 0.0f32;
 
         for t in 0..n {
@@ -284,6 +225,9 @@ impl PhiGraph {
             } else {
                 has_edge = -1.0f32;
             }
+
+            e_max_all.push(e_max);
+            has_all.push(has_edge);
 
             let node_in = [
                 e_max[0],
@@ -318,7 +262,56 @@ impl PhiGraph {
                 *val = (*val * inv).tanh();
             }
         }
-        pre
+
+        // Porte causale apprise sur voisinage ±3 : distingue corps causal soutenu vs bord passif/bruit
+        let mut gates = Vec::with_capacity(n);
+        for t in 0..n {
+            let lo = t.saturating_sub(3);
+            let hi = (t + 3).min(n - 1);
+            let inv_w = 1.0 / ((hi - lo + 1) as f32);
+
+            let mut loc_max = [0.0f32; EDGE_HID];
+            let mut loc_deg = 0.0f32;
+            let mut loc_has = 0.0f32;
+            for j in lo..=hi {
+                for h in 0..EDGE_HID {
+                    loc_max[h] += e_max_all[j][h] * inv_w;
+                }
+                loc_deg += sub.deg[j] * inv_w;
+                loc_has += has_all[j] * inv_w;
+            }
+
+            let g_in = [
+                loc_max[0],
+                loc_max[1],
+                loc_max[2],
+                loc_max[3],
+                e_max_all[t][0],
+                e_max_all[t][1],
+                e_max_all[t][2],
+                e_max_all[t][3],
+                loc_deg,
+                loc_has,
+            ];
+
+            let mut logit = w[OFF_GATE_B2];
+            for h in 0..GATE_HID {
+                let base = OFF_GATE_W1 + h * GATE_IN;
+                let mut acc = w[OFF_GATE_B1 + h];
+                for k in 0..GATE_IN {
+                    acc += w[base + k] * g_in[k];
+                }
+                logit += w[OFF_GATE_W2 + h] * acc.tanh();
+            }
+            let gate = 1.0 / (1.0 + (-logit.clamp(-12.0, 12.0)).exp());
+            gates.push(gate);
+        }
+
+        (pre, gates)
+    }
+
+    pub fn encode_relations(&self, sub: &RawSubstrate) -> Vec<[f32; REL_DIM]> {
+        self.encode_with_gate(sub).0
     }
 
     pub fn encode_bytes(&self, bytes: &[u8]) -> Vec<[f32; REL_DIM]> {
@@ -402,17 +395,22 @@ impl PhiGraph {
         (preds, pos_err, mean_err)
     }
 
-    pub fn abduce(&self, rels: &[[f32; REL_DIM]], cut_mask: Option<u8>) -> AbductionTrace {
+    pub fn abduce_with_steps(
+        &self,
+        rels: &[[f32; REL_DIM]],
+        cut_mask: Option<u8>,
+        steps: usize,
+    ) -> AbductionTrace {
         let w = &self.weights;
         let mut state = [0.0f32; STATE_DIM];
-        let mut step_residuals = Vec::with_capacity(SEARCH_STEPS + 1);
+        let mut step_residuals = Vec::with_capacity(steps + 1);
 
         let mid = (rels.len() / 2).max(1);
         let inv_a = 1.0 / (mid as f32);
         let inv_b = 1.0 / (rels.len().saturating_sub(mid).max(1) as f32);
         let len_inv = 1.0 / (rels.len().max(1) as f32);
 
-        for _ in 0..SEARCH_STEPS {
+        for _ in 0..steps {
             let (preds, _, mean_err) = self.evaluate_hypothesis(&state, rels);
             step_residuals.push(mean_err);
 
@@ -476,6 +474,10 @@ impl PhiGraph {
         }
     }
 
+    pub fn abduce(&self, rels: &[[f32; REL_DIM]], cut_mask: Option<u8>) -> AbductionTrace {
+        self.abduce_with_steps(rels, cut_mask, SEARCH_STEPS)
+    }
+
     pub fn save<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
         if let Some(parent) = path.as_ref().parent()
             && !parent.as_os_str().is_empty()
@@ -505,7 +507,7 @@ impl PhiGraph {
         if version != VERSION || count != NUM_PARAMS || data.len() != 12 + count * 4 {
             return Err(io::Error::new(
                 ErrorKind::InvalidData,
-                "Version ou taille du modèle .phis incompatible (ré-entraîne avec v0.4.1)",
+                "Version ou taille du modèle .phis incompatible (ré-entraîne avec v0.5)",
             ));
         }
         let mut weights = Vec::with_capacity(count);
