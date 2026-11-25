@@ -24,7 +24,7 @@
    [1m[94m= [0m[1mnote[0m: `SepMode` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
 
 [1m[33mwarning[0m: `phisharp` (bin "phisharp") generated 2 warnings
-[1m[92m    Finished[0m `release` profile [optimized] target(s) in 0.00s
+[1m[92m    Finished[0m `release` profile [optimized] target(s) in 0.05s
 [1m[92m     Running[0m `target/release/phisharp ask --model out/sharp.phis --file molds.eff`
 === PHISHARP ABDUCTION REPORT (v0.5 — Flux Continu Auto-Segmenté) ===
 Effet (E)       : 'molds.eff' (169 octets, 5 régimes causaux découverts sans séparateur)
