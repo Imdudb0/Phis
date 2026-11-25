@@ -1,4 +1,4 @@
-use crate::graph::{NUM_PARAMS, PhiGraph, extract_relations};
+use crate::graph::{NUM_PARAMS, PhiGraph, STATE_DIM, extract_relations};
 use crate::phi::{compute_phi_sharp, cosine_sim};
 use crate::ptgrs::{CauseFamily, sample_episode, sample_episode_in_range};
 use crate::rng::Rng;
@@ -13,14 +13,36 @@ pub struct TrainConfig {
     pub seed: u64,
 }
 
+/// Pénalité anti-effondrement en cône (sans jamais utiliser les étiquettes cachées).
+fn batch_collapse_penalty(states: &[[f32; STATE_DIM]]) -> f32 {
+    let mut sum = 0.0f32;
+    let mut pairs = 0usize;
+    for i in 0..states.len() {
+        for j in (i + 1)..states.len() {
+            let c = cosine_sim(&states[i], &states[j]).max(0.0);
+            sum += c * c;
+            pairs += 1;
+        }
+    }
+    if pairs == 0 {
+        0.0
+    } else {
+        sum / (pairs as f32)
+    }
+}
+
 fn eval_batch(graph: &PhiGraph, batch: &[Vec<u8>], eval_seed: u64) -> f32 {
     let mut rng = Rng::new(eval_seed);
     let mut sum = 0.0f32;
+    let mut states = Vec::with_capacity(batch.len());
     for effect in batch {
         let rep = compute_phi_sharp(graph, effect, &mut rng, false);
         sum += rep.phi_sharp;
+        states.push(rep.trace.final_state);
     }
-    sum / (batch.len() as f32)
+    let mean_phi = sum / (batch.len() as f32);
+    let collapse = batch_collapse_penalty(&states);
+    mean_phi - 0.22 * collapse
 }
 
 pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
@@ -28,7 +50,6 @@ pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
     let mut rng = Rng::new(cfg.seed);
     let mut theta = PhiGraph::random(&mut rng).weights;
 
-    // État Adam pour Evolution Strategies antithétique
     let mut m = vec![0.0f32; NUM_PARAMS];
     let mut v = vec![0.0f32; NUM_PARAMS];
     let beta1 = 0.9f32;
@@ -41,12 +62,11 @@ pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
         .min(cfg.pop_pairs.max(1));
 
     println!(
-        "Entraînement Phisharp ({} paramètres, {} étapes, {} paires ES, {} threads)...",
+        "Entraînement Phisharp v0.2 ({} paramètres, {} étapes, {} paires ES, {} threads)...",
         NUM_PARAMS, cfg.steps, cfg.pop_pairs, n_threads
     );
 
     for step in 1..=cfg.steps {
-        // Lot synthétique PTGRS : E seul est vu par le modèle
         let batch: Vec<Vec<u8>> = CauseFamily::ALL
             .iter()
             .map(|&fam| sample_episode(&mut rng, fam).effect)
@@ -54,7 +74,6 @@ pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
         let eval_seed = rng.next_u64();
         let pair_seeds: Vec<u64> = (0..cfg.pop_pairs).map(|_| rng.next_u64()).collect();
 
-        // Évaluation parallèle des perturbations +/- sigma * eps
         let results: Vec<(u64, f32, f32)> = thread::scope(|s| {
             let chunk_size = cfg.pop_pairs.div_ceil(n_threads);
             let mut handles = Vec::new();
@@ -87,7 +106,6 @@ pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
             merged
         });
 
-        // Standardisation des différences pour stabiliser le pas
         let diffs: Vec<f32> = results.iter().map(|&(_, fp, fn_)| fp - fn_).collect();
         let var: f32 = diffs.iter().map(|d| d * d).sum::<f32>() / (diffs.len() as f32);
         let std = var.sqrt().max(1e-6);
@@ -102,7 +120,6 @@ pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
             }
         }
 
-        // Montée de gradient Adam + légère régularisation L2
         let t = step as i32;
         let b1_corr = 1.0 - beta1.powi(t);
         let b2_corr = 1.0 - beta2.powi(t);
@@ -124,6 +141,8 @@ pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
             let mut proj = 0.0;
             let mut integ = 0.0;
             let mut res = 0.0;
+            let mut bounce = 0.0;
+            let mut states = Vec::with_capacity(batch.len());
             for eff in &batch {
                 let r = compute_phi_sharp(&model, eff, &mut diag_rng, false);
                 phi += r.phi_sharp;
@@ -132,10 +151,13 @@ pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
                 proj += r.projection;
                 integ += r.integration;
                 res += r.residual;
+                bounce += r.bounce_pen;
+                states.push(r.trace.final_state);
             }
             let n = batch.len() as f32;
+            let coll = batch_collapse_penalty(&states);
             println!(
-                "step {:>4}/{:<4} | phi_sharp={:+.4} | Gen={:.3} Disc={:.3} Proj={:.3} IIT={:.3} | res={:.4} ({:.1}s)",
+                "step {:>4}/{:<4} | φ={:+.4} | Gen={:.3} Disc={:.3} Proj={:.3} IIT={:.3} | res={:.3} bnc={:.3} coll={:.3} ({:.1}s)",
                 step,
                 cfg.steps,
                 phi / n,
@@ -144,6 +166,8 @@ pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
                 proj / n,
                 integ / n,
                 res / n,
+                bounce / n,
+                coll,
                 start.elapsed().as_secs_f32()
             );
         }
@@ -154,14 +178,11 @@ pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
     final_model
 }
 
-/// Évaluation post-hoc avec la cause cachée du PTGRS (jamais vue durant l'entraînement) :
-/// teste si deux effets aux alphabets d'octets DISJOINTS mais de même cause cachée
-/// convergent vers des trajectoires plus proches que deux causes différentes.
 fn evaluate_meta_relational_abstraction(model: &PhiGraph, seed: u64) {
     let mut rng = Rng::new(seed);
     let mut same_sum = 0.0f32;
     let mut diff_sum = 0.0f32;
-    let trials = 40;
+    let trials = 48;
 
     for _ in 0..trials {
         let f1 = CauseFamily::ALL[rng.next_usize(CauseFamily::ALL.len())];
@@ -170,7 +191,6 @@ fn evaluate_meta_relational_abstraction(model: &PhiGraph, seed: u64) {
             f2 = CauseFamily::ALL[rng.next_usize(CauseFamily::ALL.len())];
         }
 
-        // Alphabets strictement disjoints : [32..75] vs [140..220]
         let e_a = sample_episode_in_range(&mut rng, f1, 32, 75);
         let e_b = sample_episode_in_range(&mut rng, f1, 140, 220);
         let e_c = sample_episode_in_range(&mut rng, f2, 140, 220);
