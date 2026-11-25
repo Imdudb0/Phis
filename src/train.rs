@@ -1,4 +1,6 @@
-//! Entraînement FERMÉ de Phisharp v0.2.0 : PTGRS (E seul) + φ_sharp + Sens + Résidu.
+//! Entraînement FERMÉ v0.3.0 : PTGRS (E seul) + φ_sharp + Sens + Résidu.
+//! Ici, aucune béquille externe ne donne sens_min gratuitement : le réseau doit
+//! véritablement apprendre à abduire via ses matrices non-réciproques et w_res_*.
 
 use std::path::Path;
 
@@ -21,12 +23,12 @@ pub struct TrainConfig {
 impl Default for TrainConfig {
     fn default() -> Self {
         Self {
-            iterations: 80,
+            iterations: 100,
             pop_pairs: 16,
             batch_size: 4,
             search_budget: 8,
-            sigma: 0.045,
-            lr: 0.015,
+            sigma: 0.05,
+            lr: 0.018,
             seed: 2026_11_24,
         }
     }
@@ -65,7 +67,8 @@ fn evaluate_batch_fitness(
         let rep = &res.final_report;
 
         let traj_gain = (rep.phi_sharp - phi0).max(0.0);
-        let obj = rep.phi_sharp + 0.50 * traj_gain + 0.35 * rep.sens_min - 0.25 * rep.residue_score;
+        // Pression forte sur sens_min + phi_sharp - residue pour forcer V_lat à vraiment expliquer E
+        let obj = rep.phi_sharp + 0.40 * traj_gain + 0.55 * rep.sens_min - 0.30 * rep.residue_score;
 
         sum_obj += obj;
         sum_phi += rep.phi_sharp;
