@@ -278,7 +278,7 @@ pub fn score_generativity(h: &HypothesisState, pg: &PerceivedGraph) -> f64 {
     let uniform_ll = -(k as f64).ln();
 
     let mut ll1 = 0.0;
-    let mut count1 = 0.0;
+    let mut count1: f64 = 0.0;
     for w in pg.sym_seq.windows(2) {
         ll1 += h.sym_trans[w[0] * k + w[1]].max(1e-9).ln();
         count1 += 1.0;
