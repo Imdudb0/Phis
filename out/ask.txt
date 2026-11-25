@@ -25,25 +25,28 @@
 
 [1m[33mwarning[0m: `phisharp` (bin "phisharp") generated 2 warnings
 [1m[92m    Finished[0m `release` profile [optimized] target(s) in 0.00s
-[1m[92m     Running[0m `target/release/phisharp ask --model out/sharp.phis --file out/comp.eff`
+[1m[92m     Running[0m `target/release/phisharp ask --model out/sharp.phis --file molds.eff`
 === PHISHARP ABDUCTION REPORT (v0.5 — Flux Continu Auto-Segmenté) ===
-Effet (E)       : 'out/comp.eff' (233 octets, 4 régimes causaux découverts sans séparateur)
-Cohérence scène : sélectivité=0.3010 (R_top=0.794 vs R_rest=0.621, paire [2]<->[3])
-φ_sharp(cible)  : +0.2147  [Gen=0.346 Disc=0.615 Proj=0.646 Gate=0.232 IIT=0.336, res=0.4820]
+Effet (E)       : 'molds.eff' (169 octets, 5 régimes causaux découverts sans séparateur)
+Cohérence scène : sélectivité=0.4167 (R_top=0.839 vs R_rest=0.503, paire [1]<->[2])
+φ_sharp(cible)  : +0.4629  [Gen=0.524 Disc=0.657 Proj=0.768 Gate=0.581 IIT=0.293, res=0.2935]
 
-Régime cible [3] (octets 143..157, gate=0.696) :
-  "H-!4GH-!4Y)>4G"
+Régime cible [4] (octets 152..167, gate=0.627) :
+  "rsrqpqrsrqpqrsr"
 
 Projection référentielle vers les régimes découverts dans perceived.eff :
-  #1 régime [1] (68..102, gate=0.791) | résonance=0.4505 | err_croisée=0.3490 | cos=-0.125 | octets_communs=21%
-     noyau   : "TXC@N'NP?!*2)VQTXC@N'NP?!*2)VQTXC@"
-     référent (50..68) : "*+.MOLD_NESTED: VQ"
-  #2 régime [0] (18..50, gate=0.862) | résonance=0.3955 | err_croisée=0.4417 | cos=-0.173 | octets_communs=7%
-     noyau   : "()*+,'()*+,'()*+,'()*+,'()*+,'()"
-     référent (0..18) : "MOLD_ARITHMETIC: '"
-  #3 régime [2] (122..135, gate=0.600) | résonance=0.3599 | err_croisée=0.7075 | cos=+0.229 | octets_communs=100%
-     noyau   : "-!4Y)>4GH-@4Y"
-     référent (102..122) : "N'N.MOLD_GRAMMAR: GH"
+  #1 régime [0] (11..28, gate=0.652) | résonance=0.7631 | err_croisée=0.1867 | cos=+0.756 | octets_communs=0%
+     noyau   : "BCDCBAABCDCBAABCD"
+     référent (0..11) : "symetrie: A"
+  #2 régime [2] (81..102, gate=0.854) | résonance=0.3834 | err_croisée=0.4526 | cos=-0.204 | octets_communs=0%
+     noyau   : "234561234561234561234"
+     référent (65..81) : "Z.progression: 1"
+  #3 régime [3] (117..133, gate=0.667) | résonance=0.3403 | err_croisée=0.5418 | cos=-0.237 | octets_communs=13%
+     noyau   : "lpha_1 beta alph"
+     référent (102..117) : "56.grammaire: a"
+  #4 régime [1] (45..65, gate=0.852) | résonance=0.3266 | err_croisée=0.5109 | cos=-0.343 | octets_communs=0%
+     noyau   : "XYZXYZXYZXYZXYZXYZXY"
+     référent (28..45) : "CBA.periodicite: "
 
-Explication projetée (alphabet de E, marge=+0.0550) :
-  *+.MOLD_NESTED: VQ
+Explication projetée (alphabet de E, marge=+0.3797) :
+  symetrie: A
