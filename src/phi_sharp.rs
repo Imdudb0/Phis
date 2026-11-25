@@ -1,10 +1,8 @@
-//! φ_sharp (IIT 4.0) v0.3.0 :
-//! - Répertoires Cause/Effet ancrés sur l'engagement réel des nœuds latents dans E.
-//! - La coupe MIP mesure à la fois la perte d'intégration interne ET la perte d'explication
-//!   de E quand on coupe le graphe latent -> ne sature plus à 0.9876 et reste ~0 sur bruit blanc.
-//! - Projection évaluée par clauses paires/impaires + moitiés (robuste à l'ajout de résidu).
+//! φ_sharp (IIT 4.0) v0.3.1 :
+//! - Coupe MIP couplée à l'opérateur multiplicatif latent (g_j ⊙ rq_u) -> perte mesurée fidèlement.
+//! - Pente douce sur Discrimination (sigmoid/softplus) pour éviter le plateau à 0.0000 au démarrage.
 
-use crate::math::{iit_intrinsic_difference, iit_partition_loss, normalize_prob, tanh_clamped};
+use crate::math::{iit_intrinsic_difference, iit_partition_loss, normalize_prob, sigmoid, tanh_clamped};
 use crate::substrate::{D, HypothesisState, N_LAT, PerceivedGraph};
 
 #[derive(Clone, Debug)]
@@ -40,7 +38,6 @@ impl Default for EvalOptions {
     }
 }
 
-/// Engagement effectif de chaque nœud latent vis-à-vis de la distribution empirique de E.
 fn compute_e_grounded_latent_activity(h: &HypothesisState, pg: &PerceivedGraph) -> [f64; N_LAT] {
     let mut load = [0.0; N_LAT];
     let k = h.k;
@@ -53,8 +50,7 @@ fn compute_e_grounded_latent_activity(h: &HypothesisState, pg: &PerceivedGraph) 
     let mut act = [0.0; N_LAT];
     for i in 0..N_LAT {
         let state_norm = h.lat_states[i].iter().map(|x| x * x).sum::<f64>().sqrt();
-        // Un nœud inutilisé par E a un engagement quasi nul
-        act[i] = (0.15 + state_norm) * (0.1 + 4.0 * load[i]).min(2.0);
+        act[i] = (0.15 + state_norm) * (0.15 + 4.0 * load[i]).min(2.2);
     }
     act
 }
@@ -87,10 +83,10 @@ fn build_cause_effect_repertoires(
             su_e += w_ij;
             su_c += w_ji;
         }
-        eff[j] = (1.4 * s_eff).clamp(-10.0, 10.0).exp();
-        cau[j] = (1.4 * s_cau).clamp(-10.0, 10.0).exp();
-        u_eff[j] = (0.35 * su_e).clamp(-10.0, 10.0).exp();
-        u_cau[j] = (0.35 * su_c).clamp(-10.0, 10.0).exp();
+        eff[j] = (1.6 * s_eff).clamp(-10.0, 10.0).exp();
+        cau[j] = (1.6 * s_cau).clamp(-10.0, 10.0).exp();
+        u_eff[j] = (0.4 * su_e).clamp(-10.0, 10.0).exp();
+        u_cau[j] = (0.4 * su_c).clamp(-10.0, 10.0).exp();
     }
 
     normalize_prob(&mut eff);
@@ -100,12 +96,12 @@ fn build_cause_effect_repertoires(
     (eff, cau, u_eff, u_cau)
 }
 
-/// Prédit les transitions de E lorsque la coupe MIP `cut_mask` supprime les flux A <-> B.
 fn cut_sym_trans_fit(h: &HypothesisState, pg: &PerceivedGraph, cut_mask: &[bool; N_LAT]) -> f64 {
     let k = h.k;
     if k <= 1 || pg.sym_seq.len() < 2 {
         return 0.0;
     }
+    let base_scale = 1.0 / (D as f64).sqrt();
     let mut lat_trans = [0.0; N_LAT * N_LAT];
     for i in 0..N_LAT {
         let mut sum = 0.0;
@@ -113,7 +109,7 @@ fn cut_sym_trans_fit(h: &HypothesisState, pg: &PerceivedGraph, cut_mask: &[bool;
             let w = if cut_mask[i] != cut_mask[j] {
                 1e-4
             } else {
-                (2.2 * h.lat_couplings[i * N_LAT + j]).clamp(-10.0, 10.0).exp()
+                (2.4 * h.lat_couplings[i * N_LAT + j]).clamp(-10.0, 10.0).exp()
             };
             lat_trans[i * N_LAT + j] = w;
             sum += w;
@@ -134,14 +130,39 @@ fn cut_sym_trans_fit(h: &HypothesisState, pg: &PerceivedGraph, cut_mask: &[bool;
             }
             lat_after[j] = acc;
         }
-        let mut row_sum = 0.0;
+        let mut eff_op = [0.0; D];
+        for j in 0..N_LAT {
+            for d in 0..D {
+                eff_op[d] += lat_after[j] * h.lat_op_mods[j][d];
+            }
+        }
+        let mut eff_vec = [0.0; D];
+        for d in 0..D {
+            eff_vec[d] = eff_op[d] * h.sym_query_vecs[u][d];
+        }
+
+        let mut logits = vec![0.0; k];
+        let mut max_l = f64::NEG_INFINITY;
         for v in 0..k {
             let mut p_uv = 0.0;
             for j in 0..N_LAT {
                 p_uv += lat_after[j] * h.lat_to_sym[j * k + v];
             }
-            cut_trans[u * k + v] = p_uv.max(1e-9);
-            row_sum += cut_trans[u * k + v];
+            let mut bil = 0.0;
+            for d in 0..D {
+                bil += eff_vec[d] * h.sym_key_vecs[v][d];
+            }
+            let l = 1.5 * p_uv.max(1e-9).ln() + 3.0 * (bil * base_scale);
+            logits[v] = l;
+            if l > max_l {
+                max_l = l;
+            }
+        }
+        let mut row_sum = 0.0;
+        for v in 0..k {
+            let w = (logits[v] - max_l).clamp(-14.0, 0.0).exp().max(1e-9);
+            cut_trans[u * k + v] = w;
+            row_sum += w;
         }
         let inv = 1.0 / row_sum.max(1e-12);
         for v in 0..k {
@@ -181,7 +202,6 @@ pub fn compute_iit_mip(h: &HypothesisState, pg: &PerceivedGraph) -> (f64, f64) {
         return (0.0, 0.0);
     }
 
-    // Détection stricte de copie triviale H := E
     let k = h.k;
     let mut copy_l1 = 0.0;
     for idx in 0..(k * k) {
@@ -192,7 +212,6 @@ pub fn compute_iit_mip(h: &HypothesisState, pg: &PerceivedGraph) -> (f64, f64) {
     let asym_factor = (mean_asym * 5.0).clamp(0.10, 1.0);
     let non_trivial_factor = (diff_factor * asym_factor).sqrt();
 
-    // Fit complet de H sur E pour mesurer la perte d'explication de E sous coupe MIP
     let full_ll = if pg.sym_seq.len() >= 2 {
         let mut ll = 0.0;
         for w in pg.sym_seq.windows(2) {
@@ -244,11 +263,10 @@ pub fn compute_iit_mip(h: &HypothesisState, pg: &PerceivedGraph) -> (f64, f64) {
         min_e_loss = 0.0;
     }
 
-    // Échelle douce sans saturation précoce + couplage à la perte causale réelle sur E
-    let internal_mip = tanh_clamped(min_phi * 2.2 * non_trivial_factor);
-    let grounded_mip = tanh_clamped(min_e_loss * 2.5);
-    let phi_mip = (internal_mip * (0.25 + 0.75 * grounded_mip)).clamp(0.0, 1.0);
-    let ce_norm = tanh_clamped(cause_effect_power * 2.2 * non_trivial_factor);
+    let internal_mip = tanh_clamped(min_phi * 3.0 * non_trivial_factor);
+    let grounded_mip = tanh_clamped(min_e_loss * 3.0);
+    let phi_mip = (internal_mip * (0.35 + 0.65 * grounded_mip)).clamp(0.0, 1.0);
+    let ce_norm = tanh_clamped(cause_effect_power * 2.5 * non_trivial_factor);
     (phi_mip, ce_norm.max(0.0))
 }
 
@@ -260,7 +278,7 @@ pub fn score_generativity(h: &HypothesisState, pg: &PerceivedGraph) -> f64 {
     let uniform_ll = -(k as f64).ln();
 
     let mut ll1 = 0.0;
-    let mut count1: f64 = 0.0;
+    let mut count1 = 0.0;
     for w in pg.sym_seq.windows(2) {
         ll1 += h.sym_trans[w[0] * k + w[1]].max(1e-9).ln();
         count1 += 1.0;
@@ -268,7 +286,7 @@ pub fn score_generativity(h: &HypothesisState, pg: &PerceivedGraph) -> f64 {
     let mean_ll1 = ll1 / count1.max(1.0);
 
     let mut ll2 = 0.0;
-    let mut count2: f64 = 0.0;
+    let mut count2 = 0.0;
     if pg.sym_seq.len() >= 3 {
         let mut trans2 = vec![0.0; k * k];
         for u in 0..k {
@@ -287,9 +305,14 @@ pub fn score_generativity(h: &HypothesisState, pg: &PerceivedGraph) -> f64 {
     }
     let mean_ll2 = if count2 > 0.0 { ll2 / count2 } else { uniform_ll };
 
-    let gain1 = ((mean_ll1 - uniform_ll) / (-uniform_ll).max(0.5)).clamp(0.0, 1.5);
-    let gain2 = ((mean_ll2 - uniform_ll) / (-uniform_ll).max(0.5)).clamp(0.0, 1.5);
-    tanh_clamped((0.65 * gain1 + 0.35 * gain2) * 1.6).clamp(0.0, 1.0)
+    let gain1 = ((mean_ll1 - uniform_ll) / (-uniform_ll).max(0.5)).clamp(-0.2, 1.5);
+    let gain2 = ((mean_ll2 - uniform_ll) / (-uniform_ll).max(0.5)).clamp(-0.2, 1.5);
+    let raw = 0.65 * gain1 + 0.35 * gain2;
+    if raw <= 0.0 {
+        0.05 * sigmoid(raw * 4.0)
+    } else {
+        tanh_clamped(raw * 1.6).clamp(0.0, 1.0)
+    }
 }
 
 pub fn score_discrimination(h: &HypothesisState, pg: &PerceivedGraph) -> f64 {
@@ -327,12 +350,13 @@ pub fn score_discrimination(h: &HypothesisState, pg: &PerceivedGraph) -> f64 {
     }
     ll_marg /= (n - 1) as f64;
 
-    let margin_scr = (ll_true - ll_scr).max(0.0);
-    let margin_rev = (ll_true - ll_rev).max(0.0);
-    let margin_marg = (ll_true - ll_marg).max(0.0);
-
-    let combined = 0.55 * margin_scr + 0.30 * margin_rev + 0.15 * margin_marg;
-    tanh_clamped(combined * 2.5).clamp(0.0, 1.0)
+    let combined = 0.55 * (ll_true - ll_scr) + 0.30 * (ll_true - ll_rev) + 0.15 * (ll_true - ll_marg);
+    if combined <= 0.0 {
+        // Pente douce sous 0 pour permettre à NES de sortir du plateau initial (reste ~0 sur aléatoire)
+        0.04 * sigmoid(combined * 4.0)
+    } else {
+        tanh_clamped(combined * 2.5).clamp(0.0, 1.0)
+    }
 }
 
 pub fn score_projection(h: &HypothesisState, pg: &PerceivedGraph) -> f64 {
@@ -356,7 +380,6 @@ pub fn score_projection(h: &HypothesisState, pg: &PerceivedGraph) -> f64 {
         ((mean_ll - uniform_ll) / (-uniform_ll).max(0.5)).clamp(0.0, 1.3)
     };
 
-    // Consistance entre segments pairs et segments impairs (robuste aux ajouts finaux de résidu)
     let mut even_ll = 0.0;
     let mut even_n = 0.0;
     let mut odd_ll = 0.0;
@@ -509,6 +532,7 @@ fn rebuild_sym_trans_from_lat(h: &mut HypothesisState, _pg: &PerceivedGraph) {
     if h.search_depth == 0 {
         return;
     }
+    let base_scale = 1.0 / (D as f64).sqrt();
     let mut lat_trans = [0.0; N_LAT * N_LAT];
     for i in 0..N_LAT {
         let mut max_v = f64::NEG_INFINITY;
@@ -539,6 +563,17 @@ fn rebuild_sym_trans_from_lat(h: &mut HypothesisState, _pg: &PerceivedGraph) {
             }
             lat_after[j] = acc;
         }
+        let mut eff_op = [0.0; D];
+        for j in 0..N_LAT {
+            for d in 0..D {
+                eff_op[d] += lat_after[j] * h.lat_op_mods[j][d];
+            }
+        }
+        let mut eff_vec = [0.0; D];
+        for d in 0..D {
+            eff_vec[d] = eff_op[d] * h.sym_query_vecs[u][d];
+        }
+
         let mut logits = vec![0.0; k];
         let mut max_l = f64::NEG_INFINITY;
         for v in 0..k {
@@ -546,7 +581,11 @@ fn rebuild_sym_trans_from_lat(h: &mut HypothesisState, _pg: &PerceivedGraph) {
             for j in 0..N_LAT {
                 p_uv += lat_after[j] * h.lat_to_sym[j * k + v];
             }
-            let l = 3.2 * p_uv.max(1e-9).ln();
+            let mut bil = 0.0;
+            for d in 0..D {
+                bil += eff_vec[d] * h.sym_key_vecs[v][d];
+            }
+            let l = 1.5 * p_uv.max(1e-9).ln() + 3.0 * (bil * base_scale);
             logits[v] = l;
             if l > max_l {
                 max_l = l;
