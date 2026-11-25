@@ -44,18 +44,30 @@ impl CauseFamily {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SepMode {
+    None,
+    Newline,
+    Pipe,
+    Random,
+}
+
 #[derive(Clone, Debug)]
 pub struct Episode {
     pub effect: Vec<u8>,
     pub hidden_cause: CauseFamily,
 }
 
+/// Épisode composite en flux continu. Les métadonnées `hidden_*` ne servent
+/// qu'au diagnostic post-hoc et ne sont jamais vues pendant l'entraînement.
 #[derive(Clone, Debug)]
 pub struct CompositeEpisode {
     pub effect: Vec<u8>,
     pub hidden_query_idx: usize,
     pub hidden_match_idx: usize,
     pub hidden_families: Vec<CauseFamily>,
+    pub hidden_core_spans: Vec<(usize, usize)>,
+    pub hidden_tag_spans: Vec<Option<(usize, usize)>>,
 }
 
 struct TermNode {
@@ -127,7 +139,7 @@ pub fn sample_episode(rng: &mut Rng, family: CauseFamily) -> Episode {
 
 pub fn sample_episode_in_range(rng: &mut Rng, family: CauseFamily, lo: u8, hi: u8) -> Episode {
     let mut tg = TermGraph::new();
-    let max_len = 28 + rng.next_usize(25);
+    let max_len = 28 + rng.next_usize(21);
 
     let root = match family {
         CauseFamily::Periodic => {
@@ -139,7 +151,6 @@ pub fn sample_episode_in_range(rng: &mut Rng, family: CauseFamily, lo: u8, hi: u
             tg.add_branch(vec![motif; reps])
         }
         CauseFamily::Symmetric => {
-            // Palindromes pairs (ABCDDCBA) et impairs (ABCDCBA)
             let half = 3 + rng.next_usize(4);
             let odd = rng.next_usize(2) == 1;
             let alpha = sample_alphabet(rng, half + usize::from(odd), lo, hi);
@@ -183,7 +194,6 @@ pub fn sample_episode_in_range(rng: &mut Rng, family: CauseFamily, lo: u8, hi: u
             ])
         }
         CauseFamily::Substitution => {
-            // Réécriture L-système quasi-périodique (DAG de Fibonacci : S_k = S_{k-1} + S_{k-2})
             let alpha = sample_alphabet(rng, 5, lo, hi);
             let a0 = tg.add_leaf(alpha[0]);
             let a1 = tg.add_leaf(alpha[1]);
@@ -242,12 +252,27 @@ pub fn sample_episode_in_range(rng: &mut Rng, family: CauseFamily, lo: u8, hi: u
     }
 }
 
+fn choose_sep(rng: &mut Rng, mode: SepMode) -> &'static [u8] {
+    match mode {
+        SepMode::None => b"",
+        SepMode::Newline => b"\n",
+        SepMode::Pipe => b" | ",
+        SepMode::Random => match rng.next_usize(4) {
+            0 => b"",
+            1 => b"\n",
+            2 => b" | ",
+            _ => b"; ",
+        },
+    }
+}
+
 pub fn sample_composite_episode(
     rng: &mut Rng,
     num_molds: usize,
     with_tags: bool,
     printable_query: bool,
     query_last: bool,
+    sep_mode: SepMode,
 ) -> CompositeEpisode {
     let mut fams = CauseFamily::ALL.to_vec();
     rng.shuffle(&mut fams);
@@ -255,23 +280,26 @@ pub fn sample_composite_episode(
     fams.truncate(k);
 
     let target_fam = fams[0];
-    let mut entries: Vec<(Vec<u8>, CauseFamily, bool, bool)> = Vec::with_capacity(k + 1);
+    let sep = choose_sep(rng, sep_mode);
+
+    // Chaque entrée : (tag_optionnel, corps_causal, famille, is_query, is_match)
+    let mut entries: Vec<(Option<Vec<u8>>, Vec<u8>, CauseFamily, bool, bool)> =
+        Vec::with_capacity(k + 1);
 
     for (idx, &fam) in fams.iter().enumerate() {
         let body = sample_episode_in_range(rng, fam, 33, 90).effect;
-        let line = if with_tags {
-            let mut prefix = if printable_query {
+        let tag = if with_tags {
+            let prefix = if printable_query {
                 format!("MOLD_{}: ", fam.name().to_uppercase()).into_bytes()
             } else {
-                let tag_len = 6 + rng.next_usize(6);
+                let tag_len = 8 + rng.next_usize(5);
                 sample_alphabet(rng, tag_len, 33, 90)
             };
-            prefix.extend_from_slice(&body);
-            prefix
+            Some(prefix)
         } else {
-            body
+            None
         };
-        entries.push((line, fam, false, idx == 0));
+        entries.push((tag, body, fam, false, idx == 0));
     }
 
     let (q_lo, q_hi) = if printable_query {
@@ -283,9 +311,9 @@ pub fn sample_composite_episode(
 
     if query_last {
         rng.shuffle(&mut entries);
-        entries.push((query, target_fam, true, false));
+        entries.push((None, query, target_fam, true, false));
     } else {
-        entries.push((query, target_fam, true, false));
+        entries.push((None, query, target_fam, true, false));
         rng.shuffle(&mut entries);
     }
 
@@ -293,12 +321,25 @@ pub fn sample_composite_episode(
     let mut hidden_query_idx = 0;
     let mut hidden_match_idx = 0;
     let mut hidden_families = Vec::with_capacity(entries.len());
+    let mut hidden_core_spans = Vec::with_capacity(entries.len());
+    let mut hidden_tag_spans = Vec::with_capacity(entries.len());
 
-    for (i, (line, fam, is_query, is_match)) in entries.into_iter().enumerate() {
+    for (i, (tag_opt, body, fam, is_query, is_match)) in entries.into_iter().enumerate() {
         if i > 0 {
-            effect.push(b'\n');
+            effect.extend_from_slice(sep);
         }
-        effect.extend_from_slice(&line);
+        let tag_span = if let Some(tag) = tag_opt {
+            let ts = effect.len();
+            effect.extend_from_slice(&tag);
+            let te = effect.len();
+            Some((ts, te))
+        } else {
+            None
+        };
+        let cs = effect.len();
+        effect.extend_from_slice(&body);
+        let ce = effect.len();
+
         if is_query {
             hidden_query_idx = i;
         }
@@ -306,6 +347,8 @@ pub fn sample_composite_episode(
             hidden_match_idx = i;
         }
         hidden_families.push(fam);
+        hidden_core_spans.push((cs, ce));
+        hidden_tag_spans.push(tag_span);
     }
 
     CompositeEpisode {
@@ -313,5 +356,7 @@ pub fn sample_composite_episode(
         hidden_query_idx,
         hidden_match_idx,
         hidden_families,
+        hidden_core_spans,
+        hidden_tag_spans,
     }
 }
