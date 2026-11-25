@@ -555,7 +555,7 @@ fn sample_steps(g: &Grammar, tg: &mut TermGraph, rng: &mut Rng, n: usize, max_no
         let mut ms: Vec<Vec<(u32, Vec<Option<u32>>)>> = Vec::with_capacity(g.rules.len());
         let mut w: Vec<f32> = Vec::with_capacity(g.rules.len());
         for r in g.rules.iter() {
-            let m = matches(g, &reach, r);
+            let m = matches(tg, &reach, r);  
             w.push(if m.is_empty() { 0.0 } else { r.w * (m.len() as f32).sqrt() });
             ms.push(m);
         }
@@ -773,13 +773,13 @@ pub fn minidict(spec: &FamilySpec, rng: &mut Rng, k_entries: usize) -> MiniDict 
             used[x as usize] = true;
         }
     }
-    let sep = (0..256).find(|&i| !used[i]).unwrap_or(0);
-    used[sep] = true;
-    let colon = (0..256).find(|&i| !used[i]).unwrap_or(1);
-    used[colon] = true;
-    let qmark = (0..256).find(|&i| !used[i]).unwrap_or(2);
-    used[qmark] = true;
-
+    let sep: u8 = (0..=255u8).find(|&i| !used[i as usize]).unwrap_or(0);
+    used[sep as usize] = true;
+    let colon: u8 = (0..=255u8).find(|&i| !used[i as usize]).unwrap_or(1);
+    used[colon as usize] = true;
+    let qmark: u8 = (0..=255u8).find(|&i| !used[i as usize]).unwrap_or(2);
+    used[qmark as usize] = true;
+    
     let mut e: Vec<u8> = Vec::new();
     let mut entries = Vec::new();
     for (i, body) in bodies.iter().enumerate() {
