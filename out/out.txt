@@ -1,75 +1,61 @@
-[1m[33mwarning[0m[1m: fields `dst_idx`, `cross_err`, `cos_sim`, and `byte_overlap` are never read[0m
-  [1m[94m--> [0msrc/phi.rs:62:9
+[1m[33mwarning[0m[1m: unused variable: `dlen`[0m
+   [1m[94m--> [0msrc/multihop.rs:477:37
+    [1m[94m|[0m
+[1m[94m477[0m [1m[94m|[0m                     let (back, fwd, dlen) = diag_extent(bytes, t, j);
+    [1m[94m|[0m                                     [1m[33m^^^^[0m [1m[33mhelp: if this is intentional, prefix it with an underscore: `_dlen`[0m
+    [1m[94m|[0m
+    [1m[94m= [0m[1mnote[0m: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+[1m[33mwarning[0m[1m: field `mean_gate` is never read[0m
+  [1m[94m--> [0msrc/phi.rs:13:9
    [1m[94m|[0m
-[1m[94m61[0m [1m[94m|[0m pub struct ProjectionMatch {
-   [1m[94m|[0m            [1m[94m---------------[0m [1m[94mfields in this struct[0m
-[1m[94m62[0m [1m[94m|[0m     pub dst_idx: usize,
-   [1m[94m|[0m         [1m[33m^^^^^^^[0m
-[1m[94m63[0m [1m[94m|[0m     pub score: f32,
-[1m[94m64[0m [1m[94m|[0m     pub cross_err: f32,
-   [1m[94m|[0m         [1m[33m^^^^^^^^^[0m
-[1m[94m65[0m [1m[94m|[0m     pub cos_sim: f32,
-   [1m[94m|[0m         [1m[33m^^^^^^^[0m
+[1m[94m 9[0m [1m[94m|[0m pub struct DiscoveredRegime {
+   [1m[94m|[0m            [1m[94m----------------[0m [1m[94mfield in this struct[0m
 [1m[94m...[0m
-[1m[94m69[0m [1m[94m|[0m     pub byte_overlap: f32,
-   [1m[94m|[0m         [1m[33m^^^^^^^^^^^^[0m
+[1m[94m13[0m [1m[94m|[0m     pub mean_gate: f32,
+   [1m[94m|[0m         [1m[33m^^^^^^^^^[0m
    [1m[94m|[0m
-   [1m[94m= [0m[1mnote[0m: `ProjectionMatch` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+   [1m[94m= [0m[1mnote[0m: `DiscoveredRegime` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
    [1m[94m= [0m[1mnote[0m: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
 
-[1m[33mwarning[0m[1m: fields `r_top` and `r_rest` are never read[0m
-  [1m[94m--> [0msrc/phi.rs:75:9
-   [1m[94m|[0m
-[1m[94m73[0m [1m[94m|[0m pub struct CompositePhi {
-   [1m[94m|[0m            [1m[94m------------[0m [1m[94mfields in this struct[0m
-[1m[94m74[0m [1m[94m|[0m     pub score: f32,
-[1m[94m75[0m [1m[94m|[0m     pub r_top: f32,
-   [1m[94m|[0m         [1m[33m^^^^^[0m
-[1m[94m76[0m [1m[94m|[0m     pub r_rest: f32,
-   [1m[94m|[0m         [1m[33m^^^^^^[0m
-   [1m[94m|[0m
-   [1m[94m= [0m[1mnote[0m: `CompositePhi` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
-
-[1m[33mwarning[0m: `phisharp` (bin "phisharp") generated 2 warnings
+[1m[33mwarning[0m: `phisharp` (bin "phisharp") generated 2 warnings (run `cargo fix --bin "phisharp" -p phisharp` to apply 1 suggestion)
 [1m[92m    Finished[0m `release` profile [optimized] target(s) in 0.01s
-[1m[92m     Running[0m `target/release/phisharp train --out out/sharp.phis --steps 450`
-Entraînement Phisharp v0.7.2 (1852 params = 1541 Hop-1 + 311 Mémoire de Travail, 450 étapes, 24 paires ES, 4 threads)...
-  Curriculum 1 séance : étapes 1..=270 (Hop-1) -> 271..=405 (Mémoire de Travail) -> 406..=450 (Joint)
-[H1] step    1/450  | φ=+0.0581 | Gen=0.311 Disc=0.049 Spec=0.004 Gate=0.25/0.25 IIT=0.072 RefSel=0.271 | res=0.531 coll=0.820 (0.0s)
-[H1] step   25/450  | φ=+0.3201 | Gen=0.459 Disc=0.440 Spec=0.010 Gate=0.24/0.24 IIT=0.067 RefSel=0.312 | res=0.356 coll=0.498 (1.2s)
-[H1] step   50/450  | φ=+0.5470 | Gen=0.714 Disc=0.644 Spec=0.145 Gate=0.27/0.26 IIT=0.145 RefSel=0.365 | res=0.158 coll=0.388 (2.4s)
-[H1] step   75/450  | φ=+0.5754 | Gen=0.733 Disc=0.730 Spec=0.182 Gate=0.34/0.28 IIT=0.136 RefSel=0.414 | res=0.153 coll=0.426 (3.5s)
-[H1] step  100/450  | φ=+0.6006 | Gen=0.707 Disc=0.707 Spec=0.174 Gate=0.45/0.33 IIT=0.200 RefSel=0.372 | res=0.164 coll=0.433 (4.5s)
-[H1] step  125/450  | φ=+0.6262 | Gen=0.719 Disc=0.785 Spec=0.193 Gate=0.59/0.41 IIT=0.173 RefSel=0.422 | res=0.156 coll=0.246 (5.5s)
-[H1] step  150/450  | φ=+0.6823 | Gen=0.724 Disc=0.833 Spec=0.203 Gate=0.65/0.47 IIT=0.270 RefSel=0.327 | res=0.154 coll=0.255 (6.5s)
-[H1] step  175/450  | φ=+0.7165 | Gen=0.738 Disc=0.808 Spec=0.250 Gate=0.70/0.50 IIT=0.323 RefSel=0.336 | res=0.144 coll=0.276 (7.5s)
-[H1] step  200/450  | φ=+0.6682 | Gen=0.698 Disc=0.794 Spec=0.195 Gate=0.76/0.59 IIT=0.328 RefSel=0.405 | res=0.179 coll=0.348 (8.6s)
-[H1] step  225/450  | φ=+0.7151 | Gen=0.764 Disc=0.785 Spec=0.299 Gate=0.76/0.68 IIT=0.313 RefSel=0.336 | res=0.127 coll=0.149 (9.6s)
-[H1] step  250/450  | φ=+0.6863 | Gen=0.708 Disc=0.820 Spec=0.313 Gate=0.86/0.76 IIT=0.212 RefSel=0.367 | res=0.161 coll=0.198 (10.7s)
-[H1] step  270/450  | φ=+0.7077 | Gen=0.747 Disc=0.815 Spec=0.327 Gate=0.85/0.79 IIT=0.246 RefSel=0.460 | res=0.135 coll=0.177 (11.5s)
-[WM] step  271/450  | φ_wm=+0.1968 | align=0.078 (cut=0.000, IIT_echo=+0.078) | HSel=0.044 RSel=0.130 RDisc=0.000 (11.6s)
-[WM] step  275/450  | φ_wm=+0.1152 | align=0.104 (cut=0.000, IIT_echo=+0.104) | HSel=0.055 RSel=0.139 RDisc=0.000 (12.0s)
-[WM] step  300/450  | φ_wm=+0.3889 | align=0.525 (cut=0.165, IIT_echo=+0.360) | HSel=0.195 RSel=0.176 RDisc=0.000 (14.3s)
-[WM] step  325/450  | φ_wm=+0.5129 | align=0.366 (cut=0.000, IIT_echo=+0.366) | HSel=0.232 RSel=0.311 RDisc=0.000 (16.6s)
-[WM] step  350/450  | φ_wm=+0.6344 | align=0.202 (cut=0.000, IIT_echo=+0.202) | HSel=0.099 RSel=0.329 RDisc=0.000 (18.9s)
-[WM] step  375/450  | φ_wm=+0.7748 | align=0.563 (cut=0.000, IIT_echo=+0.563) | HSel=0.242 RSel=0.440 RDisc=0.000 (21.2s)
-[WM] step  400/450  | φ_wm=+0.6593 | align=0.692 (cut=0.000, IIT_echo=+0.692) | HSel=0.323 RSel=0.518 RDisc=0.027 (23.5s)
-[WM] step  405/450  | φ_wm=+0.6236 | align=0.552 (cut=0.000, IIT_echo=+0.552) | HSel=0.256 RSel=0.460 RDisc=0.178 (24.0s)
-[JT] step  425/450  | φ_h1=+0.7421 | φ_wm=+0.7179 (26.7s)
-[JT] step  450/450  | φ_h1=+0.7431 | φ_wm=+0.7179 (30.2s)
+[1m[92m     Running[0m `target/release/phisharp train --out out/sharp.phis --steps 300`
+Entraînement Phisharp v0.7 (1638 paramètres : 1541 Hop-1 + 97 Champ Réf., 300 étapes, 4 threads)...
+step    1/300  | φ=+0.0265 | Gen=0.291 Disc=0.030 Spec=0.005 Gate=0.25/0.25 IIT=0.087 RefSel=0.259 | res=0.561 coll=0.855 (0.1s)
+step   25/300  | φ=+0.4685 | Gen=0.660 Disc=0.493 Spec=0.053 Gate=0.25/0.24 IIT=0.138 RefSel=0.301 | res=0.194 coll=0.601 (2.0s)
+step   50/300  | φ=+0.6438 | Gen=0.852 Disc=0.761 Spec=0.141 Gate=0.26/0.26 IIT=0.160 RefSel=0.288 | res=0.077 coll=0.640 (3.8s)
+step   75/300  | φ=+0.6479 | Gen=0.817 Disc=0.820 Spec=0.275 Gate=0.32/0.28 IIT=0.183 RefSel=0.423 | res=0.095 coll=0.573 (5.7s)
+step  100/300  | φ=+0.6677 | Gen=0.779 Disc=0.813 Spec=0.273 Gate=0.42/0.34 IIT=0.252 RefSel=0.641 | res=0.117 coll=0.500 (7.5s)
+step  125/300  | φ=+0.7503 | Gen=0.813 Disc=0.843 Spec=0.255 Gate=0.55/0.47 IIT=0.389 RefSel=0.383 | res=0.098 coll=0.437 (9.2s)
+step  150/300  | φ=+0.7571 | Gen=0.819 Disc=0.869 Spec=0.262 Gate=0.64/0.56 IIT=0.357 RefSel=0.447 | res=0.094 coll=0.471 (11.0s)
+step  175/300  | φ=+0.7506 | Gen=0.818 Disc=0.884 Spec=0.290 Gate=0.75/0.61 IIT=0.267 RefSel=0.370 | res=0.095 coll=0.412 (12.7s)
+step  200/300  | φ=+0.7242 | Gen=0.778 Disc=0.866 Spec=0.280 Gate=0.84/0.76 IIT=0.208 RefSel=0.581 | res=0.120 coll=0.377 (14.5s)
+step  225/300  | φ=+0.7998 | Gen=0.860 Disc=0.867 Spec=0.334 Gate=0.83/0.72 IIT=0.330 RefSel=0.371 | res=0.070 coll=0.418 (16.3s)
+step  250/300  | φ=+0.7990 | Gen=0.840 Disc=0.858 Spec=0.334 Gate=0.85/0.79 IIT=0.362 RefSel=0.518 | res=0.080 coll=0.265 (18.0s)
+step  275/300  | φ=+0.7681 | Gen=0.821 Disc=0.846 Spec=0.420 Gate=0.88/0.79 IIT=0.279 RefSel=0.573 | res=0.092 coll=0.355 (19.8s)
+step  300/300  | φ=+0.8055 | Gen=0.854 Disc=0.853 Spec=0.302 Gate=0.89/0.79 IIT=0.319 RefSel=0.414 | res=0.074 coll=0.406 (21.5s)
+
+Phase B — Champ Référentiel Connexionniste (97 poids, 150 étapes ES non-supervisées)...
+ref     1/150  | φ_ref=+0.4539 (21.6s)
+ref    30/150  | φ_ref=+0.8562 (21.9s)
+ref    60/150  | φ_ref=+0.9712 (22.2s)
+ref    90/150  | φ_ref=+1.5951 (22.5s)
+ref   120/150  | φ_ref=+1.7290 (22.9s)
+ref   150/150  | φ_ref=+1.7076 (23.2s)
 
 --- Évaluation post-hoc 1 : Abstraction Méta-relationnelle (0 octet commun) ---
-  Même cause cachée : cos = +0.9511
-  Causes différentes: cos = +0.1120
-  Marge             : +0.8391
+  Même cause cachée : cos = +0.9213
+  Causes différentes: cos = +0.1468
+  Marge             : +0.7745
 
 --- Évaluation post-hoc 2 : Flux continu 1-saut auto-segmenté (4 moules, hasard = 25%) ---
-  Moules collés SANS séparateur (0 octet commun)     : 45/50 (90.0%)
-  Moules étiquetés, sép. aléatoire (0 octet commun)  : 48/50 (96.0%)  [référent exact=47/48]
+  Moules collés SANS séparateur (0 octet commun)     : 46/50 (92.0%)
+  Moules étiquetés, sép. aléatoire (0 octet commun)  : 44/50 (88.0%)  [référent exact=44/44]
 
---- Évaluation post-hoc 3 : Mémoire de Travail 100% Connexionniste (0 parsing symbolique) ---
-  Hop-2 multiligne (4 déf., hasard = 25%) : P(t)=23/50 (46.0%) | Δ_IIT=18/50 (36.0%)  [marge P=+0.028, IIT_echo=+0.622]
-  Hop-2 flux plat  (4 déf., hasard = 25%) : P(t)=30/50 (60.0%)
-  Hop-3 récursif   (5 déf., 3 causes)     : P(t)=13/50 (26.0%) | Δ_IIT=6/50 (12.0%)  [IIT_echo=+0.628]
+--- Évaluation post-hoc 3 : Multi-Sauts 100% Connexionniste (4 concepts, hasard = 25%) ---
+  Décomposition 2 causes (cible hybride)             : 47/50 (94.0%)
+  Crête alignée / exacte (multiligne, 0 octet com.)  : 2/50 (4.0%) | exact=0/50  [marge=+0.0882]
+  Crête alignée / exacte (flux plat, 0 octet com.)   : 2/50 (4.0%) | exact=0/50
 
 Modèle sauvegardé dans 'out/sharp.phis'.
