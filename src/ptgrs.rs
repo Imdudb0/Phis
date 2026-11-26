@@ -48,7 +48,6 @@ impl CauseFamily {
 pub enum SepMode {
     None,
     Newline,
-    Pipe,
     Random,
 }
 
@@ -58,8 +57,6 @@ pub struct Episode {
     pub hidden_cause: CauseFamily,
 }
 
-/// Épisode composite en flux continu. Les métadonnées `hidden_*` ne servent
-/// qu'au diagnostic post-hoc et ne sont jamais vues pendant l'entraînement.
 #[derive(Clone, Debug)]
 pub struct CompositeEpisode {
     pub effect: Vec<u8>,
@@ -68,6 +65,16 @@ pub struct CompositeEpisode {
     pub hidden_families: Vec<CauseFamily>,
     pub hidden_core_spans: Vec<(usize, usize)>,
     pub hidden_tag_spans: Vec<Option<(usize, usize)>>,
+}
+
+/// Scène multi-sauts : 4 moules primitifs étiquetés + 4 définitions composées (sans aucun
+/// exemple direct de ces concepts) + 1 cible hybride combinant 2 causes à 0 octet commun.
+#[derive(Clone, Debug)]
+pub struct MultiHopEpisode {
+    pub effect: Vec<u8>,
+    pub hidden_concept_name: Vec<u8>,
+    pub hidden_cause_pair: (CauseFamily, CauseFamily),
+    pub hidden_prim_names: Vec<Vec<u8>>,
 }
 
 struct TermNode {
@@ -256,7 +263,6 @@ fn choose_sep(rng: &mut Rng, mode: SepMode) -> &'static [u8] {
     match mode {
         SepMode::None => b"",
         SepMode::Newline => b"\n",
-        SepMode::Pipe => b" | ",
         SepMode::Random => match rng.next_usize(4) {
             0 => b"",
             1 => b"\n",
@@ -282,7 +288,6 @@ pub fn sample_composite_episode(
     let target_fam = fams[0];
     let sep = choose_sep(rng, sep_mode);
 
-    // Chaque entrée : (tag_optionnel, corps_causal, famille, is_query, is_match)
     let mut entries: Vec<(Option<Vec<u8>>, Vec<u8>, CauseFamily, bool, bool)> =
         Vec::with_capacity(k + 1);
 
@@ -358,5 +363,110 @@ pub fn sample_composite_episode(
         hidden_families,
         hidden_core_spans,
         hidden_tag_spans,
+    }
+}
+
+fn sample_unique_words(rng: &mut Rng, count: usize, readable: bool) -> Vec<Vec<u8>> {
+    if readable {
+        let mut pool: Vec<&'static [u8]> = vec![
+            b"SOLAR", b"LUNAR", b"PRISM", b"HELIX", b"TORUS", b"QUARK", b"ORBIT", b"PULSE",
+            b"DRIFT", b"SHARD", b"FLARE", b"CHORD", b"WEAVE", b"SPARK",
+        ];
+        rng.shuffle(&mut pool);
+        return pool
+            .into_iter()
+            .take(count)
+            .map(|w| w.to_vec())
+            .collect();
+    }
+    let mut out: Vec<Vec<u8>> = Vec::with_capacity(count);
+    while out.len() < count {
+        let w = sample_alphabet(rng, 5, b'A', b'Z');
+        if !out.contains(&w) {
+            out.push(w);
+        }
+    }
+    out
+}
+
+/// Génère une scène multi-sauts :
+/// - 4 moules primitifs étiquetés (corps dans `[33..63]`, noms dans `[A..Z]`)
+/// - 4 définitions composées (paires distinctes de moules, sans exemple direct)
+/// - 1 cible composite combinant 2 causes dans `[a..z]` (0% d'octets communs avec moules et définitions)
+pub fn sample_multihop_episode(
+    rng: &mut Rng,
+    flat: bool,
+    readable: bool,
+) -> MultiHopEpisode {
+    let mut fams = CauseFamily::ALL.to_vec();
+    rng.shuffle(&mut fams);
+    fams.truncate(4);
+
+    let words = sample_unique_words(rng, 8, readable);
+    let prim_names: Vec<Vec<u8>> = words[0..4].to_vec();
+    let comp_names: Vec<Vec<u8>> = words[4..8].to_vec();
+
+    // 4 paires distinctes parmi les 6 possibles ; la paire 0 est la cible cachée
+    let mut pairs: Vec<(usize, usize)> = vec![(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)];
+    let target_pair = pairs.remove(0);
+    rng.shuffle(&mut pairs);
+    let mut chosen_pairs: Vec<(usize, usize, Vec<u8>, bool)> = vec![
+        (target_pair.0, target_pair.1, comp_names[0].clone(), true),
+        (pairs[0].0, pairs[0].1, comp_names[1].clone(), false),
+        (pairs[1].0, pairs[1].1, comp_names[2].clone(), false),
+        (pairs[2].0, pairs[2].1, comp_names[3].clone(), false),
+    ];
+    rng.shuffle(&mut chosen_pairs);
+
+    let line_sep: &[u8] = if flat { b" | " } else { b"\n" };
+    let assign_op: &[u8] = match rng.next_usize(3) {
+        0 => b" = ",
+        1 => b" : ",
+        _ => b" -> ",
+    };
+    let join_op: &[u8] = match rng.next_usize(3) {
+        0 => b" + ",
+        1 => b" & ",
+        _ => b" , ",
+    };
+
+    let mut effect = Vec::new();
+    // 1. Moules primitifs (alphabet [33..63] disjoint de [A..Z] et de [a..z])
+    for i in 0..4 {
+        if i > 0 {
+            effect.extend_from_slice(line_sep);
+        }
+        effect.extend_from_slice(&prim_names[i]);
+        effect.extend_from_slice(b": ");
+        let body = sample_episode_in_range(rng, fams[i], 33, 63).effect;
+        effect.extend_from_slice(&body);
+    }
+
+    // 2. Définitions composées (purement symboliques, aucun exemple)
+    let mut hidden_concept_name = Vec::new();
+    for (u, v, cname, is_target) in chosen_pairs {
+        effect.extend_from_slice(line_sep);
+        effect.extend_from_slice(&cname);
+        effect.extend_from_slice(assign_op);
+        effect.extend_from_slice(&prim_names[u]);
+        effect.extend_from_slice(join_op);
+        effect.extend_from_slice(&prim_names[v]);
+        if is_target {
+            hidden_concept_name = cname;
+        }
+    }
+
+    // 3. Cible composite combinant les 2 causes dans [a..z] (0 octet commun avec le reste)
+    effect.extend_from_slice(line_sep);
+    let q1 = sample_episode_in_range(rng, fams[target_pair.0], b'a', b'z').effect;
+    let q2 = sample_episode_in_range(rng, fams[target_pair.1], b'a', b'z').effect;
+    effect.extend_from_slice(&q1);
+    effect.extend_from_slice(&q2);
+
+    MultiHopEpisode {
+        effect,
+        hidden_concept_name,
+        hidden_cause_pair: (fams[target_pair.0], fams[target_pair.1]),
+        hidden_prim_names: prim_names,
     }
 }
