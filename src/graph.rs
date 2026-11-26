@@ -17,21 +17,14 @@ pub const NODE_IN: usize = EDGE_HID * 2 + 2;
 pub const GATE_IN: usize = EDGE_HID * 2 + 2;
 pub const GATE_HID: usize = 4;
 
-// --- Mémoire de Travail Positionnelle (directement dans l'espace orthogonal 24D de H) ---
-pub const WM_DIM: usize = STATE_DIM; // 24
-pub const WM_STEPS: usize = 4;
-const ECHO_IN: usize = 7;
-const ECHO_HID: usize = 6;
-const SCAN_IN: usize = 7;
-const SCAN_CTRL: usize = 5;
-const SCAN_BLOCK: usize =
-    SCAN_CTRL * SCAN_IN + SCAN_CTRL * SCAN_CTRL + SCAN_CTRL + 3 * SCAN_CTRL + 3; // 83
-const WM_UPD_IN: usize = 5;
-const WM_UPD_HID: usize = 4;
-const READ_IN: usize = 8;
-const READ_HID: usize = 6;
+// Sous-réseau référentiel connexionniste (97 paramètres appris pour Hop-2 / Hop-3)
+pub const REF_EDGE_IN: usize = 6;
+pub const REF_EDGE_HID: usize = 4;
+pub const REF_ROLE_IN: usize = 5;
+pub const REF_ROLE_HID: usize = 4;
+pub const REF_CLAUSE_IN: usize = 4;
+pub const REF_CLAUSE_HID: usize = 4;
 
-// --- Paramètres Hop-1 (0..1541) ---
 const OFF_REL_EDGE_W: usize = 0; // 48
 const OFF_REL_EDGE_B: usize = OFF_REL_EDGE_W + EDGE_HID * EDGE_IN; // 48, len 4
 const OFF_REL_NODE_W: usize = OFF_REL_EDGE_B + EDGE_HID; // 52, len 80
@@ -52,123 +45,33 @@ const OFF_CTX: usize = OFF_BH + DIM * (2 * DIM); // 1461, len 32
 const OFF_U: usize = OFF_CTX + DIM * REL_DIM; // 1493, len 16
 const OFF_OUT: usize = OFF_U + DIM * DIM; // 1509, len 32
 
-// --- Paramètres Mémoire de Travail (1541..1852, +311 params) ---
-pub const WM_PARAM_START: usize = OFF_OUT + REL_DIM * DIM; // 1541
-const OFF_ECHO_W1: usize = WM_PARAM_START; // 1541, len 42
-const OFF_ECHO_B1: usize = OFF_ECHO_W1 + ECHO_HID * ECHO_IN; // 1583, len 6
-const OFF_ECHO_W2: usize = OFF_ECHO_B1 + ECHO_HID; // 1589, len 6
-const OFF_ECHO_B2: usize = OFF_ECHO_W2 + ECHO_HID; // 1595, len 1
-const OFF_SCAN_BWD: usize = OFF_ECHO_B2 + 1; // 1596, len 83
-const OFF_SCAN_FWD: usize = OFF_SCAN_BWD + SCAN_BLOCK; // 1679, len 83
-const OFF_WM_UPD_W1: usize = OFF_SCAN_FWD + SCAN_BLOCK; // 1762, len 20
-const OFF_WM_UPD_B1: usize = OFF_WM_UPD_W1 + WM_UPD_HID * WM_UPD_IN; // 1782, len 4
-const OFF_WM_UPD_W2: usize = OFF_WM_UPD_B1 + WM_UPD_HID; // 1786, len 4
-const OFF_WM_UPD_B2: usize = OFF_WM_UPD_W2 + WM_UPD_HID; // 1790, len 1
-const OFF_READ_W1: usize = OFF_WM_UPD_B2 + 1; // 1791, len 48
-const OFF_READ_B1: usize = OFF_READ_W1 + READ_HID * READ_IN; // 1839, len 6
-const OFF_READ_W2: usize = OFF_READ_B1 + READ_HID; // 1845, len 6
-const OFF_READ_B2: usize = OFF_READ_W2 + READ_HID; // 1851, len 1
-pub const NUM_PARAMS: usize = OFF_READ_B2 + 1; // 1852
+pub const OFF_REF_START: usize = OFF_OUT + REL_DIM * DIM; // 1541
+const OFF_REF_EDGE_W1: usize = OFF_REF_START; // 1541, len 24
+const OFF_REF_EDGE_B1: usize = OFF_REF_EDGE_W1 + REF_EDGE_HID * REF_EDGE_IN; // 1565, len 4
+const OFF_REF_EDGE_W2: usize = OFF_REF_EDGE_B1 + REF_EDGE_HID; // 1569, len 4
+const OFF_REF_EDGE_B2: usize = OFF_REF_EDGE_W2 + REF_EDGE_HID; // 1573, len 1
+
+const OFF_REF_ROLE_W1: usize = OFF_REF_EDGE_B2 + 1; // 1574, len 20
+const OFF_REF_ROLE_B1: usize = OFF_REF_ROLE_W1 + REF_ROLE_HID * REF_ROLE_IN; // 1594, len 4
+const OFF_REF_ROLE_W2: usize = OFF_REF_ROLE_B1 + REF_ROLE_HID; // 1598, len 8
+const OFF_REF_ROLE_B2: usize = OFF_REF_ROLE_W2 + 2 * REF_ROLE_HID; // 1606, len 2
+
+const OFF_REF_CL_W1: usize = OFF_REF_ROLE_B2 + 2; // 1608, len 16
+const OFF_REF_CL_B1: usize = OFF_REF_CL_W1 + REF_CLAUSE_HID * REF_CLAUSE_IN; // 1624, len 4
+const OFF_REF_CL_W2: usize = OFF_REF_CL_B1 + REF_CLAUSE_HID; // 1628, len 8
+const OFF_REF_CL_B2: usize = OFF_REF_CL_W2 + 2 * REF_CLAUSE_HID; // 1636, len 2
+
+pub const NUM_PARAMS: usize = OFF_REF_CL_B2 + 2; // 1638
 
 const MAGIC: &[u8; 4] = b"PHIS";
-const VERSION: u32 = 9;
+const VERSION: u32 = 6;
 
 #[inline]
 fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x.clamp(-12.0, 12.0)).exp())
 }
 
-pub fn wm_norm(v: &[f32; WM_DIM]) -> f32 {
-    let mut s = 0.0f32;
-    for &x in v {
-        s += x * x;
-    }
-    s.sqrt()
-}
-
-pub fn wm_normalize(v: &[f32; WM_DIM]) -> [f32; WM_DIM] {
-    let nrm = wm_norm(v);
-    if nrm < 1e-8 {
-        return [0.0; WM_DIM];
-    }
-    let inv = 1.0 / nrm;
-    let mut out = [0.0f32; WM_DIM];
-    for d in 0..WM_DIM {
-        out[d] = v[d] * inv;
-    }
-    out
-}
-
-pub fn wm_cosine(a: &[f32; WM_DIM], b: &[f32; WM_DIM]) -> f32 {
-    let mut dot = 0.0f32;
-    let mut na = 0.0f32;
-    let mut nb = 0.0f32;
-    for d in 0..WM_DIM {
-        dot += a[d] * b[d];
-        na += a[d] * a[d];
-        nb += b[d] * b[d];
-    }
-    let denom = (na * nb).sqrt();
-    if denom < 1e-8 {
-        0.0
-    } else {
-        (dot / denom).clamp(-1.0, 1.0)
-    }
-}
-
-pub fn wm_align(v: &[f32; WM_DIM], q: &[f32; WM_DIM]) -> f32 {
-    let mut dot = 0.0f32;
-    let mut nv = 0.0f32;
-    let mut nq = 0.0f32;
-    for d in 0..WM_DIM {
-        dot += v[d] * q[d];
-        nv += v[d] * v[d];
-        nq += q[d] * q[d];
-    }
-    let qn = nq.sqrt();
-    if qn < 1e-8 {
-        return 0.0;
-    }
-    let denom = (nv.sqrt() + 0.25) * qn;
-    (dot / denom).clamp(-1.0, 1.0)
-}
-
-pub fn orth_novelty(msg: &[f32; WM_DIM], cur: &[f32; WM_DIM]) -> [f32; WM_DIM] {
-    let mut dot = 0.0f32;
-    let mut m2 = 0.0f32;
-    let mut z2 = 0.0f32;
-    for d in 0..WM_DIM {
-        dot += msg[d] * cur[d];
-        m2 += msg[d] * msg[d];
-        z2 += cur[d] * cur[d];
-    }
-    if m2 < 1e-8 {
-        return [0.0; WM_DIM];
-    }
-    if dot <= 0.0 || z2 < 1e-8 {
-        return *msg;
-    }
-    let gate = ((1.0 - dot / m2) * 2.0).clamp(0.0, 1.0);
-    if gate < 1e-6 {
-        return [0.0; WM_DIM];
-    }
-    let proj = (dot / (z2 + 1e-6)).min(1.0);
-    let mut out = [0.0f32; WM_DIM];
-    for d in 0..WM_DIM {
-        out[d] = gate * (msg[d] - proj * cur[d]);
-    }
-    out
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct EchoEdge {
-    pub src: u32,
-    pub norm_len: f32,
-    pub log_deg: f32,
-    pub rel_dist: f32,
-    pub freq_src: f32,
-}
-
+/// Substrat relationnel brut à échelle invariante (fenêtre fixe ±30, degré local ±12).
 #[derive(Clone, Debug)]
 pub struct RawSubstrate {
     pub len: usize,
@@ -176,11 +79,6 @@ pub struct RawSubstrate {
     pub edges: Vec<[f32; EDGE_IN]>,
     pub edge_targets: Vec<u32>,
     pub deg: Vec<f32>,
-    pub global_freq: Vec<f32>,
-    pub back_echo_len: Vec<f32>,
-    pub echo_log_deg: Vec<f32>,
-    pub echo_offsets: Vec<usize>,
-    pub echo_edges: Vec<EchoEdge>,
 }
 
 impl RawSubstrate {
@@ -190,20 +88,6 @@ impl RawSubstrate {
         let deg_rad = 12usize;
         let max_edges = 12usize;
         let log_cap = (win_cap as f32).ln();
-
-        let mut counts = [0u32; 256];
-        let mut max_c = 1u32;
-        for &b in bytes {
-            counts[b as usize] += 1;
-            if counts[b as usize] > max_c {
-                max_c = counts[b as usize];
-            }
-        }
-        let inv_max_c = 1.0 / (max_c as f32);
-        let global_freq: Vec<f32> = bytes
-            .iter()
-            .map(|&b| counts[b as usize] as f32 * inv_max_c)
-            .collect();
 
         let m_nb = |a: isize, b: isize, ti: isize, ji: isize| -> f32 {
             if a >= 0 && b >= 0 && a != b && !(a == ji && b == ti) {
@@ -302,92 +186,12 @@ impl RawSubstrate {
             offsets.push(edges.len());
         }
 
-        // Diagonales d'écho longue portée strictement causales (src < dst, L >= 3) :
-        // empêche toute fuite arrière des définitions vers les étiquettes primitives.
-        let mut back_echo_len = vec![0.0f32; n];
-        let mut echo_deg_raw = vec![0u32; n];
-        let mut raw_links: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n];
-
-        if n > 20 {
-            let max_d = n.min(1024);
-            for d in 17..max_d {
-                let mut i = 0usize;
-                while i + d < n {
-                    if bytes[i] == bytes[i + d] {
-                        let start = i;
-                        while i + d < n && bytes[i] == bytes[i + d] {
-                            i += 1;
-                        }
-                        let run_len = i - start;
-                        if run_len >= 3 {
-                            let nl = (run_len as f32 / 10.0).min(1.0);
-                            for k in 0..run_len {
-                                let a = start + k;
-                                let b = a + d;
-                                echo_deg_raw[a] += 1;
-                                echo_deg_raw[b] += 1;
-                                if nl > back_echo_len[b] {
-                                    back_echo_len[b] = nl;
-                                }
-                                raw_links[b].push((a, run_len));
-                            }
-                        }
-                    } else {
-                        i += 1;
-                    }
-                }
-            }
-        }
-
-        let echo_log_deg: Vec<f32> = echo_deg_raw
-            .iter()
-            .map(|&c| {
-                if c == 0 {
-                    0.0
-                } else {
-                    (((c + 1) as f32).ln() / 3.0).clamp(0.0, 1.0)
-                }
-            })
-            .collect();
-
-        let max_echo_per_pos = 6usize;
-        let inv_n = 1.0 / (n.max(1) as f32);
-        let mut echo_offsets = Vec::with_capacity(n + 1);
-        let mut echo_edges = Vec::new();
-        echo_offsets.push(0);
-
-        for dst in 0..n {
-            let list = &mut raw_links[dst];
-            if list.len() > max_echo_per_pos {
-                list.sort_unstable_by(|a, b| {
-                    b.1.cmp(&a.1)
-                        .then_with(|| dst.abs_diff(a.0).cmp(&dst.abs_diff(b.0)))
-                });
-                list.truncate(max_echo_per_pos);
-            }
-            for &(src, run_len) in list.iter() {
-                echo_edges.push(EchoEdge {
-                    src: src as u32,
-                    norm_len: (run_len as f32 / 10.0).min(1.0),
-                    log_deg: echo_log_deg[dst],
-                    rel_dist: ((dst as f32) - (src as f32)) * inv_n,
-                    freq_src: global_freq[src],
-                });
-            }
-            echo_offsets.push(echo_edges.len());
-        }
-
         Self {
             len: n,
             offsets,
             edges,
             edge_targets,
             deg,
-            global_freq,
-            back_echo_len,
-            echo_log_deg,
-            echo_offsets,
-            echo_edges,
         }
     }
 }
@@ -417,6 +221,67 @@ impl PhiGraph {
     pub fn from_weights(weights: Vec<f32>) -> Self {
         assert_eq!(weights.len(), NUM_PARAMS);
         Self { weights }
+    }
+
+    /// Porte d'écho relationnel apprise (arête diagonale longue portée dans M).
+    #[inline]
+    pub fn eval_echo_gate(&self, feat: &[f32; REF_EDGE_IN]) -> f32 {
+        let w = &self.weights;
+        let mut logit = w[OFF_REF_EDGE_B2];
+        for h in 0..REF_EDGE_HID {
+            let base = OFF_REF_EDGE_W1 + h * REF_EDGE_IN;
+            let mut acc = w[OFF_REF_EDGE_B1 + h];
+            for k in 0..REF_EDGE_IN {
+                acc += w[base + k] * feat[k];
+            }
+            logit += w[OFF_REF_EDGE_W2 + h] * acc.tanh();
+        }
+        sigmoid(logit)
+    }
+
+    /// Cellule de rôle apprise : estime `(p_head, p_boiler) ∈ (0, 1)²` uniquement depuis M.
+    #[inline]
+    pub fn eval_role_cell(&self, feat: &[f32; REF_ROLE_IN]) -> (f32, f32) {
+        let w = &self.weights;
+        let mut hid = [0.0f32; REF_ROLE_HID];
+        for h in 0..REF_ROLE_HID {
+            let base = OFF_REF_ROLE_W1 + h * REF_ROLE_IN;
+            let mut acc = w[OFF_REF_ROLE_B1 + h];
+            for k in 0..REF_ROLE_IN {
+                acc += w[base + k] * feat[k];
+            }
+            hid[h] = acc.tanh();
+        }
+        let mut l0 = w[OFF_REF_ROLE_B2];
+        let mut l1 = w[OFF_REF_ROLE_B2 + 1];
+        for h in 0..REF_ROLE_HID {
+            l0 += w[OFF_REF_ROLE_W2 + h] * hid[h];
+            l1 += w[OFF_REF_ROLE_W2 + REF_ROLE_HID + h] * hid[h];
+        }
+        (sigmoid(l0), sigmoid(l1))
+    }
+
+    /// Cellule récurrente non-réciproque d'intégration de clause :
+    /// retourne `(keep_acc, next_head_seen) ∈ (0, 1)²`.
+    #[inline]
+    pub fn eval_clause_gates(&self, feat: &[f32; REF_CLAUSE_IN]) -> (f32, f32) {
+        let w = &self.weights;
+        let mut hid = [0.0f32; REF_CLAUSE_HID];
+        for h in 0..REF_CLAUSE_HID {
+            let base = OFF_REF_CL_W1 + h * REF_CLAUSE_IN;
+            let mut acc = w[OFF_REF_CL_B1 + h];
+            for k in 0..REF_CLAUSE_IN {
+                acc += w[base + k] * feat[k];
+            }
+            hid[h] = acc.tanh();
+        }
+        let mut l0 = w[OFF_REF_CL_B2];
+        let mut l1 = w[OFF_REF_CL_B2 + 1];
+        for h in 0..REF_CLAUSE_HID {
+            l0 += w[OFF_REF_CL_W2 + h] * hid[h];
+            l1 += w[OFF_REF_CL_W2 + REF_CLAUSE_HID + h] * hid[h];
+        }
+        (sigmoid(l0), sigmoid(l1))
     }
 
     pub fn encode_with_gate(&self, sub: &RawSubstrate) -> (Vec<[f32; REL_DIM]>, Vec<f32>, Vec<f32>) {
@@ -728,317 +593,6 @@ impl PhiGraph {
         self.abduce_with_steps(rels, cut_mask, SEARCH_STEPS)
     }
 
-    // =========================================================================
-    // MÉMOIRE DE TRAVAIL POSITIONNELLE (directement dans l'espace 24D de H)
-    // =========================================================================
-
-    fn eval_echo_weight(&self, feat: &[f32; ECHO_IN]) -> f32 {
-        let w = &self.weights;
-        let mut logit = w[OFF_ECHO_B2];
-        for h in 0..ECHO_HID {
-            let base = OFF_ECHO_W1 + h * ECHO_IN;
-            let mut acc = w[OFF_ECHO_B1 + h];
-            for k in 0..ECHO_IN {
-                acc += w[base + k] * feat[k];
-            }
-            logit += w[OFF_ECHO_W2 + h] * acc.tanh();
-        }
-        sigmoid(logit)
-    }
-
-    fn eval_scanner_step(
-        &self,
-        off: usize,
-        ctrl: &mut [f32; SCAN_CTRL],
-        inp: &[f32; SCAN_IN],
-        init_bias: [f32; 3],
-    ) -> (f32, f32, f32) {
-        let w = &self.weights;
-        let off_in = off;
-        let off_rec = off_in + SCAN_CTRL * SCAN_IN;
-        let off_b = off_rec + SCAN_CTRL * SCAN_CTRL;
-        let off_out_w = off_b + SCAN_CTRL;
-        let off_out_b = off_out_w + 3 * SCAN_CTRL;
-
-        let mut next_ctrl = [0.0f32; SCAN_CTRL];
-        for h in 0..SCAN_CTRL {
-            let mut acc = w[off_b + h];
-            for k in 0..SCAN_IN {
-                acc += w[off_in + h * SCAN_IN + k] * inp[k];
-            }
-            for j in 0..SCAN_CTRL {
-                acc += w[off_rec + h * SCAN_CTRL + j] * ctrl[j];
-            }
-            next_ctrl[h] = acc.tanh();
-        }
-        *ctrl = next_ctrl;
-
-        let mut gates = [0.0f32; 3];
-        for g in 0..3 {
-            let mut acc = w[off_out_b + g] + init_bias[g];
-            for h in 0..SCAN_CTRL {
-                acc += w[off_out_w + g * SCAN_CTRL + h] * ctrl[h];
-            }
-            gates[g] = sigmoid(acc);
-        }
-        (gates[0], gates[1], gates[2])
-    }
-
-    /// Exécute `WM_STEPS` itérations de la mémoire de travail :
-    /// - Sub-step A : transport causal avant (`src < dst`) le long des échos longue portée
-    /// - Sub-step B : balayage arrière (`←`) prioritaire + balayage avant (`→`) fermé à l'init
-    /// - Sub-step C : fusion orthogonale Gram-Schmidt idempotente.
-    pub fn propagate_working_memory(
-        &self,
-        sub: &RawSubstrate,
-        gates_pt: &[f32],
-        init_z: &[[f32; WM_DIM]],
-        cut_echoes: bool,
-    ) -> Vec<[f32; WM_DIM]> {
-        let n = sub.len;
-        if n == 0 {
-            return Vec::new();
-        }
-        let w = &self.weights;
-        let mut z = init_z.to_vec();
-
-        let mut msg_echo = vec![[0.0f32; WM_DIM]; n];
-        let mut msg_bwd = vec![[0.0f32; WM_DIM]; n];
-        let mut msg_fwd = vec![[0.0f32; WM_DIM]; n];
-        let mut norms = vec![0.0f32; n];
-
-        for _ in 0..WM_STEPS {
-            for t in 0..n {
-                norms[t] = wm_norm(&z[t]);
-            }
-
-            // Sub-step A : transport causal avant par échos longue portée de M(a,b)
-            if !cut_echoes {
-                for dst in 0..n {
-                    msg_echo[dst] = [0.0; WM_DIM];
-                    let slice = &sub.echo_edges[sub.echo_offsets[dst]..sub.echo_offsets[dst + 1]];
-                    if slice.is_empty() {
-                        continue;
-                    }
-                    let mut acc = [0.0f32; WM_DIM];
-                    for edge in slice {
-                        let src = edge.src as usize;
-                        if norms[src] < 0.05 {
-                            continue;
-                        }
-                        let feat = [
-                            edge.norm_len,
-                            edge.log_deg,
-                            edge.rel_dist,
-                            edge.freq_src,
-                            (norms[src] / 2.0).min(1.0),
-                            (norms[dst] / 2.0).min(1.0),
-                            gates_pt[src],
-                        ];
-                        let alpha = self.eval_echo_weight(&feat);
-                        if alpha > 0.05 {
-                            let nov = orth_novelty(&z[src], &acc);
-                            for d in 0..WM_DIM {
-                                acc[d] += alpha * nov[d];
-                            }
-                        }
-                    }
-                    msg_echo[dst] = acc;
-                }
-                for t in 0..n {
-                    if wm_norm(&msg_echo[t]) > 1e-4 {
-                        let nov = orth_novelty(&msg_echo[t], &z[t]);
-                        for d in 0..WM_DIM {
-                            z[t][d] += nov[d];
-                        }
-                        let nrm = wm_norm(&z[t]);
-                        if nrm > 3.0 {
-                            let sc = 3.0 / nrm;
-                            for x in &mut z[t] {
-                                *x *= sc;
-                            }
-                        }
-                        norms[t] = nrm.min(3.0);
-                    }
-                }
-            }
-
-            // Sub-step B1 : balayage directionnel arrière (t = n-1 -> 0) avec transition d'écho
-            let mut ctrl_b = [0.0f32; SCAN_CTRL];
-            let mut carry_b = [0.0f32; WM_DIM];
-            for t in (0..n).rev() {
-                let c_norm = (wm_norm(&carry_b) / 2.0).min(1.0);
-                let prev_be = if t + 1 < n {
-                    sub.back_echo_len[t + 1]
-                } else {
-                    0.0
-                };
-                let inp = [
-                    gates_pt[t],
-                    sub.back_echo_len[t],
-                    prev_be,
-                    sub.echo_log_deg[t],
-                    sub.global_freq[t],
-                    (norms[t] / 2.0).min(1.0),
-                    c_norm,
-                ];
-                let (keep, absorb, write) =
-                    self.eval_scanner_step(OFF_SCAN_BWD, &mut ctrl_b, &inp, [1.4, 0.6, 0.6]);
-
-                for d in 0..WM_DIM {
-                    carry_b[d] *= keep;
-                }
-                if norms[t] > 0.05 {
-                    let nov = orth_novelty(&z[t], &carry_b);
-                    for d in 0..WM_DIM {
-                        carry_b[d] += absorb * nov[d];
-                    }
-                    let cn = wm_norm(&carry_b);
-                    if cn > 3.0 {
-                        let sc = 3.0 / cn;
-                        for x in &mut carry_b {
-                            *x *= sc;
-                        }
-                    }
-                }
-                for d in 0..WM_DIM {
-                    msg_bwd[t][d] = write * carry_b[d];
-                }
-            }
-
-            // Sub-step B2 : balayage directionnel avant (fermé par défaut pour éviter les bavures inter-clauses)
-            let mut ctrl_f = [0.0f32; SCAN_CTRL];
-            let mut carry_f = [0.0f32; WM_DIM];
-            for t in 0..n {
-                let c_norm = (wm_norm(&carry_f) / 2.0).min(1.0);
-                let prev_be = if t > 0 { sub.back_echo_len[t - 1] } else { 0.0 };
-                let inp = [
-                    gates_pt[t],
-                    sub.back_echo_len[t],
-                    prev_be,
-                    sub.echo_log_deg[t],
-                    sub.global_freq[t],
-                    (norms[t] / 2.0).min(1.0),
-                    c_norm,
-                ];
-                let (keep, absorb, write) =
-                    self.eval_scanner_step(OFF_SCAN_FWD, &mut ctrl_f, &inp, [-1.5, -1.0, -1.5]);
-
-                for d in 0..WM_DIM {
-                    carry_f[d] *= keep;
-                }
-                if norms[t] > 0.05 {
-                    let nov = orth_novelty(&z[t], &carry_f);
-                    for d in 0..WM_DIM {
-                        carry_f[d] += absorb * nov[d];
-                    }
-                    let cn = wm_norm(&carry_f);
-                    if cn > 3.0 {
-                        let sc = 3.0 / cn;
-                        for x in &mut carry_f {
-                            *x *= sc;
-                        }
-                    }
-                }
-                for d in 0..WM_DIM {
-                    msg_fwd[t][d] = write * carry_f[d];
-                }
-            }
-
-            // Sub-step C : fusion orthogonale dans Z
-            for t in 0..n {
-                let nb = (wm_norm(&msg_bwd[t]) / 2.0).min(1.0);
-                let nf = (wm_norm(&msg_fwd[t]) / 2.0).min(1.0);
-                if nb + nf < 1e-4 {
-                    continue;
-                }
-                let upd_in = [
-                    (norms[t] / 2.0).min(1.0),
-                    nb,
-                    nf,
-                    gates_pt[t],
-                    sub.back_echo_len[t],
-                ];
-                let mut logit = w[OFF_WM_UPD_B2] + 0.5;
-                for h in 0..WM_UPD_HID {
-                    let base = OFF_WM_UPD_W1 + h * WM_UPD_IN;
-                    let mut acc = w[OFF_WM_UPD_B1 + h];
-                    for k in 0..WM_UPD_IN {
-                        acc += w[base + k] * upd_in[k];
-                    }
-                    logit += w[OFF_WM_UPD_W2 + h] * acc.tanh();
-                }
-                let gamma = sigmoid(logit);
-
-                let mut z_next = z[t];
-                let nov_b = orth_novelty(&msg_bwd[t], &z_next);
-                for d in 0..WM_DIM {
-                    z_next[d] += gamma * nov_b[d];
-                }
-                let nov_f = orth_novelty(&msg_fwd[t], &z_next);
-                for d in 0..WM_DIM {
-                    z_next[d] += gamma * nov_f[d];
-                }
-
-                let nrm = wm_norm(&z_next);
-                if nrm > 3.0 {
-                    let sc = 3.0 / nrm;
-                    for x in &mut z_next {
-                        *x *= sc;
-                    }
-                }
-                z[t] = z_next;
-            }
-        }
-
-        z
-    }
-
-    /// Tête de lecture connexionniste unifiée (1-saut & multi-sauts) grâce à `max_delta_ctx`.
-    pub fn readout_explanation(
-        &self,
-        sub: &RawSubstrate,
-        gates_pt: &[f32],
-        z_full: &[[f32; WM_DIM]],
-        z_cut: &[[f32; WM_DIM]],
-        z_query: &[f32; WM_DIM],
-        max_delta_ctx: f32,
-    ) -> Vec<f32> {
-        let w = &self.weights;
-        let n = sub.len;
-        let mut out = Vec::with_capacity(n);
-
-        for t in 0..n {
-            let align_full = wm_align(&z_full[t], z_query);
-            let align_cut = wm_align(&z_cut[t], z_query);
-            let align_delta = (align_full - align_cut).max(0.0);
-            let nrm = (wm_norm(&z_full[t]) / 2.0).min(1.0);
-            let feat = [
-                align_full,
-                align_cut,
-                align_delta,
-                max_delta_ctx,
-                nrm,
-                gates_pt[t],
-                sub.back_echo_len[t],
-                sub.global_freq[t],
-            ];
-
-            let mut logit = w[OFF_READ_B2];
-            for h in 0..READ_HID {
-                let base = OFF_READ_W1 + h * READ_IN;
-                let mut acc = w[OFF_READ_B1 + h];
-                for k in 0..READ_IN {
-                    acc += w[base + k] * feat[k];
-                }
-                logit += w[OFF_READ_W2 + h] * acc.tanh();
-            }
-            out.push(sigmoid(logit));
-        }
-
-        out
-    }
-
     pub fn save<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
         if let Some(parent) = path.as_ref().parent()
             && !parent.as_os_str().is_empty()
@@ -1068,7 +622,7 @@ impl PhiGraph {
         if version != VERSION || count != NUM_PARAMS || data.len() != 12 + count * 4 {
             return Err(io::Error::new(
                 ErrorKind::InvalidData,
-                "Version ou taille du modèle .phis incompatible (ré-entraîne avec v0.7.2)",
+                "Version ou taille du modèle .phis incompatible (ré-entraîne avec v0.7)",
             ));
         }
         let mut weights = Vec::with_capacity(count);
