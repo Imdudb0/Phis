@@ -1,7 +1,4 @@
-use crate::graph::{
-    AbductionTrace, NODES, PhiGraph, REL_DIM, RawSubstrate, SEARCH_STEPS, STATE_DIM, WM_DIM,
-    orth_novelty, wm_align, wm_cosine, wm_norm, wm_normalize,
-};
+use crate::graph::{AbductionTrace, NODES, PhiGraph, REL_DIM, RawSubstrate, SEARCH_STEPS, STATE_DIM};
 use crate::rng::Rng;
 
 const SINGLETON_MASKS: [u8; 6] = [
@@ -29,11 +26,6 @@ pub struct PreparedEpisode {
 
 #[derive(Clone, Debug)]
 pub struct PreparedComposite {
-    pub stream: RawSubstrate,
-}
-
-#[derive(Clone, Debug)]
-pub struct PreparedMultiHop {
     pub stream: RawSubstrate,
 }
 
@@ -76,36 +68,6 @@ pub struct CompositePhi {
     pub r_rest: f32,
     pub selectivity: f32,
     pub top_pair: (usize, usize),
-}
-
-#[derive(Clone, Debug)]
-pub struct WmSpan {
-    pub start: usize,
-    pub end: usize,
-    pub peak_p: f32,
-    pub mean_p: f32,
-    pub mean_cos: f32,
-    pub mean_norm: f32,
-    pub mean_gate: f32,
-    pub mean_back_echo: f32,
-}
-
-#[derive(Clone, Debug)]
-pub struct WmReport {
-    pub wm_phi: f32,
-    pub head_cos: f32,
-    pub head_cos_cut: f32,
-    pub iit_echo_gain: f32,
-    pub head_sel: f32,
-    pub readout_sel: f32,
-    pub readout_disc: f32,
-    pub delta_peak_span: (usize, usize),
-    pub context_end: usize,
-    pub molds_count: usize,
-    pub target_causes: usize,
-    pub target_spans: Vec<(usize, usize)>,
-    pub mold_regimes: Vec<DiscoveredRegime>,
-    pub top_spans: Vec<WmSpan>,
 }
 
 pub fn fnv_hash(bytes: &[u8]) -> u64 {
@@ -166,6 +128,8 @@ impl PreparedEpisode {
         rng.shuffle(&mut neg_bytes);
         let neg = RawSubstrate::from_bytes(&neg_bytes);
 
+        // Négatif passif (85% octets uniques + 15% répétitions isolées) : apprend à la porte
+        // neuronale que les étiquettes/prose non structurées ont g(t) ≈ 0.
         let mut pool: [u8; 256] = std::array::from_fn(|i| i as u8);
         rng.shuffle(&mut pool);
         let mut passive_bytes = Vec::with_capacity(bytes.len());
@@ -224,15 +188,7 @@ impl PreparedComposite {
     }
 }
 
-impl PreparedMultiHop {
-    pub fn from_bytes(bytes: &[u8]) -> Self {
-        Self {
-            stream: RawSubstrate::from_bytes(bytes),
-        }
-    }
-}
-
-fn byte_overlap_ratio(a: &[u8], b: &[u8]) -> f32 {
+pub fn byte_overlap_ratio(a: &[u8], b: &[u8]) -> f32 {
     if a.is_empty() {
         return 0.0;
     }
@@ -244,7 +200,7 @@ fn byte_overlap_ratio(a: &[u8], b: &[u8]) -> f32 {
     (shared as f32) / (a.len() as f32)
 }
 
-fn cut_discontinuity(sub: &RawSubstrate, s: usize, e: usize, p: usize) -> f32 {
+pub fn cut_discontinuity(sub: &RawSubstrate, s: usize, e: usize, p: usize) -> f32 {
     let l_lo = p.saturating_sub(10).max(s);
     let r_hi = (p + 10).min(e);
     if p <= l_lo || r_hi <= p {
@@ -292,7 +248,7 @@ fn cut_discontinuity(sub: &RawSubstrate, s: usize, e: usize, p: usize) -> f32 {
     (1.0 - 0.5 * (f_left + f_right)).clamp(0.0, 1.0)
 }
 
-fn abductive_discontinuity(
+pub fn abductive_discontinuity(
     graph: &PhiGraph,
     rels: &[[f32; REL_DIM]],
     left: (usize, usize),
@@ -451,11 +407,7 @@ fn split_run_by_abduction(
     segs
 }
 
-fn attach_passive_referents(
-    cores: &[(usize, usize)],
-    gates_ctx: &[f32],
-    n: usize,
-) -> Vec<DiscoveredRegime> {
+fn attach_passive_referents(cores: &[(usize, usize)], gates_ctx: &[f32], n: usize) -> Vec<DiscoveredRegime> {
     let k = cores.len();
     if k == 0 {
         return Vec::new();
@@ -494,12 +446,10 @@ fn attach_passive_referents(
     out
 }
 
-fn tighten_regime_isolated(
-    graph: &PhiGraph,
-    bytes: &[u8],
-    mut cs: usize,
-    mut ce: usize,
-) -> (usize, usize) {
+/// Calage auto-cohérent des bords d'un régime par la même porte neuronale évaluée
+/// sur la tranche isolée `&bytes[cs..ce]` : détache tout octet qui n'avait d'arêtes
+/// que vers un bloc voisin (zéro séparateur codé en dur).
+fn tighten_regime_isolated(graph: &PhiGraph, bytes: &[u8], mut cs: usize, mut ce: usize) -> (usize, usize) {
     for _ in 0..2 {
         if ce.saturating_sub(cs) < 12 {
             break;
@@ -586,6 +536,8 @@ pub fn discover_causal_regimes_from_encoded(
         raw_runs.push((run_start, n));
     }
 
+    // Fusionne les micro-trous <= 3, ou jusqu'à 6 octets si des arêtes supportées
+    // de la matrice d'auto-égalité enjambent le trou (ex: mot unique interne dans Grammar).
     let mut merged: Vec<(usize, usize)> = Vec::new();
     for (s, e) in raw_runs {
         if let Some(last) = merged.last_mut() {
@@ -702,8 +654,7 @@ pub fn discover_causal_regimes(
 ) -> Vec<DiscoveredRegime> {
     let sub = RawSubstrate::from_bytes(bytes);
     let (rels, gates_ctx, gates_pt) = graph.encode_with_gate(&sub);
-    let raw =
-        discover_causal_regimes_from_encoded(graph, &sub, &rels, &gates_ctx, &gates_pt, exact);
+    let raw = discover_causal_regimes_from_encoded(graph, &sub, &rels, &gates_ctx, &gates_pt, exact);
     if !exact || raw.is_empty() {
         return raw;
     }
@@ -769,6 +720,7 @@ pub fn compute_phi_sharp_prepared(
         * (gates_pass_ctx.iter().sum::<f32>() * inv_pass
             + gates_pass_pt.iter().sum::<f32>() * inv_pass);
 
+    // Pénalise le pire faux positif (répétitions mélangées OU prose/étiquettes passives)
     let worst_bad_g = mean_g_neg.max(mean_g_pass);
     let gate_contrast = (mean_g_orig * (1.0 - worst_bad_g)).clamp(0.0, 1.0);
 
@@ -962,553 +914,6 @@ pub fn project_query_to_regimes(
     matches
 }
 
-// =============================================================================
-// MÉMOIRE DE TRAVAIL CONNEXIONNISTE : φ_wm ANCRÉ SUR LE DELTA IIT (0 LABEL)
-// =============================================================================
-
-fn passive_back_echo_ratio(sub: &RawSubstrate, gates_pt: &[f32], cs: usize, ce: usize) -> f32 {
-    if ce <= cs {
-        return 0.0;
-    }
-    let mut hits = 0usize;
-    for t in cs..ce {
-        let slice = &sub.echo_edges[sub.echo_offsets[t]..sub.echo_offsets[t + 1]];
-        if slice
-            .iter()
-            .any(|e| (e.src as usize) < cs && gates_pt[e.src as usize] < 0.52)
-        {
-            hits += 1;
-        }
-    }
-    (hits as f32) / ((ce - cs) as f32)
-}
-
-fn best_window_excl(
-    vals: &[f32],
-    mask: &[bool],
-    len: usize,
-    win: usize,
-    excl: Option<(usize, usize)>,
-) -> (f32, usize) {
-    if len == 0 {
-        return (0.0, 0);
-    }
-    let w = win.min(len).max(1);
-    let mut best_val = -1.0f32;
-    let mut best_center = 0usize;
-
-    for s in 0..=(len - w) {
-        let center = s + w / 2;
-        if let Some((ec, rad)) = excl
-            && center.abs_diff(ec) < rad
-        {
-            continue;
-        }
-        let mut sum = 0.0f32;
-        let mut cnt = 0usize;
-        for j in s..(s + w) {
-            if mask[j] {
-                sum += vals[j];
-                cnt += 1;
-            }
-        }
-        if cnt * 5 >= w * 3 {
-            let avg = sum / (cnt as f32);
-            if avg > best_val {
-                best_val = avg;
-                best_center = center;
-            }
-        }
-    }
-
-    if best_val < 0.0 {
-        for j in 0..len {
-            if let Some((ec, rad)) = excl
-                && j.abs_diff(ec) < rad
-            {
-                continue;
-            }
-            if mask[j] && vals[j] > best_val {
-                best_val = vals[j];
-                best_center = j;
-            }
-        }
-    }
-    (best_val.max(0.0), best_center)
-}
-
-fn extract_top_wm_spans(
-    sub: &RawSubstrate,
-    gates_pt: &[f32],
-    z: &[[f32; WM_DIM]],
-    z_query: &[f32; WM_DIM],
-    p_field: &[f32],
-    context_end: usize,
-    max_spans: usize,
-) -> Vec<WmSpan> {
-    if context_end == 0 {
-        return Vec::new();
-    }
-    let mut smooth = vec![0.0f32; context_end];
-    for t in 0..context_end {
-        let lo = t.saturating_sub(1);
-        let hi = (t + 1).min(context_end - 1);
-        let sum: f32 = p_field[lo..=hi].iter().sum();
-        smooth[t] = sum / ((hi - lo + 1) as f32);
-    }
-
-    let mut used = vec![false; context_end];
-    let mut spans = Vec::with_capacity(max_spans);
-
-    for _ in 0..max_spans {
-        let mut best_t = None;
-        let mut best_s = 0.05f32;
-        for t in 0..context_end {
-            if !used[t] && smooth[t] > best_s {
-                best_s = smooth[t];
-                best_t = Some(t);
-            }
-        }
-        let Some(pt) = best_t else {
-            break;
-        };
-
-        let peak_p = p_field[pt].max(best_s);
-        let thresh = (peak_p * 0.55).max(0.18);
-
-        let mut s = pt;
-        while s > 0 && !used[s - 1] && p_field[s - 1] >= thresh && pt.saturating_sub(s) < 16 {
-            s -= 1;
-        }
-        let mut e = pt + 1;
-        while e < context_end && !used[e] && p_field[e] >= thresh && e.saturating_sub(pt) < 16 {
-            e += 1;
-        }
-
-        let len = (e - s).max(1) as f32;
-        let mut sum_p = 0.0f32;
-        let mut sum_cos = 0.0f32;
-        let mut sum_norm = 0.0f32;
-        let mut sum_gate = 0.0f32;
-        let mut sum_be = 0.0f32;
-        let mut max_p = 0.0f32;
-        for t in s..e {
-            if p_field[t] > max_p {
-                max_p = p_field[t];
-            }
-            sum_p += p_field[t];
-            sum_cos += wm_cosine(&z[t], z_query);
-            sum_norm += wm_norm(&z[t]);
-            sum_gate += gates_pt[t];
-            sum_be += sub.back_echo_len[t];
-        }
-
-        spans.push(WmSpan {
-            start: s,
-            end: e,
-            peak_p: max_p,
-            mean_p: sum_p / len,
-            mean_cos: sum_cos / len,
-            mean_norm: sum_norm / len,
-            mean_gate: sum_gate / len,
-            mean_back_echo: sum_be / len,
-        });
-
-        let pad_s = s.saturating_sub(4);
-        let pad_e = (e + 4).min(context_end);
-        for u in &mut used[pad_s..pad_e] {
-            *u = true;
-        }
-    }
-
-    spans
-}
-
-fn run_wm_core(
-    graph: &PhiGraph,
-    sub: &RawSubstrate,
-    raw_bytes: Option<&[u8]>,
-    exact: bool,
-) -> Option<WmReport> {
-    let n = sub.len;
-    if n < 24 {
-        return None;
-    }
-
-    let (rels, gates_ctx, gates_pt) = graph.encode_with_gate(sub);
-    let mut regimes =
-        discover_causal_regimes_from_encoded(graph, sub, &rels, &gates_ctx, &gates_pt, exact);
-
-    if exact && let Some(bytes) = raw_bytes {
-        let mut tightened = Vec::with_capacity(regimes.len());
-        for reg in &regimes {
-            let (cs, ce) = tighten_regime_isolated(graph, bytes, reg.core_start, reg.core_end);
-            if ce.saturating_sub(cs) >= 10 {
-                tightened.push((cs, ce));
-            }
-        }
-        if tightened.len() >= 2 {
-            regimes = attach_passive_referents(&tightened, &gates_ctx, n);
-        }
-    }
-
-    if regimes.len() < 2 {
-        return None;
-    }
-
-    // 1. Démotion purement relationnelle des blocs méta-linguistiques (écho vers zone passive antérieure)
-    let last_idx = regimes.len() - 1;
-    let mut non_meta: Vec<DiscoveredRegime> = Vec::with_capacity(regimes.len());
-    for (idx, &reg) in regimes.iter().enumerate() {
-        if idx < last_idx
-            && passive_back_echo_ratio(sub, &gates_pt, reg.core_start, reg.core_end) >= 0.25
-        {
-            continue;
-        }
-        non_meta.push(reg);
-    }
-    if non_meta.len() < 2 {
-        non_meta = regimes;
-    }
-
-    let traces: Vec<AbductionTrace> = non_meta
-        .iter()
-        .map(|reg| graph.abduce(&rels[reg.core_start..reg.core_end], None))
-        .collect();
-
-    // 2. Regroupe les régimes finaux constituant une cible multi-causes
-    let k = non_meta.len();
-    let mut split_t = k - 1;
-    while split_t >= 3 && (k - split_t) < 4 {
-        let cand = split_t - 1;
-        let gap_next = non_meta[split_t]
-            .core_start
-            .saturating_sub(non_meta[cand].core_end);
-        if gap_next > 10 {
-            break;
-        }
-        let gap_prev = non_meta[cand]
-            .core_start
-            .saturating_sub(non_meta[cand - 1].core_end);
-        if gap_prev > 10 && gap_prev < 20 {
-            break;
-        }
-        let max_cos = (0..cand)
-            .map(|i| cosine_sim(&traces[cand].final_state, &traces[i].final_state))
-            .fold(-1.0f32, f32::max);
-        if max_cos >= 0.42 {
-            split_t = cand;
-        } else {
-            break;
-        }
-    }
-
-    let mold_regimes = non_meta[0..split_t].to_vec();
-    let target_regs = &non_meta[split_t..];
-    let target_spans: Vec<(usize, usize)> = target_regs
-        .iter()
-        .map(|r| (r.core_start, r.core_end))
-        .collect();
-    let context_end = target_regs[0].core_start;
-    if context_end < 12 {
-        return None;
-    }
-
-    // 3. Initialisation directe de Z^(0) dans l'espace orthogonal 24D de H (marge +0.99 préservée)
-    let mut init_z = vec![[0.0f32; WM_DIM]; n];
-    for (idx, reg) in mold_regimes.iter().enumerate() {
-        let u = wm_normalize(&traces[idx].final_state);
-        for t in reg.core_start..reg.core_end.min(context_end) {
-            let w_g = gates_pt[t].max(0.65);
-            for d in 0..WM_DIM {
-                init_z[t][d] = w_g * u[d];
-            }
-        }
-    }
-
-    // 4. Agrégation continue de la cible en Z_Q par nouveauté orthogonale :
-    //    chaque régime cible distinct contribue d'abord sa cause dominante, puis les fenêtres
-    //    glissantes décomposent un éventuel régime long multi-causes.
-    let mut z_query = [0.0f32; WM_DIM];
-    let mut target_causes = 0usize;
-
-    let mut reg_primary: Vec<(f32, [f32; WM_DIM])> = Vec::with_capacity(target_regs.len());
-    let mut extra_wins: Vec<(f32, [f32; WM_DIM])> = Vec::new();
-
-    for (offset, reg) in target_regs.iter().enumerate() {
-        let tr = &traces[split_t + offset];
-        reg_primary.push((tr.final_mean_err, wm_normalize(&tr.final_state)));
-
-        let len = reg.core_end.saturating_sub(reg.core_start);
-        if len >= 34 {
-            let w = 18usize;
-            let stride = 8usize;
-            let mut s = reg.core_start;
-            while s + w <= reg.core_end {
-                let wtr = graph.abduce(&rels[s..s + w], None);
-                extra_wins.push((wtr.final_mean_err, wm_normalize(&wtr.final_state)));
-                s += stride;
-            }
-            let tail_s = reg.core_end - w;
-            if tail_s > reg.core_start {
-                let wtr = graph.abduce(&rels[tail_s..reg.core_end], None);
-                extra_wins.push((wtr.final_mean_err, wm_normalize(&wtr.final_state)));
-            }
-        }
-    }
-
-    reg_primary.sort_by(|a, b| a.0.total_cmp(&b.0));
-    for (i, &(err, ref u)) in reg_primary.iter().enumerate() {
-        if target_causes >= 3 {
-            break;
-        }
-        if i > 0 && err > 0.55 {
-            continue;
-        }
-        if target_causes == 0 {
-            z_query = *u;
-            target_causes = 1;
-        } else {
-            let nov = orth_novelty(u, &z_query);
-            if wm_norm(&nov) >= 0.58 {
-                for d in 0..WM_DIM {
-                    z_query[d] += nov[d];
-                }
-                target_causes += 1;
-            }
-        }
-    }
-
-    extra_wins.sort_by(|a, b| a.0.total_cmp(&b.0));
-    if let Some(&(best_w_err, _)) = extra_wins.first() {
-        let err_cap = (best_w_err + 0.25).max(0.40);
-        for &(err, ref u) in &extra_wins {
-            if err > err_cap || target_causes >= 3 {
-                continue;
-            }
-            let nov = orth_novelty(u, &z_query);
-            if wm_norm(&nov) >= 0.62 {
-                for d in 0..WM_DIM {
-                    z_query[d] += nov[d];
-                }
-                target_causes += 1;
-            }
-        }
-    }
-
-    // 5. Propagation complète (full) vs coupure IIT des échos longue portée (cut)
-    let z_full = graph.propagate_working_memory(sub, &gates_pt, &init_z, false);
-    let z_cut = graph.propagate_working_memory(sub, &gates_pt, &init_z, true);
-
-    // 6. Signal 100% non-supervisé ancré sur le delta causal IIT (align_full - align_cut)+
-    let mut head_mask = vec![false; context_end];
-    let mut head_count = 0usize;
-    let mut has_long_echo = false;
-    for t in 0..context_end {
-        if sub.back_echo_len[t] >= 0.20 {
-            has_long_echo = true;
-        }
-        if gates_pt[t] < 0.48 && sub.back_echo_len[t] < 0.05 {
-            head_mask[t] = true;
-            head_count += 1;
-        }
-    }
-    if head_count < 4 {
-        for m in &mut head_mask {
-            *m = true;
-        }
-    }
-
-    let mut align_full = vec![0.0f32; context_end];
-    let mut align_cut = vec![0.0f32; context_end];
-    let mut delta = vec![0.0f32; context_end];
-    for t in 0..context_end {
-        let af = wm_align(&z_full[t], &z_query).max(0.0);
-        let ac = wm_align(&z_cut[t], &z_query).max(0.0);
-        align_full[t] = af;
-        align_cut[t] = ac;
-        delta[t] = (af - ac).max(0.0);
-    }
-
-    let (delta_peak, delta_center) = best_window_excl(&delta, &head_mask, context_end, 5, None);
-    let (delta_second, _) = best_window_excl(
-        &delta,
-        &head_mask,
-        context_end,
-        5,
-        Some((delta_center, 12)),
-    );
-    let delta_margin = (delta_peak - delta_second).max(0.0);
-
-    let (af_peak, af_center) = best_window_excl(&align_full, &head_mask, context_end, 5, None);
-    let (af_second, _) = best_window_excl(
-        &align_full,
-        &head_mask,
-        context_end,
-        5,
-        Some((af_center, 12)),
-    );
-    let af_margin = (af_peak - af_second).max(0.0);
-
-    let peak_lo = delta_center.saturating_sub(2);
-    let peak_hi = (delta_center + 3).min(context_end);
-    let mut head_cos_at_peak = 0.0f32;
-    let mut head_cut_at_peak = 0.0f32;
-    let mut pk_cnt = 0usize;
-    for t in peak_lo..peak_hi {
-        if head_mask[t] {
-            head_cos_at_peak += align_full[t];
-            head_cut_at_peak += align_cut[t];
-            pk_cnt += 1;
-        }
-    }
-    let (head_cos, head_cos_cut) = if pk_cnt > 0 && delta_peak > 0.05 {
-        (
-            head_cos_at_peak / (pk_cnt as f32),
-            head_cut_at_peak / (pk_cnt as f32),
-        )
-    } else {
-        (af_peak, align_cut[af_center])
-    };
-    let iit_echo_gain = delta_peak;
-
-    let mut bg_d_sum = 0.0f32;
-    let mut bg_d_cnt = 0usize;
-    for t in 0..context_end {
-        if head_mask[t] && t.abs_diff(delta_center) > 10 {
-            bg_d_sum += delta[t];
-            bg_d_cnt += 1;
-        }
-    }
-    let bg_delta = if bg_d_cnt == 0 {
-        0.0
-    } else {
-        bg_d_sum / (bg_d_cnt as f32)
-    };
-    let head_sel = if has_long_echo {
-        0.5 * delta_peak * (1.0 - bg_delta) + 0.5 * delta_margin
-    } else {
-        af_margin
-    };
-    
-    // 7. Tête de lecture connexionniste P(t) + saillance non-supervisée + contrefactuel (-z_query)
-    let p_field = graph.readout_explanation(sub, &gates_pt, &z_full, &z_cut, &z_query, delta_peak);
-    let mut neg_q = [0.0f32; WM_DIM];
-    for d in 0..WM_DIM {
-        neg_q[d] = -z_query[d];
-    }
-    let p_neg = graph.readout_explanation(sub, &gates_pt, &z_full, &z_cut, &neg_q, delta_peak);
-
-    let all_mask = vec![true; context_end];
-    let (top_p, p_center) = best_window_excl(&p_field[..context_end], &all_mask, context_end, 5, None);
-    let (second_p, _) = best_window_excl(
-        &p_field[..context_end],
-        &all_mask,
-        context_end,
-        5,
-        Some((p_center, 12)),
-    );
-    let (top_p_neg, _) = best_window_excl(&p_neg[..context_end], &all_mask, context_end, 5, None);
-
-    let mut bg_p_sum = 0.0f32;
-    let mut bg_p_cnt = 0usize;
-    for t in 0..context_end {
-        if t.abs_diff(p_center) > 10 {
-            bg_p_sum += p_field[t];
-            bg_p_cnt += 1;
-        }
-    }
-    let bg_p = if bg_p_cnt == 0 {
-        0.0
-    } else {
-        bg_p_sum / (bg_p_cnt as f32)
-    };
-    let readout_sel = 0.5 * top_p * (1.0 - bg_p) + 0.5 * (top_p - second_p).max(0.0);
-    let readout_disc = (top_p - top_p_neg).max(0.0);
-
-    // Saillance non-supervisée `sal[t]` : distingue proprement Hop-2/3 vs Hop-1 (ex: comp.eff)
-    let use_echo_sal = has_long_echo && (target_causes >= 2 || delta_peak > 0.25);
-    let mut p_sal_num = 0.0f32;
-    let mut p_mass = 0.0f32;
-    for t in 0..context_end {
-        let passive_head = if head_count >= 4 {
-            (1.0 - gates_pt[t]) * (1.0 - sub.back_echo_len[t])
-        } else {
-            1.0
-        };
-        let sal_t = if use_echo_sal {
-            (0.35 * align_full[t] + 0.65 * delta[t]) * passive_head
-        } else {
-            align_full[t] * passive_head
-        };
-        p_sal_num += p_field[t] * sal_t;
-        p_mass += p_field[t];
-    }
-    let p_corr = p_sal_num / (p_mass + 2.0);
-
-    // Objectif φ_wm : impossible à tricher sans échos + composition + reset de frontières
-    let wm_phi = if use_echo_sal {
-        0.50 * delta_peak
-            + 0.70 * delta_margin
-            + 0.25 * (delta_peak * (1.0 - bg_delta))
-            + 0.55 * p_corr
-            + 0.20 * readout_sel
-            + 0.10 * readout_disc
-    } else {
-        0.35 * af_peak
-            + 0.45 * af_margin
-            + 0.55 * p_corr
-            + 0.25 * readout_sel
-            + 0.10 * readout_disc
-    };
-
-    let delta_peak_span = (
-        delta_center.saturating_sub(2),
-        (delta_center + 3).min(context_end),
-    );
-    let top_spans = if exact {
-        extract_top_wm_spans(
-            sub,
-            &gates_pt,
-            &z_full,
-            &z_query,
-            &p_field,
-            context_end,
-            5,
-        )
-    } else {
-        Vec::new()
-    };
-
-    Some(WmReport {
-        wm_phi,
-        head_cos,
-        head_cos_cut,
-        iit_echo_gain,
-        head_sel,
-        readout_sel,
-        readout_disc,
-        delta_peak_span,
-        context_end,
-        molds_count: mold_regimes.len(),
-        target_causes,
-        target_spans,
-        mold_regimes,
-        top_spans,
-    })
-}
-
-pub fn compute_wm_phi_prepared(graph: &PhiGraph, prep: &PreparedMultiHop) -> f32 {
-    run_wm_core(graph, &prep.stream, None, false)
-        .map(|r| r.wm_phi)
-        .unwrap_or(-0.20)
-}
-
-pub fn run_working_memory(graph: &PhiGraph, bytes: &[u8]) -> Option<WmReport> {
-    let sub = RawSubstrate::from_bytes(bytes);
-    run_wm_core(graph, &sub, Some(bytes), true)
-}
-
 pub fn extract_abductive_core(
     graph: &PhiGraph,
     bytes: &[u8],
@@ -1540,11 +945,7 @@ pub fn extract_abductive_core(
         }
         s += stride;
     }
-    (
-        best_start,
-        bytes[best_start..best_start + win].to_vec(),
-        best_err,
-    )
+    (best_start, bytes[best_start..best_start + win].to_vec(), best_err)
 }
 
 pub fn format_partition(mask: u8) -> String {
