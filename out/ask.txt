@@ -14,7 +14,7 @@
 [1m[92m    Finished[0m `release` profile [optimized] target(s) in 0.00s
 [1m[92m     Running[0m `target/release/phisharp ask --model out/sharp.phis --file out/defs_fr.eff`
 === PHISHARP ABDUCTION REPORT (v0.6 — Multi-Sauts & Définitions Composées) ===
-Effet (E)       : 'out/defs_fr.eff' (373 octets, 4 moules + 2 cause(s) cible, 4 déf. composées, 0 méta-bloc(s) démote)
+Effet (E)       : 'out/defs_fr.eff' (373 octets, 4 moules + 2 cause(s) cible, 5 déf. composées, 0 méta-bloc(s) démote)
 Cohérence scène : sélectivité=0.5916 (R_top=0.945 vs R_rest=0.374, paire [1]<->[5])
 Résidu cible    : décomposition multi-causes validée (res 0.2757 -> 0.0750, cos inter-causes=-0.640)
 
@@ -39,12 +39,14 @@ Cause cible #2 (octets 355..373) | φ=+0.8437 [Gen=0.907 Disc=0.955 Proj=0.716 I
 Projection Référentielle Multi-Sauts (définitions composées découvertes) :
   #1 [Hop-2] "motif_cyclique"  | score=0.8928 (couv=0.893, préc=0.893)  <-  cycle + noyau
      clause (185..216) : "motif_cyclique = cycle + noyau"
-  #2 [Hop-2] "a alpha_2 beta alpha_1.oscillation_miroir"  | score=0.8263 (couv=0.826, préc=0.826)  <-  miroir + cycle
+  #2 [Hop-3] "super_hybride"  | score=0.8603 (couv=0.893, préc=0.829)  <-  oscillation_miroir + noyau
+     clause (286..329) : "super_hybride = oscillation_miroir + noyau"
+  #3 [Hop-2] "oscillation_miroir"  | score=0.8263 (couv=0.826, préc=0.826)  <-  miroir + cycle
      clause (127..185) : "a alpha_2 beta alpha_1.oscillation_miroir = miroir + cycle"
-  #3 [Hop-2] "noyau_syntaxique"  | score=0.8165 (couv=0.816, préc=0.816)  <-  noyau + trame
+  #4 [Hop-2] "noyau_syntaxique"  | score=0.8165 (couv=0.816, préc=0.816)  <-  noyau + trame
      clause (253..286) : "noyau_syntaxique = noyau + trame"
-  #4 [Hop-2] "symetrie_syntaxique"  | score=0.7500 (couv=0.750, préc=0.750)  <-  miroir + trame
+  #5 [Hop-2] "symetrie_syntaxique"  | score=0.7500 (couv=0.750, préc=0.750)  <-  miroir + trame
      clause (216..253) : "symetrie_syntaxique = miroir + trame"
 
-Explication projetée (multi-sauts Hop-2, alphabet de E, marge=+0.0665) :
+Explication projetée (multi-sauts Hop-2, alphabet de E, marge=+0.0325) :
   motif_cyclique
