@@ -1,6 +1,6 @@
 use crate::graph::{
     AbductionTrace, NODES, PhiGraph, REL_DIM, RawSubstrate, SEARCH_STEPS, STATE_DIM, WM_DIM,
-    orth_novelty, wm_cosine, wm_norm,
+    orth_novelty, wm_align, wm_cosine, wm_norm, wm_normalize,
 };
 use crate::rng::Rng;
 
@@ -99,6 +99,7 @@ pub struct WmReport {
     pub head_sel: f32,
     pub readout_sel: f32,
     pub readout_disc: f32,
+    pub delta_peak_span: (usize, usize),
     pub context_end: usize,
     pub molds_count: usize,
     pub target_causes: usize,
@@ -231,7 +232,7 @@ impl PreparedMultiHop {
     }
 }
 
-pub fn byte_overlap_ratio(a: &[u8], b: &[u8]) -> f32 {
+fn byte_overlap_ratio(a: &[u8], b: &[u8]) -> f32 {
     if a.is_empty() {
         return 0.0;
     }
@@ -243,7 +244,7 @@ pub fn byte_overlap_ratio(a: &[u8], b: &[u8]) -> f32 {
     (shared as f32) / (a.len() as f32)
 }
 
-pub fn cut_discontinuity(sub: &RawSubstrate, s: usize, e: usize, p: usize) -> f32 {
+fn cut_discontinuity(sub: &RawSubstrate, s: usize, e: usize, p: usize) -> f32 {
     let l_lo = p.saturating_sub(10).max(s);
     let r_hi = (p + 10).min(e);
     if p <= l_lo || r_hi <= p {
@@ -291,7 +292,7 @@ pub fn cut_discontinuity(sub: &RawSubstrate, s: usize, e: usize, p: usize) -> f3
     (1.0 - 0.5 * (f_left + f_right)).clamp(0.0, 1.0)
 }
 
-pub fn abductive_discontinuity(
+fn abductive_discontinuity(
     graph: &PhiGraph,
     rels: &[[f32; REL_DIM]],
     left: (usize, usize),
@@ -962,11 +963,9 @@ pub fn project_query_to_regimes(
 }
 
 // =============================================================================
-// MÉMOIRE DE TRAVAIL CONNEXIONNISTE : φ_wm NON-SUPERVISÉ & LECTURE CONTINUE P(t)
+// MÉMOIRE DE TRAVAIL CONNEXIONNISTE : φ_wm ANCRÉ SUR LE DELTA IIT (0 LABEL)
 // =============================================================================
 
-/// Fraction des octets d'un régime qui échoent vers une zone passive antérieure (méta-langage).
-/// 100% relationnel : utilise uniquement `echo_edges` de M(a,b) et `gates_pt` appris.
 fn passive_back_echo_ratio(sub: &RawSubstrate, gates_pt: &[f32], cs: usize, ce: usize) -> f32 {
     if ce <= cs {
         return 0.0;
@@ -984,7 +983,13 @@ fn passive_back_echo_ratio(sub: &RawSubstrate, gates_pt: &[f32], cs: usize, ce: 
     (hits as f32) / ((ce - cs) as f32)
 }
 
-fn best_window_mean(vals: &[f32], mask: &[bool], len: usize, win: usize) -> (f32, usize) {
+fn best_window_excl(
+    vals: &[f32],
+    mask: &[bool],
+    len: usize,
+    win: usize,
+    excl: Option<(usize, usize)>,
+) -> (f32, usize) {
     if len == 0 {
         return (0.0, 0);
     }
@@ -993,6 +998,12 @@ fn best_window_mean(vals: &[f32], mask: &[bool], len: usize, win: usize) -> (f32
     let mut best_center = 0usize;
 
     for s in 0..=(len - w) {
+        let center = s + w / 2;
+        if let Some((ec, rad)) = excl
+            && center.abs_diff(ec) < rad
+        {
+            continue;
+        }
         let mut sum = 0.0f32;
         let mut cnt = 0usize;
         for j in s..(s + w) {
@@ -1005,14 +1016,18 @@ fn best_window_mean(vals: &[f32], mask: &[bool], len: usize, win: usize) -> (f32
             let avg = sum / (cnt as f32);
             if avg > best_val {
                 best_val = avg;
-                best_center = s + w / 2;
+                best_center = center;
             }
         }
     }
 
     if best_val < 0.0 {
-        // Repli sur la meilleure position valide si aucune fenêtre contiguë n'atteint la taille `w`
         for j in 0..len {
+            if let Some((ec, rad)) = excl
+                && j.abs_diff(ec) < rad
+            {
+                continue;
+            }
             if mask[j] && vals[j] > best_val {
                 best_val = vals[j];
                 best_center = j;
@@ -1141,11 +1156,13 @@ fn run_wm_core(
         return None;
     }
 
-    // 1. Démotion purement relationnelle des blocs méta-linguistiques (citant des zones passives antérieures)
+    // 1. Démotion purement relationnelle des blocs méta-linguistiques (écho vers zone passive antérieure)
     let last_idx = regimes.len() - 1;
     let mut non_meta: Vec<DiscoveredRegime> = Vec::with_capacity(regimes.len());
     for (idx, &reg) in regimes.iter().enumerate() {
-        if idx < last_idx && passive_back_echo_ratio(sub, &gates_pt, reg.core_start, reg.core_end) >= 0.25 {
+        if idx < last_idx
+            && passive_back_echo_ratio(sub, &gates_pt, reg.core_start, reg.core_end) >= 0.25
+        {
             continue;
         }
         non_meta.push(reg);
@@ -1154,13 +1171,12 @@ fn run_wm_core(
         non_meta = regimes;
     }
 
-    // Abduit les régimes retenus une seule fois
     let traces: Vec<AbductionTrace> = non_meta
         .iter()
         .map(|reg| graph.abduce(&rels[reg.core_start..reg.core_end], None))
         .collect();
 
-    // 2. Regroupe les régimes finaux appartenant à une cible multi-causes (sans utiliser de labels)
+    // 2. Regroupe les régimes finaux constituant une cible multi-causes
     let k = non_meta.len();
     let mut split_t = k - 1;
     while split_t >= 3 && (k - split_t) < 4 {
@@ -1168,19 +1184,19 @@ fn run_wm_core(
         let gap_next = non_meta[split_t]
             .core_start
             .saturating_sub(non_meta[cand].core_end);
-        if gap_next > 8 {
+        if gap_next > 10 {
             break;
         }
         let gap_prev = non_meta[cand]
             .core_start
             .saturating_sub(non_meta[cand - 1].core_end);
-        if gap_prev > 8 && gap_prev < 20 {
+        if gap_prev > 10 && gap_prev < 20 {
             break;
         }
         let max_cos = (0..cand)
             .map(|i| cosine_sim(&traces[cand].final_state, &traces[i].final_state))
             .fold(-1.0f32, f32::max);
-        if max_cos >= 0.45 {
+        if max_cos >= 0.42 {
             split_t = cand;
         } else {
             break;
@@ -1198,51 +1214,75 @@ fn run_wm_core(
         return None;
     }
 
-    // 3. Initialisation de la Mémoire de Travail Z^(0) sur les moules primitifs (0..context_end)
+    // 3. Initialisation directe de Z^(0) dans l'espace orthogonal 24D de H (marge +0.99 préservée)
     let mut init_z = vec![[0.0f32; WM_DIM]; n];
     for (idx, reg) in mold_regimes.iter().enumerate() {
-        let u = graph.project_cause_to_wm(&traces[idx].final_state);
+        let u = wm_normalize(&traces[idx].final_state);
         for t in reg.core_start..reg.core_end.min(context_end) {
-            let w_g = gates_pt[t].max(0.55);
+            let w_g = gates_pt[t].max(0.65);
             for d in 0..WM_DIM {
                 init_z[t][d] = w_g * u[d];
             }
         }
     }
 
-    // 4. Agrégation continue de la cible Q en vecteur mémoire `z_query` par nouveauté orthogonale
-    //    (gère 1, 2 ou 3 causes sans heuristique de coupe discrète)
-    let mut win_cands: Vec<(f32, [f32; WM_DIM])> = Vec::new();
+    // 4. Agrégation continue de la cible en Z_Q par nouveauté orthogonale :
+    //    chaque régime cible distinct contribue d'abord sa cause dominante, puis les fenêtres
+    //    glissantes décomposent un éventuel régime long multi-causes.
+    let mut z_query = [0.0f32; WM_DIM];
+    let mut target_causes = 0usize;
+
+    let mut reg_primary: Vec<(f32, [f32; WM_DIM])> = Vec::with_capacity(target_regs.len());
+    let mut extra_wins: Vec<(f32, [f32; WM_DIM])> = Vec::new();
+
     for (offset, reg) in target_regs.iter().enumerate() {
+        let tr = &traces[split_t + offset];
+        reg_primary.push((tr.final_mean_err, wm_normalize(&tr.final_state)));
+
         let len = reg.core_end.saturating_sub(reg.core_start);
-        if len < 34 {
-            let tr = &traces[split_t + offset];
-            win_cands.push((tr.final_mean_err, graph.project_cause_to_wm(&tr.final_state)));
-        } else {
+        if len >= 34 {
             let w = 18usize;
             let stride = 8usize;
             let mut s = reg.core_start;
             while s + w <= reg.core_end {
-                let tr = graph.abduce(&rels[s..s + w], None);
-                win_cands.push((tr.final_mean_err, graph.project_cause_to_wm(&tr.final_state)));
+                let wtr = graph.abduce(&rels[s..s + w], None);
+                extra_wins.push((wtr.final_mean_err, wm_normalize(&wtr.final_state)));
                 s += stride;
             }
             let tail_s = reg.core_end - w;
             if tail_s > reg.core_start {
-                let tr = graph.abduce(&rels[tail_s..reg.core_end], None);
-                win_cands.push((tr.final_mean_err, graph.project_cause_to_wm(&tr.final_state)));
+                let wtr = graph.abduce(&rels[tail_s..reg.core_end], None);
+                extra_wins.push((wtr.final_mean_err, wm_normalize(&wtr.final_state)));
             }
         }
     }
-    win_cands.sort_by(|a, b| a.0.total_cmp(&b.0));
 
-    let mut z_query = [0.0f32; WM_DIM];
-    let mut target_causes = 0usize;
-    if let Some(&(best_err, first_u)) = win_cands.first() {
-        z_query = first_u;
-        target_causes = 1;
-        let err_cap = (best_err + 0.14).max(0.24);
-        for &(err, ref u) in &win_cands[1..] {
+    reg_primary.sort_by(|a, b| a.0.total_cmp(&b.0));
+    for (i, &(err, ref u)) in reg_primary.iter().enumerate() {
+        if target_causes >= 3 {
+            break;
+        }
+        if i > 0 && err > 0.55 {
+            continue;
+        }
+        if target_causes == 0 {
+            z_query = *u;
+            target_causes = 1;
+        } else {
+            let nov = orth_novelty(u, &z_query);
+            if wm_norm(&nov) >= 0.58 {
+                for d in 0..WM_DIM {
+                    z_query[d] += nov[d];
+                }
+                target_causes += 1;
+            }
+        }
+    }
+
+    extra_wins.sort_by(|a, b| a.0.total_cmp(&b.0));
+    if let Some(&(best_w_err, _)) = extra_wins.first() {
+        let err_cap = (best_w_err + 0.25).max(0.40);
+        for &(err, ref u) in &extra_wins {
             if err > err_cap || target_causes >= 3 {
                 continue;
             }
@@ -1256,14 +1296,18 @@ fn run_wm_core(
         }
     }
 
-    // 5. Propagation complète (full) vs coupure IIT des arêtes d'écho longue portée (cut)
+    // 5. Propagation complète (full) vs coupure IIT des échos longue portée (cut)
     let z_full = graph.propagate_working_memory(sub, &gates_pt, &init_z, false);
     let z_cut = graph.propagate_working_memory(sub, &gates_pt, &init_z, true);
 
-    // 6. Évaluation 100% non-supervisée sur les têtes passives non-écho (0..context_end)
+    // 6. Signal 100% non-supervisé ancré sur le delta causal IIT (align_full - align_cut)+
     let mut head_mask = vec![false; context_end];
     let mut head_count = 0usize;
+    let mut has_long_echo = false;
     for t in 0..context_end {
+        if sub.back_echo_len[t] >= 0.20 {
+            has_long_echo = true;
+        }
         if gates_pt[t] < 0.48 && sub.back_echo_len[t] < 0.05 {
             head_mask[t] = true;
             head_count += 1;
@@ -1275,43 +1319,96 @@ fn run_wm_core(
         }
     }
 
-    let mut cos_full = vec![0.0f32; context_end];
-    let mut cos_cut = vec![0.0f32; context_end];
+    let mut align_full = vec![0.0f32; context_end];
+    let mut align_cut = vec![0.0f32; context_end];
+    let mut delta = vec![0.0f32; context_end];
     for t in 0..context_end {
-        cos_full[t] = wm_cosine(&z_full[t], &z_query).max(0.0);
-        cos_cut[t] = wm_cosine(&z_cut[t], &z_query).max(0.0);
+        let af = wm_align(&z_full[t], &z_query).max(0.0);
+        let ac = wm_align(&z_cut[t], &z_query).max(0.0);
+        align_full[t] = af;
+        align_cut[t] = ac;
+        delta[t] = (af - ac).max(0.0);
     }
 
-    let (head_cos, peak_center) = best_window_mean(&cos_full, &head_mask, context_end, 5);
-    let (head_cos_cut, _) = best_window_mean(&cos_cut, &head_mask, context_end, 5);
-    let iit_echo_gain = (head_cos - head_cos_cut).max(0.0);
+    let (delta_peak, delta_center) = best_window_excl(&delta, &head_mask, context_end, 5, None);
+    let (delta_second, _) = best_window_excl(
+        &delta,
+        &head_mask,
+        context_end,
+        5,
+        Some((delta_center, 12)),
+    );
+    let delta_margin = (delta_peak - delta_second).max(0.0);
 
-    let mut bg_sum = 0.0f32;
-    let mut bg_cnt = 0usize;
-    for t in 0..context_end {
-        if head_mask[t] && t.abs_diff(peak_center) > 10 {
-            bg_sum += cos_full[t];
-            bg_cnt += 1;
+    let (af_peak, af_center) = best_window_excl(&align_full, &head_mask, context_end, 5, None);
+    let (af_second, _) = best_window_excl(
+        &align_full,
+        &head_mask,
+        context_end,
+        5,
+        Some((af_center, 12)),
+    );
+    let af_margin = (af_peak - af_second).max(0.0);
+
+    let peak_lo = delta_center.saturating_sub(2);
+    let peak_hi = (delta_center + 3).min(context_end);
+    let mut head_cos_at_peak = 0.0f32;
+    let mut head_cut_at_peak = 0.0f32;
+    let mut pk_cnt = 0usize;
+    for t in peak_lo..peak_hi {
+        if head_mask[t] {
+            head_cos_at_peak += align_full[t];
+            head_cut_at_peak += align_cut[t];
+            pk_cnt += 1;
         }
     }
-    let bg_head_cos = if bg_cnt == 0 {
+    let (head_cos, head_cos_cut) = if pk_cnt > 0 && delta_peak > 0.05 {
+        (
+            head_cos_at_peak / (pk_cnt as f32),
+            head_cut_at_peak / (pk_cnt as f32),
+        )
+    } else {
+        (af_peak, align_cut[af_center])
+    };
+    let iit_echo_gain = delta_peak;
+
+    let mut bg_d_sum = 0.0f32;
+    let mut bg_d_cnt = 0usize;
+    for t in 0..context_end {
+        if head_mask[t] && t.abs_diff(delta_center) > 10 {
+            bg_d_sum += delta[t];
+            bg_d_cnt += 1;
+        }
+    }
+    let bg_delta = if bg_d_cnt == 0 {
         0.0
     } else {
-        bg_sum / (bg_cnt as f32)
+        bg_d_sum / (bg_d_cnt as f32)
     };
-    let head_sel = head_cos * (1.0 - bg_head_cos);
+    let head_sel = if has_long_echo {
+        0.5 * delta_peak * (1.0 - bg_delta) + 0.5 * delta_margin
+    } else {
+        af_margin
+    };
 
-    // 7. Tête de lecture connexionniste P(t) + contrefactuel (-z_query)
-    let p_field = graph.readout_explanation(sub, &gates_pt, &z_full, &z_query);
+    // 7. Tête de lecture connexionniste P(t) + saillance non-supervisée + contrefactuel (-z_query)
+    let p_field = graph.readout_explanation(sub, &gates_pt, &z_full, &z_cut, &z_query);
     let mut neg_q = [0.0f32; WM_DIM];
     for d in 0..WM_DIM {
         neg_q[d] = -z_query[d];
     }
-    let p_neg = graph.readout_explanation(sub, &gates_pt, &z_full, &neg_q);
+    let p_neg = graph.readout_explanation(sub, &gates_pt, &z_full, &z_cut, &neg_q);
 
     let all_mask = vec![true; context_end];
-    let (top_p, p_center) = best_window_mean(&p_field[..context_end], &all_mask, context_end, 5);
-    let (top_p_neg, _) = best_window_mean(&p_neg[..context_end], &all_mask, context_end, 5);
+    let (top_p, p_center) = best_window_excl(&p_field[..context_end], &all_mask, context_end, 5, None);
+    let (second_p, _) = best_window_excl(
+        &p_field[..context_end],
+        &all_mask,
+        context_end,
+        5,
+        Some((p_center, 12)),
+    );
+    let (top_p_neg, _) = best_window_excl(&p_neg[..context_end], &all_mask, context_end, 5, None);
 
     let mut bg_p_sum = 0.0f32;
     let mut bg_p_cnt = 0usize;
@@ -1326,31 +1423,49 @@ fn run_wm_core(
     } else {
         bg_p_sum / (bg_p_cnt as f32)
     };
-    let readout_sel = top_p * (1.0 - bg_p);
+    let readout_sel = 0.5 * top_p * (1.0 - bg_p) + 0.5 * (top_p - second_p).max(0.0);
     let readout_disc = (top_p - top_p_neg).max(0.0);
 
-    // Aligne le pic de P(t) sur un vrai vecteur mémoire passif non-écho (0 label)
-    let al_lo = p_center.saturating_sub(2);
-    let al_hi = (p_center + 3).min(context_end);
-    let mut al_sum = 0.0f32;
-    for t in al_lo..al_hi {
+    // Saillance non-supervisée `sal[t]` : aligne lissement P(t) sur le sommet causal (Hop-2/3 ou Hop-1)
+    let use_echo_sal = has_long_echo && (target_causes >= 2 || delta_peak > 0.12);
+    let mut p_sal_num = 0.0f32;
+    let mut p_mass = 0.0f32;
+    for t in 0..context_end {
         let passive_head = if head_count >= 4 {
             (1.0 - gates_pt[t]) * (1.0 - sub.back_echo_len[t])
         } else {
             1.0
         };
-        al_sum += cos_full[t] * passive_head;
+        let sal_t = if use_echo_sal {
+            (0.35 * align_full[t] + 0.65 * delta[t]) * passive_head
+        } else {
+            align_full[t] * passive_head
+        };
+        p_sal_num += p_field[t] * sal_t;
+        p_mass += p_field[t];
     }
-    let readout_align = al_sum / ((al_hi - al_lo).max(1) as f32);
+    let p_corr = p_sal_num / (p_mass + 2.0);
 
-    let iit_norm = (iit_echo_gain / 0.28).clamp(0.0, 1.0);
-    let wm_phi = 0.30 * head_cos
-        + 0.25 * head_sel
-        + 0.35 * iit_norm
-        + 0.20 * readout_sel
-        + 0.15 * readout_disc
-        + 0.25 * readout_align;
+    // Objectif φ_wm : impossible à tricher sans échos + composition + reset de frontières
+    let wm_phi = if use_echo_sal {
+        0.50 * delta_peak
+            + 0.70 * delta_margin
+            + 0.25 * (delta_peak * (1.0 - bg_delta))
+            + 0.55 * p_corr
+            + 0.20 * readout_sel
+            + 0.10 * readout_disc
+    } else {
+        0.35 * af_peak
+            + 0.45 * af_margin
+            + 0.55 * p_corr
+            + 0.25 * readout_sel
+            + 0.10 * readout_disc
+    };
 
+    let delta_peak_span = (
+        delta_center.saturating_sub(2),
+        (delta_center + 3).min(context_end),
+    );
     let top_spans = if exact {
         extract_top_wm_spans(
             sub,
@@ -1373,6 +1488,7 @@ fn run_wm_core(
         head_sel,
         readout_sel,
         readout_disc,
+        delta_peak_span,
         context_end,
         molds_count: mold_regimes.len(),
         target_causes,
