@@ -170,7 +170,7 @@ impl PreparedComposite {
     }
 }
 
-fn byte_overlap_ratio(a: &[u8], b: &[u8]) -> f32 {
+pub fn byte_overlap_ratio(a: &[u8], b: &[u8]) -> f32 {
     if a.is_empty() {
         return 0.0;
     }
@@ -182,7 +182,7 @@ fn byte_overlap_ratio(a: &[u8], b: &[u8]) -> f32 {
     (shared as f32) / (a.len() as f32)
 }
 
-fn cut_discontinuity(sub: &RawSubstrate, s: usize, e: usize, p: usize) -> f32 {
+pub fn cut_discontinuity(sub: &RawSubstrate, s: usize, e: usize, p: usize) -> f32 {
     let l_lo = p.saturating_sub(10).max(s);
     let r_hi = (p + 10).min(e);
     if p <= l_lo || r_hi <= p {
@@ -230,7 +230,7 @@ fn cut_discontinuity(sub: &RawSubstrate, s: usize, e: usize, p: usize) -> f32 {
     (1.0 - 0.5 * (f_left + f_right)).clamp(0.0, 1.0)
 }
 
-fn abductive_discontinuity(
+pub fn abductive_discontinuity(
     graph: &PhiGraph,
     rels: &[[f32; REL_DIM]],
     left: (usize, usize),
@@ -414,7 +414,6 @@ pub fn discover_causal_regimes_from_encoded(
         }];
     }
 
-    // 1. Îlots actifs issus de la porte causale contextuelle (±2)
     let mut raw_runs: Vec<(usize, usize)> = Vec::new();
     let mut in_run = false;
     let mut run_start = 0usize;
@@ -461,7 +460,7 @@ pub fn discover_causal_regimes_from_encoded(
         }];
     }
 
-    // 2. Rognage strict des bavures sur la porte ponctuelle `gates_pt`
+    // Rognage ponctuel sans plafond artificiel de 4 octets (nettoie les préfixes collés)
     for i in 0..active_runs.len() {
         let min_s = if i == 0 { 0 } else { active_runs[i - 1].1 };
         let max_e = if i + 1 == active_runs.len() {
@@ -472,27 +471,26 @@ pub fn discover_causal_regimes_from_encoded(
         let (mut s, mut e) = active_runs[i];
 
         let mut trim_l = 0usize;
-        while s + 10 < e && trim_l < 4 && gates_pt[s] < 0.42 {
+        while s + 10 < e && trim_l < 14 && gates_pt[s] < 0.44 {
             s += 1;
             trim_l += 1;
         }
         let mut trim_r = 0usize;
-        while s + 10 < e && trim_r < 4 && gates_pt[e - 1] < 0.42 {
+        while s + 10 < e && trim_r < 14 && gates_pt[e - 1] < 0.44 {
             e -= 1;
             trim_r += 1;
         }
 
-        // Récupère au plus 2 octets de bord à haute confiance ponctuelle si aucun rognage
         if trim_l == 0 {
             let mut ext_l = 0usize;
-            while s > min_s && ext_l < 2 && gates_pt[s - 1] >= 0.65 {
+            while s > min_s && ext_l < 2 && gates_pt[s - 1] >= 0.68 {
                 s -= 1;
                 ext_l += 1;
             }
         }
         if trim_r == 0 {
             let mut ext_r = 0usize;
-            while e < max_e && ext_r < 2 && gates_pt[e] >= 0.65 {
+            while e < max_e && ext_r < 2 && gates_pt[e] >= 0.68 {
                 e += 1;
                 ext_r += 1;
             }
@@ -501,17 +499,16 @@ pub fn discover_causal_regimes_from_encoded(
         active_runs[i] = (s, e);
     }
 
-    // 3. Scinde les îlots collés et nettoie les éventuels octets morts à la couture
     let mut cores: Vec<(usize, usize)> = Vec::new();
     for (s, e) in active_runs {
         for (mut cs, mut ce) in split_run_by_abduction(graph, sub, rels, s, e, exact) {
             let mut tl = 0usize;
-            while cs + 10 < ce && tl < 2 && gates_pt[cs] < 0.35 {
+            while cs + 10 < ce && tl < 4 && gates_pt[cs] < 0.40 {
                 cs += 1;
                 tl += 1;
             }
             let mut tr = 0usize;
-            while cs + 10 < ce && tr < 2 && gates_pt[ce - 1] < 0.35 {
+            while cs + 10 < ce && tr < 4 && gates_pt[ce - 1] < 0.40 {
                 ce -= 1;
                 tr += 1;
             }
@@ -519,7 +516,26 @@ pub fn discover_causal_regimes_from_encoded(
         }
     }
 
-    // 4. Associe les zones passives adjacentes comme référents induits
+    // Filtre les micro-blips faibles (ex: étiquette isolée) lorsque des régimes forts existent
+    let max_mg = cores
+        .iter()
+        .map(|&(cs, ce)| gates_ctx[cs..ce].iter().sum::<f32>() / ((ce - cs).max(1) as f32))
+        .fold(0.0f32, f32::max);
+    if max_mg >= 0.72 && cores.len() >= 2 {
+        let filtered: Vec<(usize, usize)> = cores
+            .iter()
+            .copied()
+            .filter(|&(cs, ce)| {
+                let mg = gates_ctx[cs..ce].iter().sum::<f32>() / ((ce - cs).max(1) as f32);
+                let len = ce.saturating_sub(cs);
+                mg >= 0.62 * max_mg && (len >= 14 || mg >= 0.68)
+            })
+            .collect();
+        if !filtered.is_empty() {
+            cores = filtered;
+        }
+    }
+
     let k = cores.len();
     let lead_gap = cores[0].0;
     let trail_gap = n.saturating_sub(cores[k - 1].1);
@@ -585,7 +601,6 @@ pub fn compute_phi_sharp_prepared(
 
     let generativity = (-2.2 * residual).exp().clamp(1e-4, 1.0);
 
-    // 1. Discrimination + contraste conjoint des portes contextuelle et ponctuelle
     let (neg_rels, gates_neg_ctx, gates_neg_pt) = graph.encode_with_gate(&prep.neg);
     let (_, _, cross_err) = graph.evaluate_hypothesis(&trace.final_state, &neg_rels);
     let neg_trace = graph.abduce(&neg_rels, None);
@@ -605,7 +620,6 @@ pub fn compute_phi_sharp_prepared(
     let mean_g_neg = 0.5 * (mean_g_neg_ctx + mean_g_neg_pt);
     let gate_contrast = (mean_g_orig * (1.0 - mean_g_neg)).clamp(0.0, 1.0);
 
-    // 2. Projection (réfutation, déplacement, abstraction par bijection arbitraire)
     let ref_rels = graph.encode_relations(&prep.refut);
     let ref_trace = graph.abduce(&ref_rels, None);
     let (_, _, ref_on_orig) = graph.evaluate_hypothesis(&ref_trace.final_state, &rels);
@@ -625,7 +639,6 @@ pub fn compute_phi_sharp_prepared(
     let projection =
         ((refutation_stab + displacement_stab + abstraction_stab) / 3.0).clamp(1e-4, 1.0);
 
-    // 3. Intégration cause-effet (IIT 4.0)
     let masks: Vec<u8> = if exact_mip {
         (1u8..(1u8 << (NODES - 1))).collect()
     } else {
@@ -646,7 +659,6 @@ pub fn compute_phi_sharp_prepared(
     }
     let integration = (1.0 - (-3.5 * mip_loss).exp()).clamp(0.0, 1.0);
 
-    // 4. Agrégation
     let conj = (generativity * discrimination * projection * (0.2 + 0.8 * integration)).powf(0.25);
     let phi_sharp =
         0.85 * conj + 0.10 * traj_gain + 0.15 * gate_contrast - 0.30 * residual - 0.30 * bounce_pen;
@@ -686,8 +698,14 @@ pub fn compute_composite_phi_prepared(
     prep: &PreparedComposite,
 ) -> CompositePhi {
     let (rels, gates_ctx, gates_pt) = graph.encode_with_gate(&prep.stream);
-    let regimes =
-        discover_causal_regimes_from_encoded(graph, &prep.stream, &rels, &gates_ctx, &gates_pt, false);
+    let regimes = discover_causal_regimes_from_encoded(
+        graph,
+        &prep.stream,
+        &rels,
+        &gates_ctx,
+        &gates_pt,
+        false,
+    );
     let m = regimes.len();
     if m < 2 {
         return CompositePhi {
