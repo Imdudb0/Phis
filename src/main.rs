@@ -86,13 +86,12 @@ struct MultiScaleGroundTruth {
 }
 
 impl PtgrsCause {
-    /// Générateur d'entraînement strictement générique (aucun format NL ni moule ciblé).
     fn sample_generic(rng: &mut Rng) -> Self {
         let mut pool: Vec<u8> = (0u8..=255).collect();
         rng.shuffle(&mut pool);
 
-        let n_nonterms = 3 + rng.range_usize(3); // 3..5 non-terminaux
-        let n_terms = 5 + rng.range_usize(6); // 5..10 terminaux
+        let n_nonterms = 3 + rng.range_usize(3);
+        let n_terms = 5 + rng.range_usize(6);
         let nonterms = &pool[0..n_nonterms];
         let terminals = pool[n_nonterms..n_nonterms + n_terms].to_vec();
 
@@ -133,7 +132,6 @@ impl PtgrsCause {
         }
     }
 
-    /// Famille PTGRS hors-distribution (barreau 1) : double branchement récursif.
     fn sample_ood(rng: &mut Rng, depth_family: usize) -> Self {
         let mut pool: Vec<u8> = (0u8..=255).collect();
         rng.shuffle(&mut pool);
@@ -204,7 +202,6 @@ impl PtgrsCause {
         out
     }
 
-    /// Distribution observationnelle multi-échelle de référence de C (jamais vue à l'entraînement).
     fn ground_truth_multi_scale(&self, rng: &mut Rng, max_depth: usize) -> MultiScaleGroundTruth {
         let mut c1: HashMap<(u8, u8), usize> = HashMap::new();
         let mut s1: HashMap<u8, usize> = HashMap::new();
@@ -252,9 +249,9 @@ impl PtgrsCause {
 
 #[derive(Clone)]
 struct ScaleGraph {
-    r: [Vec<f64>; 3], // R^(1), R^(2), R^(3) : v_size * v_size
-    w: [Vec<f64>; 3], // Poids de lignes normalisés (somme = 1 par échelle)
-    h_marg: [f64; 3], // Entropie croisée de référence unigramme P_marg par échelle
+    r: [Vec<f64>; 3],
+    w: [Vec<f64>; 3],
+    h_marg: [f64; 3],
 }
 
 #[derive(Clone)]
@@ -264,7 +261,7 @@ struct RelationalView {
     v_size: usize,
     p_marg: Vec<f64>,
     graph: ScaleGraph,
-    shuf_graph: ScaleGraph, // Contre-exemple E- à marginales P_marg exactement identiques
+    shuf_graph: ScaleGraph,
     node_init: Vec<[f64; DIM]>,
 }
 
@@ -467,7 +464,6 @@ impl RelationalView {
 
 // ============================================================================
 // 4. Architecture connexionniste hiérarchique top-down Phisharp V2.1
-//    Liaisons dynamiques A(t), E_emit(t), G(t) co-évoluant avec H1(t) et H2(t)
 // ============================================================================
 
 const OFF_W_LAT1: usize = 0;
@@ -502,9 +498,9 @@ const SCALE_W: [f64; 3] = [0.50_f64, 0.30_f64, 0.20_f64];
 struct HierState {
     h1: Vec<[f64; DIM]>,
     h2: Vec<[f64; DIM]>,
-    l_a: Vec<f64>, // v_size * k1 : potentiels dynamiques d'ancrage L0 -> L1
-    l_e: Vec<f64>, // k1 * v_size : potentiels dynamiques d'émission L1 -> L0
-    l_g: Vec<f64>, // k1 * k1     : potentiels dynamiques de réécriture latente
+    l_a: Vec<f64>,
+    l_e: Vec<f64>,
+    l_g: Vec<f64>,
 }
 
 impl HierState {
@@ -518,8 +514,6 @@ impl HierState {
         }
     }
 
-    /// Initialisation douce strictement invariante au renommage bijectif d'alphabet
-    /// (dépend uniquement des indices d'ordre d'apparition u, k).
     fn seeded(v_size: usize) -> Self {
         let mut h1 = vec![[0.0_f64; DIM]; K1];
         for (k, v) in h1.iter_mut().enumerate() {
@@ -536,8 +530,6 @@ impl HierState {
             rms_norm(v);
         }
 
-        // Brisure de symétrie légère entre symboles et causes latentes (permet de résoudre
-        // les graphes réguliers/cycles tout en restant 100 % invariant par bijection).
         let mut l_a = vec![0.0_f64; v_size * K1];
         for u in 0..v_size {
             for k in 0..K1 {
@@ -648,12 +640,12 @@ impl HierState {
 }
 
 struct TopDownUnfold {
-    a_ground: Vec<f64>,   // V * k1
-    g_op: Vec<f64>,       // k1 * k1
-    emit: Vec<f64>,       // k1 * V
-    ge: [Vec<f64>; 3],    // G^s * E_emit (k1 * V)
-    ag: [Vec<f64>; 3],    // A * G^s      (V * k1)
-    r_hat: [Vec<f64>; 3], // R_hat^(1..3) = A * G^s * E_emit (V * V)
+    a_ground: Vec<f64>,
+    g_op: Vec<f64>,
+    emit: Vec<f64>,
+    ge: [Vec<f64>; 3],
+    ag: [Vec<f64>; 3],
+    r_hat: [Vec<f64>; 3],
 }
 
 #[derive(Clone)]
@@ -900,8 +892,6 @@ impl PhisharpModel {
     fn b2(&self) -> &[f64] { &self.params[OFF_B2..OFF_GATES] }
     fn gates(&self) -> &[f64] { &self.params[OFF_GATES..PARAM_COUNT] }
 
-    /// Déploiement vertical pur H = (H1, H2, L_A, L_E, L_G) ==> R_hat^(1..3) = A * G^s * E_emit.
-    /// Zéro lecture gauche-droite de E. Respecte les coupes MIP (cut_l1 et cut_vertical).
     fn unfold_top_down(
         &self,
         node_init: &[[f64; DIM]],
@@ -944,7 +934,6 @@ impl PhisharpModel {
             };
         }
 
-        // 1. Modulation verticale L2 -> L1 (non-réciproque)
         let mut h1_eff = state.h1.clone();
         let mut g2_ctx = [0.0_f64; DIM];
 
@@ -982,7 +971,6 @@ impl PhisharpModel {
             }
         }
 
-        // 2. Opérateur latent non-réciproque G (k1 x k1) gouverné par (H1, H2, L_G)
         let mut g_op = vec![0.0_f64; k1 * k1];
         let mut row_logits = vec![0.0_f64; k1];
 
@@ -1014,7 +1002,8 @@ impl PhisharpModel {
                 let meta_gate = if cut_vertical {
                     0.50_f64
                 } else {
-                    0.35_f64 + 1.25_f64 * sigmoid(dot(&g2_ctx, &h1_eff[a]) + dot(&g2_ctx, &h1_eff[b]))
+                    0.35_f64
+                        + 1.25_f64 * sigmoid(dot(&g2_ctx, &h1_eff[a]) + dot(&g2_ctx, &h1_eff[b]))
                 };
                 row_logits[b] = dot(&qa, &h1_eff[b])
                     + self.w_lat1(b, a) * active
@@ -1026,7 +1015,6 @@ impl PhisharpModel {
         let g2 = mat_mul(&g_op, &g_op, k1, k1, k1);
         let g3 = mat_mul(&g2, &g_op, k1, k1, k1);
 
-        // 3. Ancrage relationnel dynamique A (V x k1) : L_A + couplage (node_init, H1)
         let mut a_ground = vec![0.0_f64; v * k1];
         let mut sym_in = vec![[0.0_f64; DIM]; v];
         for u in 0..v {
@@ -1035,13 +1023,13 @@ impl PhisharpModel {
                 if h1_norms[k] <= 1e-9_f64 {
                     row_logits[k] = -1e9_f64;
                 } else {
-                    row_logits[k] = state.l_a[u * k1 + k] + 0.45_f64 * dot(&sym_in[u], &h1_eff[k]);
+                    row_logits[k] =
+                        state.l_a[u * k1 + k] + 0.45_f64 * dot(&sym_in[u], &h1_eff[k]);
                 }
             }
             softmax_slice(&row_logits, &mut a_ground[u * k1..(u + 1) * k1]);
         }
 
-        // 4. Émission top-down dynamique E_emit (k1 x V) : L_E + couplage (H1, node_init)
         let mut z_sym = vec![[0.0_f64; DIM]; v];
         let mut u_sym_x = vec![[0.0_f64; DIM]; v];
         for u in 0..v {
@@ -1081,7 +1069,6 @@ impl PhisharpModel {
             softmax_slice(&emit_logits, &mut emit[k * v..(k + 1) * v]);
         }
 
-        // 5. Déploiement multi-échelle vertical : R_hat^(s) = A * G^s * E_emit
         let ge1 = mat_mul(&g_op, &emit, k1, k1, v);
         let ge2 = mat_mul(&g2, &emit, k1, k1, v);
         let ge3 = mat_mul(&g3, &emit, k1, k1, v);
@@ -1104,8 +1091,6 @@ impl PhisharpModel {
         }
     }
 
-    /// Une étape abductive hiérarchique : co-évolution de (L_A, L_E, L_G, H1, H2)
-    /// à partir du résidu matriciel multi-échelle Δ^(s) = R^(s) - R_hat^(s).
     fn abductive_step(
         &self,
         view: &RelationalView,
@@ -1122,7 +1107,6 @@ impl PhisharpModel {
         let unfold = self.unfold_top_down(&view.node_init, state, cut_l1, cut_vertical);
         let res_norm = multi_scale_l1(&view.graph, &unfold.r_hat, v);
 
-        // 1. Résidu matriciel multi-échelle Δ^(s) = R^(s) - R_hat^(s)
         let mut delta = [
             vec![0.0_f64; v * v],
             vec![0.0_f64; v * v],
@@ -1149,12 +1133,10 @@ impl PhisharpModel {
             }
         }
 
-        // 2. Projections relationnelles du résidu vers L_A, L_E et L_G (100 % non-réciproques)
         let mut grad_a = vec![0.0_f64; v * k1];
         let mut grad_e = vec![0.0_f64; k1 * v];
         let mut grad_g = vec![0.0_f64; k1 * k1];
 
-        // Masses d'usage par cause latente pour invariance d'échelle par rapport à V et K1
         let mut mass_a = [vec![0.0_f64; k1], vec![0.0_f64; k1], vec![0.0_f64; k1]];
         let mut mass_ag = [vec![0.0_f64; k1], vec![0.0_f64; k1], vec![0.0_f64; k1]];
         for s in 0..3 {
@@ -1170,7 +1152,6 @@ impl PhisharpModel {
             }
         }
 
-        // (a) Flux résiduel sur L_A : Δ^(s) * (G^s E_emit)^T
         for s in 0..3 {
             let sw = SCALE_W[s];
             for u in 0..v {
@@ -1189,7 +1170,6 @@ impl PhisharpModel {
             }
         }
 
-        // (b) Flux résiduel sur L_E : (A G^s)^T * diag(w^(s)) * Δ^(s) (normalisé par masse)
         for s in 0..3 {
             let sw = SCALE_W[s];
             for k in 0..k1 {
@@ -1212,10 +1192,8 @@ impl PhisharpModel {
             }
         }
 
-        // (c) Flux résiduel dans l'espace latent G : projets gauche/droite aux échelles 1..3
         for s in 0..3 {
             let sw = SCALE_W[s];
-            // M_delta[u, b] = sum_w Δ^(s)[u, w] * E_emit[b, w]
             let mut d_emit = vec![0.0_f64; v * k1];
             for u in 0..v {
                 if view.graph.w[s][u] <= 0.0_f64 {
@@ -1247,7 +1225,6 @@ impl PhisharpModel {
                     }
                 }
             } else {
-                // Pour s = 1 (lag 2) et s = 2 (lag 3) : contributions amont (A G^{s-1}) et aval (G^{s-1} E)
                 let left_mat = &unfold.ag[s - 1];
                 let left_mass = &mass_ag[s - 1];
                 let right_mat = &unfold.ge[s - 1];
@@ -1279,7 +1256,8 @@ impl PhisharpModel {
                         let cl = inv_ml * wu * left_mat[u * k1 + a];
                         let ca = inv_ma * wu * unfold.a_ground[u * k1 + a];
                         for b in 0..k1 {
-                            grad_g[a * k1 + b] += cl * d_emit[u * k1 + b] + ca * d_right[u * k1 + b];
+                            grad_g[a * k1 + b] +=
+                                cl * d_emit[u * k1 + b] + ca * d_right[u * k1 + b];
                         }
                     }
                 }
@@ -1298,14 +1276,12 @@ impl PhisharpModel {
             }
         }
 
-        // 3. Portes d'intégration pilotées par le résidu (contractent en attracteur stable)
         let g = self.gates();
         let alpha1 = 0.14_f64 + 0.46_f64 * sigmoid(g[0] * res_norm + g[1]);
         let alpha2 = 0.14_f64 + 0.46_f64 * sigmoid(g[2] * res_norm + g[3]);
         let eta_ae = 0.60_f64 + 3.40_f64 * sigmoid(g[4] * res_norm + g[5]);
         let eta_g = 0.50_f64 + 3.00_f64 * sigmoid(g[6] * res_norm + g[7]);
 
-        // Mise à jour des liaisons dynamiques L_A, L_E, L_G avec amortissement doux + centrage
         let mut next_l_a = state.l_a.clone();
         for u in 0..v {
             let active = view.graph.w[0][u] > 0.0_f64
@@ -1348,7 +1324,6 @@ impl PhisharpModel {
             center_row(&mut next_l_g[a * k1..(a + 1) * k1]);
         }
 
-        // 4. Mise à jour Niveau 1 (résidu latent Δ_G non-réciproque + Δ_obs + W_lat1 + L2->L1)
         let mut next_h1 = vec![[0.0_f64; DIM]; k1];
         let b1 = self.b1();
 
@@ -1422,7 +1397,6 @@ impl PhisharpModel {
             rms_norm(&mut next_h1[dst]);
         }
 
-        // 5. Mise à jour Niveau 2 (réification pure de L1 et de son graphe G, zéro accès à L0)
         let mut next_h2 = vec![[0.0_f64; DIM]; k2];
         let b2 = self.b2();
 
@@ -1497,7 +1471,6 @@ impl PhisharpModel {
             l_g: next_l_g,
         };
 
-        // 6. Réfutation active conservatrice (teste une contre-hypothèse sur L1, L2 et G)
         if use_refutation
             && cut_l1.is_none()
             && cut_l2.is_none()
@@ -1537,7 +1510,6 @@ impl PhisharpModel {
             }
             rms_norm(&mut refuted.h2[peak2]);
 
-            // Teste aussi la réfutation de l'arête dominante sortant de peak1 dans L_G
             let mut dom_b = 0usize;
             let mut dom_val = f64::NEG_INFINITY;
             for b in 0..k1 {
@@ -1559,7 +1531,6 @@ impl PhisharpModel {
             if gain_ref > gain_base {
                 next_state = refuted;
             } else if gain_base >= gain_curr {
-                // Consolide la composante qui a survécu à la tentative de réfutation
                 for d in 0..DIM {
                     let d1 = next_state.h1[peak1][d] - refuted.h1[peak1][d];
                     next_state.h1[peak1][d] += 0.14_f64 * d1;
@@ -1569,7 +1540,6 @@ impl PhisharpModel {
                 rms_norm(&mut next_state.h1[peak1]);
                 rms_norm(&mut next_state.h2[peak2]);
             } else {
-                // Amortit tout dépassement pour stabiliser l'attracteur aux grands budgets
                 for k in 0..k1 {
                     for d in 0..DIM {
                         next_state.h1[k][d] = 0.5_f64 * (state.h1[k][d] + next_state.h1[k][d]);
@@ -1657,11 +1627,6 @@ impl PhisharpModel {
         self.evaluate_phi_state(view, &trace.state, budget, use_refutation)
     }
 
-    /// Substitut V2.1 de φ_sharp :
-    /// - G, D, P mesurés strictement au-dessus des marginales P_marg
-    /// - Combinaison sans compensation min(G, D, P)
-    /// - MIP exacte hiérarchique + facteur d'unicité (annule nœuds morts et clones)
-    /// - VERROU ANTI-GOODHART : poids STRICTEMENT NUL sur MIP tant que G, D ou P <= 0
     fn evaluate_phi_state(
         &self,
         view: &RelationalView,
@@ -1685,14 +1650,10 @@ impl PhisharpModel {
 
         let unfold = self.unfold_top_down(&view.node_init, state, None, false);
 
-        // 1. Générativité multi-échelle au-dessus de H(P_marg)
         let gen_raw = multi_scale_gain(&view.graph, &unfold.r_hat, v);
-
-        // 2. Discrimination : contraste face à E- (permuté à marginales P_marg identiques)
         let neg_gain = multi_scale_gain(&view.shuf_graph, &unfold.r_hat, v);
         let disc_raw = (gen_raw - neg_gain).clamp(-1.0_f64, 1.0_f64);
 
-        // 3. Projection stricte : abduit sur la 1re moitié seule, déplie sur la 2e sans la lire
         let mid = view.seq.len() / 2;
         let first_half = view.subslice_same_vocab(0, mid);
         let second_half = view.subslice_same_vocab(mid, view.seq.len());
@@ -1700,17 +1661,16 @@ impl PhisharpModel {
             0.0_f64
         } else {
             let tr_half = self.run_abduction(&first_half, budget, use_refutation, &[], false);
-            let unfold_half = self.unfold_top_down(&first_half.node_init, &tr_half.state, None, false);
+            let unfold_half =
+                self.unfold_top_down(&first_half.node_init, &tr_half.state, None, false);
             multi_scale_gain(&second_half.graph, &unfold_half.r_hat, v)
         };
 
-        // 4. Intégration causale exacte (MIP hiérarchique + unicité des unités causales)
         let k1 = state.h1.len();
         let k2 = state.h2.len();
         let mip_integration = if budget == 0 || k1 <= 1 || k2 <= 1 {
             0.0_f64
         } else {
-            // Facteur d'unicité causale : une copie clonée sur L1 ou L2 donne distance = 0 -> MIP = 0
             let mut min_dist = f64::INFINITY;
             for a in 0..k1 {
                 for b in (a + 1)..k1 {
@@ -1738,7 +1698,6 @@ impl PhisharpModel {
 
                 let mut min_div = f64::INFINITY;
 
-                // (a) Toutes les bipartitions internes de Niveau 1
                 let masks1 = 1u32 << (k1.min(10) - 1);
                 for mask in 1..masks1 {
                     let cut_next =
@@ -1752,7 +1711,6 @@ impl PhisharpModel {
                     }
                 }
 
-                // (b) Toutes les bipartitions internes de Niveau 2
                 let masks2 = 1u32 << (k2.min(10) - 1);
                 for mask in 1..masks2 {
                     let cut_next =
@@ -1765,7 +1723,6 @@ impl PhisharpModel {
                     }
                 }
 
-                // (c) Coupe verticale L1 <-> L2 (interdit un L2 décoratif)
                 let vcut_next = self.abductive_step(view, state, false, None, None, true);
                 let pred_vcut = self.unfold_top_down(&view.node_init, &vcut_next, None, true);
                 let vdiv =
@@ -1774,7 +1731,6 @@ impl PhisharpModel {
                     min_div = vdiv;
                 }
 
-                // (d) Ablation de chaque nœud individuel (annule les branches mortes/épiphénoménales)
                 for drop1 in 0..k1 {
                     let mut abl = state.clone();
                     abl.h1[drop1] = [0.0_f64; DIM];
@@ -1800,7 +1756,6 @@ impl PhisharpModel {
             }
         };
 
-        // 5. Stabilité différentielle (réfutation partielle L1+L2 + déplacement central)
         let diff_stability = if budget == 0 || gen_raw <= 1e-6_f64 || k1 == 0 || k2 == 0 {
             0.0_f64
         } else {
@@ -1822,20 +1777,17 @@ impl PhisharpModel {
             0.5_f64 * (ref_stab + shift_stab)
         };
 
-        // 6. Résidu non expliqué
         let residual_norm = multi_scale_l1(&view.graph, &unfold.r_hat, v).clamp(0.0_f64, 1.0_f64);
 
         let g_c = gen_raw.clamp(0.0_f64, 1.0_f64);
         let d_c = disc_raw.clamp(0.0_f64, 1.0_f64);
         let p_c = proj_raw.clamp(0.0_f64, 1.0_f64);
 
-        // Combinaison sans compensation : min(G, D, P)
         let base_min = g_c.min(d_c).min(p_c);
-        let phi_sharp =
-            base_min * (mip_integration * diff_stability).sqrt() * (1.0_f64 - 0.5_f64 * residual_norm);
+        let phi_sharp = base_min
+            * (mip_integration * diff_stability).sqrt()
+            * (1.0_f64 - 0.5_f64 * residual_norm);
 
-        // VERROU ANTI-GOODHART STRICT :
-        // Zéro récompense sur MIP ou diff_stability tant que G, D et P ne battent pas tous P_marg.
         let shaping_score = if gen_raw > 0.0_f64 && disc_raw > 0.0_f64 && proj_raw > 0.0_f64 {
             phi_sharp + 0.05_f64 * base_min
         } else {
@@ -1856,8 +1808,6 @@ impl PhisharpModel {
         }
     }
 
-    /// Canal `ask` pur : déploiement vertical depuis l'opérateur latent G (sans autorégression),
-    /// sélectionné par clôture de résidu auto-référentielle : max [φ_sharp(E + ΔE) - φ_sharp(E)] - λ·Écho.
     fn ask_emit(&self, view: &RelationalView, budget: usize, out_len: usize) -> Vec<u8> {
         if view.vocab.is_empty() || view.seq.is_empty() {
             return Vec::new();
@@ -2115,6 +2065,8 @@ fn log_likelihood_graph(graph: &ScaleGraph, r_hat: &[Vec<f64>; 3], v: usize) -> 
     ll
 }
 
+/// Score MDL (BIC-like) pénalisant la longueur de description de l'état causal (H1, H2)
+/// et des liaisons dynamiques (L_A, L_E, L_G).
 fn mdl_graph(
     graph: &ScaleGraph,
     r_hat: &[Vec<f64>; 3],
@@ -2123,21 +2075,29 @@ fn mdl_graph(
     v: usize,
 ) -> f64 {
     let ll = log_likelihood_graph(graph, r_hat, v);
-    let mut energy = 0.0_f64;
+    let mut lat_energy = 0.0_f64;
     for h in state.h1.iter().chain(state.h2.iter()) {
         for &val in h {
             if val.abs() > 0.05_f64 {
-                energy += val.abs();
+                lat_energy += val.abs();
             }
         }
     }
+    let mut dyn_energy = 0.0_f64;
+    for &val in state
+        .l_a
+        .iter()
+        .chain(state.l_e.iter())
+        .chain(state.l_g.iter())
+    {
+        if val.abs() > 0.05_f64 {
+            dyn_energy += val.abs();
+        }
+    }
     let n = seq_len.max(2) as f64;
-    ll - 0.02_f64 * energy * n.ln() / n
+    ll - 0.008_f64 * (lat_energy + 0.5_f64 * dyn_energy) * n.ln() / n
 }
 
-/// Étalonnage corrigé : mesure EXCLUSIVEMENT la récupération excédentaire normalisée
-/// de la structure conditionnelle de C au-dessus des marginales P_marg.
-/// Un prédicteur marginal obtient 0.0 et un prédicteur uniforme <= 0.0 quelle que soit V.
 fn observational_equivalence_excess(
     view: &RelationalView,
     r_hat: &[Vec<f64>; 3],
@@ -2230,12 +2190,53 @@ fn spearman_corr(xs: &[f64], ys: &[f64]) -> f64 {
 }
 
 // ============================================================================
-// 6. Entraînement fermé multi-budget (PTGRS générique + φ_sharp uniquement)
+// 6. Entraînement fermé multi-objectif (Untrained / LL / MDL / φ_sharp)
+//    Même initialisation, même PTGRS générique, même budget, même optimiseur ES.
 // ============================================================================
 
-fn train_closed(out_path: &Path, steps: usize, seed: u64) {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TrainObjective {
+    Untrained,
+    Likelihood,
+    Mdl,
+    PhiSharp,
+}
+
+impl TrainObjective {
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "untrained" | "step0" | "random" => Some(Self::Untrained),
+            "ll" | "likelihood" | "vraisemblance" => Some(Self::Likelihood),
+            "mdl" => Some(Self::Mdl),
+            "phi" | "phisharp" | "phi_sharp" => Some(Self::PhiSharp),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Untrained => "Step 0 (aléatoire)",
+            Self::Likelihood => "Baseline Vraisemblance (LL)",
+            Self::Mdl => "Baseline MDL",
+            Self::PhiSharp => "Phisharp (φ_sharp)",
+        }
+    }
+}
+
+fn train_model(out_path: &Path, steps: usize, seed: u64, objective: TrainObjective) -> PhisharpModel {
     let mut rng = Rng::new(seed);
     let mut model = PhisharpModel::new_random(&mut rng);
+
+    if objective == TrainObjective::Untrained || steps == 0 {
+        model.save(out_path).expect("Échec écriture modèle Step 0");
+        println!(
+            "Modèle {} (0 steps, seed={}) sauvegardé : {}",
+            objective.label(),
+            seed,
+            out_path.display()
+        );
+        return model;
+    }
 
     let pop_pairs = 16usize;
     let sigma: f64 = 0.075;
@@ -2248,12 +2249,13 @@ fn train_closed(out_path: &Path, steps: usize, seed: u64) {
     let beta2: f64 = 0.999;
 
     println!(
-        "=== ENTRAÎNEMENT FERMÉ PHISHARP V2.1 (PTGRS générique + A/E/G dynamiques, {} params) ===",
+        "=== ENTRAÎNEMENT FERMÉ V2.1 [{}] (PTGRS générique, {} params) ===",
+        objective.label(),
         PARAM_COUNT
     );
 
     for step in 1..=steps {
-        let t_budget = 3 + rng.range_usize(5); // T dans 3..=7
+        let t_budget = 3 + rng.range_usize(5);
         let t_next = t_budget + 2;
 
         let mut batch_views = Vec::with_capacity(batch_size);
@@ -2295,13 +2297,82 @@ fn train_closed(out_path: &Path, steps: usize, seed: u64) {
                         let snaps = [t_budget, t_next];
                         for view in views_ref {
                             let tr = m.run_abduction(view, t_next, true, &snaps, false);
-                            let r1 = m.evaluate_phi_state(view, &tr.snapshots[0].1, t_budget, true);
-                            let r2 = m.evaluate_phi_state(view, &tr.snapshots[1].1, t_next, true);
-                            let drop_pen = (r1.phi_sharp - r2.phi_sharp).max(0.0_f64);
-                            acc += 0.45_f64 * r1.shaping_score
-                                + 0.45_f64 * r2.shaping_score
-                                + 0.10_f64 * r1.shaping_score.min(r2.shaping_score)
-                                - 0.20_f64 * drop_pen;
+                            match objective {
+                                TrainObjective::PhiSharp => {
+                                    let r1 = m.evaluate_phi_state(
+                                        view,
+                                        &tr.snapshots[0].1,
+                                        t_budget,
+                                        true,
+                                    );
+                                    let r2 = m.evaluate_phi_state(
+                                        view,
+                                        &tr.snapshots[1].1,
+                                        t_next,
+                                        true,
+                                    );
+                                    let drop_pen = (r1.phi_sharp - r2.phi_sharp).max(0.0_f64);
+                                    acc += 0.45_f64 * r1.shaping_score
+                                        + 0.45_f64 * r2.shaping_score
+                                        + 0.10_f64 * r1.shaping_score.min(r2.shaping_score)
+                                        - 0.20_f64 * drop_pen;
+                                }
+                                TrainObjective::Likelihood => {
+                                    let u1 = m.unfold_top_down(
+                                        &view.node_init,
+                                        &tr.snapshots[0].1,
+                                        None,
+                                        false,
+                                    );
+                                    let u2 = m.unfold_top_down(
+                                        &view.node_init,
+                                        &tr.snapshots[1].1,
+                                        None,
+                                        false,
+                                    );
+                                    let s1 = log_likelihood_graph(&view.graph, &u1.r_hat, view.v_size);
+                                    let s2 = log_likelihood_graph(&view.graph, &u2.r_hat, view.v_size);
+                                    let drop_pen = (s1 - s2).max(0.0_f64);
+                                    acc += 0.45_f64 * s1
+                                        + 0.45_f64 * s2
+                                        + 0.10_f64 * s1.min(s2)
+                                        - 0.20_f64 * drop_pen;
+                                }
+                                TrainObjective::Mdl => {
+                                    let u1 = m.unfold_top_down(
+                                        &view.node_init,
+                                        &tr.snapshots[0].1,
+                                        None,
+                                        false,
+                                    );
+                                    let u2 = m.unfold_top_down(
+                                        &view.node_init,
+                                        &tr.snapshots[1].1,
+                                        None,
+                                        false,
+                                    );
+                                    let s1 = mdl_graph(
+                                        &view.graph,
+                                        &u1.r_hat,
+                                        &tr.snapshots[0].1,
+                                        view.seq.len(),
+                                        view.v_size,
+                                    );
+                                    let s2 = mdl_graph(
+                                        &view.graph,
+                                        &u2.r_hat,
+                                        &tr.snapshots[1].1,
+                                        view.seq.len(),
+                                        view.v_size,
+                                    );
+                                    let drop_pen = (s1 - s2).max(0.0_f64);
+                                    acc += 0.45_f64 * s1
+                                        + 0.45_f64 * s2
+                                        + 0.10_f64 * s1.min(s2)
+                                        - 0.20_f64 * drop_pen;
+                                }
+                                TrainObjective::Untrained => {}
+                            }
                         }
                         acc / (views_ref.len() as f64)
                     };
@@ -2338,34 +2409,38 @@ fn train_closed(out_path: &Path, steps: usize, seed: u64) {
             model.params[i] = model.params[i].clamp(-4.0_f64, 4.0_f64);
         }
 
-        if step == 1 || step % 25 == 0 || step == steps {
+        if step == 1 || step % 50 == 0 || step == steps {
             let mut g_sum = 0.0_f64;
             let mut d_sum = 0.0_f64;
             let mut p_sum = 0.0_f64;
             let mut mip_sum = 0.0_f64;
             let mut phi_t = 0.0_f64;
             let mut phi_t2 = 0.0_f64;
+            let mut ll_sum = 0.0_f64;
             let snaps = [t_budget, t_next];
             for view in &batch_views {
                 let tr = model.run_abduction(view, t_next, true, &snaps, false);
                 let r1 = model.evaluate_phi_state(view, &tr.snapshots[0].1, t_budget, true);
                 let r2 = model.evaluate_phi_state(view, &tr.snapshots[1].1, t_next, true);
+                let u1 = model.unfold_top_down(&view.node_init, &tr.snapshots[0].1, None, false);
                 g_sum += r1.generativity;
                 d_sum += r1.discrimination;
                 p_sum += r1.projection;
                 mip_sum += r1.mip_integration;
                 phi_t += r1.phi_sharp;
                 phi_t2 += r2.phi_sharp;
+                ll_sum += log_likelihood_graph(&view.graph, &u1.r_hat, view.v_size);
             }
             let nb = batch_views.len() as f64;
             println!(
-                "step {:4}/{} (T={},{}) | φ(T)={:.4} φ(T+2)={:.4} | G={:.3} D={:.3} P={:.3} MIP={:.3}",
+                "step {:4}/{} (T={},{}) | φ(T)={:.4} φ(T+2)={:.4} | LL={:+.3} | G={:.3} D={:.3} P={:.3} MIP={:.3}",
                 step,
                 steps,
                 t_budget,
                 t_next,
                 phi_t / nb,
                 phi_t2 / nb,
+                ll_sum / nb,
                 g_sum / nb,
                 d_sum / nb,
                 p_sum / nb,
@@ -2375,24 +2450,52 @@ fn train_closed(out_path: &Path, steps: usize, seed: u64) {
     }
 
     model.save(out_path).expect("Échec écriture modèle V2.1");
-    println!("Modèle V2.1 figé sauvegardé : {}", out_path.display());
+    println!("Modèle [{}] figé sauvegardé : {}", objective.label(), out_path.display());
+    model
 }
 
 // ============================================================================
-// 7. Porte d'étalonnage V2.1 (récupération excédentaire C + 6 témoins négatifs)
+// 7. Porte d'étalonnage V2.1 (structurée pour usage solo et comparatif)
 // ============================================================================
 
-fn run_calibration(model: &PhisharpModel, seed: u64) {
+struct CalibrationSummary {
+    r_phi: f64,
+    r_ll: f64,
+    r_mdl: f64,
+    s_phi: f64,
+    s_ll: f64,
+    s_mdl: f64,
+    within_r_phi: f64,
+    within_r_ll: f64,
+    within_r_mdl: f64,
+    mean_phi: f64,
+    mean_eq: f64,
+    rand_phi: f64,
+    h_eq_e_phi: f64,
+    overgen_phi: f64,
+    perm_mean: f64,
+    perm_max: f64,
+    phi_clean: f64,
+    phi_l1_dead: f64,
+    phi_l1_clone: f64,
+    phi_l2_clone: f64,
+    max_phi_diff: f64,
+    ask_exact: bool,
+    signal_alive: bool,
+    pass_corr: bool,
+    pass_neg: bool,
+    pass_inv: bool,
+}
+
+fn evaluate_calibration(model: &PhisharpModel, seed: u64) -> CalibrationSummary {
     let mut rng = Rng::new(seed);
     let mut eval_rng = Rng::new(seed ^ 0x55AA_CC33);
-    println!("=== PORTE D'ÉTALONNAGE V2.1 (PTGRS générique, récupération excédentaire C) ===");
 
     let mut eq_scores = Vec::new();
     let mut phi_scores = Vec::new();
     let mut ll_scores = Vec::new();
     let mut mdl_scores = Vec::new();
 
-    // 1. Inter-causes (36 essais variant V, profondeur, longueur et budget)
     for trial in 0..36 {
         let cause = PtgrsCause::sample_generic(&mut rng);
         let depth = 3 + (trial % 3);
@@ -2445,7 +2548,6 @@ fn run_calibration(model: &PhisharpModel, seed: u64) {
     let mean_phi = phi_scores.iter().sum::<f64>() / (phi_scores.len() as f64);
     let mean_eq = eq_scores.iter().sum::<f64>() / (eq_scores.len() as f64);
 
-    // 2. Intra-cause (suivi pur de la trajectoire t = 0,1,2,4,6,8 sur 12 causes fixes)
     let traj_budgets = [0usize, 1, 2, 4, 6, 8];
     let mut within_r_phi = 0.0_f64;
     let mut within_r_ll = 0.0_f64;
@@ -2478,24 +2580,6 @@ fn run_calibration(model: &PhisharpModel, seed: u64) {
     within_r_ll /= 12.0_f64;
     within_r_mdl /= 12.0_f64;
 
-    println!(
-        "Inter-causes Pearson  vs Rec_exc(C) : φ_sharp={:+.4} | Vraisemblance={:+.4} | MDL={:+.4}",
-        r_phi, r_ll, r_mdl
-    );
-    println!(
-        "Inter-causes Spearman vs Rec_exc(C) : φ_sharp={:+.4} | Vraisemblance={:+.4} | MDL={:+.4}",
-        s_phi, s_ll, s_mdl
-    );
-    println!(
-        "Intra-cause  Pearson  (t=0..8, 12x) : φ_sharp={:+.4} | Vraisemblance={:+.4} | MDL={:+.4}",
-        within_r_phi, within_r_ll, within_r_mdl
-    );
-    println!(
-        "Moyennes PTGRS (t=0..8)             : φ_sharp={:.4} | Rec_exc(C)={:+.4}",
-        mean_phi, mean_eq
-    );
-
-    // Témoin 1 : octets aléatoires uniformes (10x)
     let mut rand_phi = 0.0_f64;
     for _ in 0..10 {
         let bytes: Vec<u8> = (0..160).map(|_| (rng.next_u64() % 10) as u8).collect();
@@ -2504,7 +2588,6 @@ fn run_calibration(model: &PhisharpModel, seed: u64) {
     }
     rand_phi /= 10.0_f64;
 
-    // Témoin 2 : H := E (aucune intégration latente : k1 = 0, k2 = 0 => MIP = 0)
     let cause_ref = PtgrsCause::sample_generic(&mut rng);
     let bytes_ref = cause_ref.emit_effect(&mut rng, 4, 160);
     let view_ref = RelationalView::from_bytes(&bytes_ref);
@@ -2513,13 +2596,11 @@ fn run_calibration(model: &PhisharpModel, seed: u64) {
         .evaluate_phi_state(&view_ref, &empty_state, DEFAULT_BUDGET, true)
         .phi_sharp;
 
-    // Témoin 3 : cause sur-générale (état latent nul => prédiction uniforme, D = 0)
     let zero_state = HierState::zeros(view_ref.v_size, K1, K2);
     let overgen_phi = model
         .evaluate_phi_state(&view_ref, &zero_state, DEFAULT_BUDGET, true)
         .phi_sharp;
 
-    // Témoin 4 : E permuté à marginales P_marg identiques (10x)
     let mut perm_sum = 0.0_f64;
     let mut perm_max = 0.0_f64;
     for _ in 0..10 {
@@ -2535,7 +2616,6 @@ fn run_calibration(model: &PhisharpModel, seed: u64) {
     }
     let perm_mean = perm_sum / 10.0_f64;
 
-    // Témoin 5 : branches épiphénoménales (nœud mort L1, clone L1, clone L2)
     let trace_ref = model.run_abduction(&view_ref, DEFAULT_BUDGET, true, &[], false);
     let phi_clean = model
         .evaluate_phi_state(&view_ref, &trace_ref.state, DEFAULT_BUDGET, true)
@@ -2556,7 +2636,6 @@ fn run_calibration(model: &PhisharpModel, seed: u64) {
         .evaluate_phi_state(&view_ref, &l2_clone, DEFAULT_BUDGET, true)
         .phi_sharp;
 
-    // Témoin 6 : invariance exacte par renommage bijectif d'alphabet
     let mut bij: Vec<u8> = (0u8..=255).collect();
     rng.shuffle(&mut bij);
     let mut inv_bij = [0u8; 256];
@@ -2580,23 +2659,6 @@ fn run_calibration(model: &PhisharpModel, seed: u64) {
     let out_ren_inv: Vec<u8> = out_ren.iter().map(|&b| inv_bij[b as usize]).collect();
     let ask_exact = out_orig == out_ren_inv;
 
-    println!("--- Témoins négatifs ---");
-    println!("  Octets aléatoires (10x)       : φ_sharp = {:.4}", rand_phi);
-    println!("  H := E (sans intégration)     : φ_sharp = {:.4}", h_eq_e_phi);
-    println!("  Cause sur-générale            : φ_sharp = {:.4}", overgen_phi);
-    println!(
-        "  E permuté à marginales égales : moy={:.4} | max={:.4}",
-        perm_mean, perm_max
-    );
-    println!(
-        "  Branches épiphénoménales      : propre={:.4} -> L1_morte={:.4} | L1_clone={:.4} | L2_clone={:.4}",
-        phi_clean, phi_l1_dead, phi_l1_clone, phi_l2_clone
-    );
-    println!(
-        "  Invariance bijective          : max|Δφ(t)|={:.2e} | ask(π(E))==π(ask(E)) : {}",
-        max_phi_diff, ask_exact
-    );
-
     let signal_alive = mean_phi > 0.03_f64 && phi_clean > 0.03_f64;
     let pass_corr = signal_alive
         && ((r_phi > r_ll && r_phi > r_mdl && r_phi > 0.40_f64)
@@ -2612,69 +2674,163 @@ fn run_calibration(model: &PhisharpModel, seed: u64) {
         && phi_l2_clone < 1e-9_f64;
     let pass_inv = max_phi_diff < 1e-9_f64 && ask_exact;
 
+    CalibrationSummary {
+        r_phi,
+        r_ll,
+        r_mdl,
+        s_phi,
+        s_ll,
+        s_mdl,
+        within_r_phi,
+        within_r_ll,
+        within_r_mdl,
+        mean_phi,
+        mean_eq,
+        rand_phi,
+        h_eq_e_phi,
+        overgen_phi,
+        perm_mean,
+        perm_max,
+        phi_clean,
+        phi_l1_dead,
+        phi_l1_clone,
+        phi_l2_clone,
+        max_phi_diff,
+        ask_exact,
+        signal_alive,
+        pass_corr,
+        pass_neg,
+        pass_inv,
+    }
+}
+
+fn run_calibration(model: &PhisharpModel, seed: u64) {
+    let c = evaluate_calibration(model, seed);
+    println!("=== PORTE D'ÉTALONNAGE V2.1 (PTGRS générique, récupération excédentaire C) ===");
+    println!(
+        "Inter-causes Pearson  vs Rec_exc(C) : φ_sharp={:+.4} | Vraisemblance={:+.4} | MDL={:+.4}",
+        c.r_phi, c.r_ll, c.r_mdl
+    );
+    println!(
+        "Inter-causes Spearman vs Rec_exc(C) : φ_sharp={:+.4} | Vraisemblance={:+.4} | MDL={:+.4}",
+        c.s_phi, c.s_ll, c.s_mdl
+    );
+    println!(
+        "Intra-cause  Pearson  (t=0..8, 12x) : φ_sharp={:+.4} | Vraisemblance={:+.4} | MDL={:+.4}",
+        c.within_r_phi, c.within_r_ll, c.within_r_mdl
+    );
+    println!(
+        "Moyennes PTGRS (t=0..8)             : φ_sharp={:.4} | Rec_exc(C)={:+.4}",
+        c.mean_phi, c.mean_eq
+    );
+    println!("--- Témoins négatifs ---");
+    println!("  Octets aléatoires (10x)       : φ_sharp = {:.4}", c.rand_phi);
+    println!("  H := E (sans intégration)     : φ_sharp = {:.4}", c.h_eq_e_phi);
+    println!("  Cause sur-générale            : φ_sharp = {:.4}", c.overgen_phi);
+    println!(
+        "  E permuté à marginales égales : moy={:.4} | max={:.4}",
+        c.perm_mean, c.perm_max
+    );
+    println!(
+        "  Branches épiphénoménales      : propre={:.4} -> L1_morte={:.4} | L1_clone={:.4} | L2_clone={:.4}",
+        c.phi_clean, c.phi_l1_dead, c.phi_l1_clone, c.phi_l2_clone
+    );
+    println!(
+        "  Invariance bijective          : max|Δφ(t)|={:.2e} | ask(π(E))==π(ask(E)) : {}",
+        c.max_phi_diff, c.ask_exact
+    );
     println!("--- VERDICT ÉTALONNAGE V2.1 ---");
-    if pass_corr && pass_neg && pass_inv {
+    if c.pass_corr && c.pass_neg && c.pass_inv {
         println!(
             "PASS : A est lisible. Passage au barreau 1 (OOD) et à la rupture de générateur autorisé."
         );
     } else {
         println!(
             "ARRÊT : Étalonnage échoué (alive={}, corr_ok={}, neg_ok={}, inv_ok={}). A non lisible.",
-            signal_alive, pass_corr, pass_neg, pass_inv
+            c.signal_alive, c.pass_corr, c.pass_neg, c.pass_inv
         );
     }
 }
 
 // ============================================================================
-// 8. Barreau 1 : PTGRS OOD, courbe anytime t=0..10, ablations, triple résidu
+// 8. Barreau 1 : PTGRS OOD (structuré avec Rec_exc(C) externe non-circulaire)
 // ============================================================================
 
-fn run_eval_ood(model: &PhisharpModel, seed: u64) {
-    let mut rng = Rng::new(seed);
-    println!("=== ÉVALUATION BARREAU 1 V2.1 (PTGRS OOD : profondeurs d=2, 4, 8) ===");
+struct OodDepthStats {
+    depth: usize,
+    curves: Vec<f64>,
+    no_ref_t6: f64,
+    rec_exc_t6: f64,
+    rec_exc_t10: f64,
+    g_t6: f64,
+    p_t6: f64,
+    mip_t6: f64,
+}
 
+struct OodSummary {
+    depths: Vec<OodDepthStats>,
+    gain_true: f64,
+    gain_foreign: f64,
+    gain_echo: f64,
+}
+
+fn evaluate_ood(model: &PhisharpModel, seed: u64) -> OodSummary {
+    let mut rng = Rng::new(seed);
+    let mut truth_rng = Rng::new(seed ^ 0x7711_9933);
     let max_t = 10usize;
     let all_snaps: Vec<usize> = (0..=max_t).collect();
+    let mut depths = Vec::new();
 
     for &depth in &[2usize, 4, 8] {
         let mut curves = vec![0.0_f64; max_t + 1];
         let mut no_ref_sum = 0.0_f64;
+        let mut rec6_sum = 0.0_f64;
+        let mut rec10_sum = 0.0_f64;
+        let mut g6_sum = 0.0_f64;
+        let mut p6_sum = 0.0_f64;
+        let mut mip6_sum = 0.0_f64;
         let trials = 12usize;
 
         for _ in 0..trials {
             let cause = PtgrsCause::sample_ood(&mut rng, depth);
             let bytes = cause.emit_effect(&mut rng, depth, 180);
             let view = RelationalView::from_bytes(&bytes);
+            let truth = cause.ground_truth_multi_scale(&mut truth_rng, depth);
 
             let tr = model.run_abduction(&view, max_t, true, &all_snaps, false);
             for (step, st) in &tr.snapshots {
-                curves[*step] += model.evaluate_phi_state(&view, st, *step, true).phi_sharp;
+                let rep = model.evaluate_phi_state(&view, st, *step, true);
+                curves[*step] += rep.phi_sharp;
+                if *step == DEFAULT_BUDGET {
+                    g6_sum += rep.generativity;
+                    p6_sum += rep.projection;
+                    mip6_sum += rep.mip_integration;
+                    let unf = model.unfold_top_down(&view.node_init, st, None, false);
+                    rec6_sum += observational_equivalence_excess(&view, &unf.r_hat, &truth);
+                } else if *step == max_t {
+                    let unf = model.unfold_top_down(&view.node_init, st, None, false);
+                    rec10_sum += observational_equivalence_excess(&view, &unf.r_hat, &truth);
+                }
             }
             no_ref_sum += model.evaluate_phi(&view, DEFAULT_BUDGET, false).phi_sharp;
         }
 
+        let n = trials as f64;
         for val in &mut curves {
-            *val /= trials as f64;
+            *val /= n;
         }
-        no_ref_sum /= trials as f64;
-
-        print!("Profondeur d={} | Anytime φ(t=0..10): ", depth);
-        for (b, val) in curves.iter().enumerate() {
-            print!("t{}={:.3} ", b, val);
-        }
-        println!();
-        let retention = if curves[DEFAULT_BUDGET] > 1e-6_f64 {
-            curves[max_t] / curves[DEFAULT_BUDGET]
-        } else {
-            0.0_f64
-        };
-        println!(
-            "  Ablations (d={}) : budget=0 -> {:.4} | sans réfutation (t={}) -> {:.4} vs avec -> {:.4} | maintien t10/t6 = {:.2}x",
-            depth, curves[0], DEFAULT_BUDGET, no_ref_sum, curves[DEFAULT_BUDGET], retention
-        );
+        depths.push(OodDepthStats {
+            depth,
+            curves,
+            no_ref_t6: no_ref_sum / n,
+            rec_exc_t6: rec6_sum / n,
+            rec_exc_t10: rec10_sum / n,
+            g_t6: g6_sum / n,
+            p_t6: p6_sum / n,
+            mip_t6: mip6_sum / n,
+        });
     }
 
-    println!("--- Test du résidu (vrai complément vs étranger C' vs écho) ---");
     let mut gain_true = 0.0_f64;
     let mut gain_foreign = 0.0_f64;
     let mut gain_echo = 0.0_f64;
@@ -2715,11 +2871,43 @@ fn run_eval_ood(model: &PhisharpModel, seed: u64) {
         gain_echo += phi_echo - phi_partial;
     }
 
+    OodSummary {
+        depths,
+        gain_true: gain_true / (trials_r as f64),
+        gain_foreign: gain_foreign / (trials_r as f64),
+        gain_echo: gain_echo / (trials_r as f64),
+    }
+}
+
+fn run_eval_ood(model: &PhisharpModel, seed: u64) {
+    let ood = evaluate_ood(model, seed);
+    println!("=== ÉVALUATION BARREAU 1 V2.1 (PTGRS OOD : profondeurs d=2, 4, 8) ===");
+    for d in &ood.depths {
+        print!("Profondeur d={} | Anytime φ(t=0..10): ", d.depth);
+        for (b, val) in d.curves.iter().enumerate() {
+            print!("t{}={:.3} ", b, val);
+        }
+        println!();
+        let ret = if d.curves[DEFAULT_BUDGET] > 1e-6_f64 {
+            d.curves[10] / d.curves[DEFAULT_BUDGET]
+        } else {
+            0.0_f64
+        };
+        println!(
+            "  Ablations (d={}) : budget=0 -> {:.4} | sans réfutation -> {:.4} vs avec -> {:.4} | t10/t6={:.2}x | Rec_exc(C) t6={:+.4} t10={:+.4}",
+            d.depth,
+            d.curves[0],
+            d.no_ref_t6,
+            d.curves[DEFAULT_BUDGET],
+            ret,
+            d.rec_exc_t6,
+            d.rec_exc_t10
+        );
+    }
+    println!("--- Test du résidu (vrai complément vs étranger C' vs écho) ---");
     println!(
         "Δφ_sharp moyen : vrai complément={:+.4} | étranger C'={:+.4} | écho={:+.4}",
-        gain_true / (trials_r as f64),
-        gain_foreign / (trials_r as f64),
-        gain_echo / (trials_r as f64)
+        ood.gain_true, ood.gain_foreign, ood.gain_echo
     );
 }
 
@@ -2831,16 +3019,33 @@ fn gen_structured_frames(seed: u64, target_len: usize) -> Vec<u8> {
     out
 }
 
-fn run_eval_transfer(model: &PhisharpModel, seed: u64) {
-    let mut rng = Rng::new(seed);
-    println!("=== TEST DE RUPTURE DE GÉNÉRATEUR V2.1 (HORS-PTGRS : CA 1D & ALGORITHMIQUE) ===");
-    println!(
-        "{:<24} | {:>7} | {:>7} | {:>5} {:>5} {:>5} {:>5} | {:>7} | {:>6}",
-        "Générateur hors-PTGRS", "φ_réel", "φ_perm", "G", "D", "P", "MIP", "no_ref", "t10/t6"
-    );
-    println!("{}", "-".repeat(92));
+struct TransferFamilyStats {
+    name: &'static str,
+    expect_structure: bool,
+    phi_real: f64,
+    phi_perm: f64,
+    g: f64,
+    d: f64,
+    p: f64,
+    mip: f64,
+    no_ref: f64,
+    retention: f64,
+    passed: bool,
+}
 
-    let families: Vec<(&str, fn(&mut Rng) -> Vec<u8>, bool)> = vec![
+struct TransferSummary {
+    families: Vec<TransferFamilyStats>,
+    passed_count: usize,
+    total_structured: usize,
+    mean_phi_structured: f64,
+    mean_p_structured: f64,
+    mean_mip_structured: f64,
+    chaos_phi: f64,
+}
+
+fn evaluate_transfer(model: &PhisharpModel, seed: u64) -> TransferSummary {
+    let mut rng = Rng::new(seed);
+    let specs: Vec<(&'static str, fn(&mut Rng) -> Vec<u8>, bool)> = vec![
         ("CA 1D Rule 110 (Turing)", |r| gen_elementary_ca(110, r.next_u64(), 180), true),
         ("CA 1D Rule 54 (Gliders)", |r| gen_elementary_ca(54, r.next_u64(), 180), true),
         ("CA 1D Rule 90 (Fractal)", |r| gen_elementary_ca(90, r.next_u64(), 180), true),
@@ -2851,11 +3056,16 @@ fn run_eval_transfer(model: &PhisharpModel, seed: u64) {
         ("Trames protocole/log",    |r| gen_structured_frames(r.next_u64(), 180), true),
     ];
 
-    let mut structured_passed = 0usize;
-    let mut structured_total = 0usize;
+    let mut families = Vec::with_capacity(specs.len());
+    let mut passed_count = 0usize;
+    let mut total_structured = 0usize;
+    let mut sum_phi_s = 0.0_f64;
+    let mut sum_p_s = 0.0_f64;
+    let mut sum_mip_s = 0.0_f64;
+    let mut chaos_phi = 0.0_f64;
     let snaps = [DEFAULT_BUDGET, 10];
 
-    for (name, sampler, expect_structure) in families {
+    for (name, sampler, expect_structure) in specs {
         let trials = 8usize;
         let mut phi_real = 0.0_f64;
         let mut phi_perm = 0.0_f64;
@@ -2899,29 +3109,280 @@ fn run_eval_transfer(model: &PhisharpModel, seed: u64) {
         phi_noref /= n;
         phi_t10 /= n;
 
-        let ret = if phi_real > 1e-6_f64 { phi_t10 / phi_real } else { 0.0_f64 };
-        println!(
-            "{:<24} | {:>7.4} | {:>7.4} | {:>5.3} {:>5.3} {:>5.3} {:>5.3} | {:>7.4} | {:>5.2}x",
-            name, phi_real, phi_perm, g_sum, d_sum, p_sum, mip_sum, phi_noref, ret
-        );
+        let ret = if phi_real > 1e-6_f64 {
+            phi_t10 / phi_real
+        } else {
+            0.0_f64
+        };
+        let passed =
+            expect_structure && phi_real > 0.04_f64 && phi_real > phi_perm + 0.03_f64 && ret >= 0.75_f64;
 
         if expect_structure {
-            structured_total += 1;
-            if phi_real > 0.04_f64 && phi_real > phi_perm + 0.03_f64 && ret >= 0.75_f64 {
-                structured_passed += 1;
+            total_structured += 1;
+            sum_phi_s += phi_real;
+            sum_p_s += p_sum;
+            sum_mip_s += mip_sum;
+            if passed {
+                passed_count += 1;
             }
+        } else {
+            chaos_phi = phi_real;
         }
+
+        families.push(TransferFamilyStats {
+            name,
+            expect_structure,
+            phi_real,
+            phi_perm,
+            g: g_sum,
+            d: d_sum,
+            p: p_sum,
+            mip: mip_sum,
+            no_ref: phi_noref,
+            retention: ret,
+            passed,
+        });
     }
 
+    let denom = total_structured.max(1) as f64;
+    TransferSummary {
+        families,
+        passed_count,
+        total_structured,
+        mean_phi_structured: sum_phi_s / denom,
+        mean_p_structured: sum_p_s / denom,
+        mean_mip_structured: sum_mip_s / denom,
+        chaos_phi,
+    }
+}
+
+fn run_eval_transfer(model: &PhisharpModel, seed: u64) {
+    let tr = evaluate_transfer(model, seed);
+    println!("=== TEST DE RUPTURE DE GÉNÉRATEUR V2.1 (HORS-PTGRS : CA 1D & ALGORITHMIQUE) ===");
+    println!(
+        "{:<24} | {:>7} | {:>7} | {:>5} {:>5} {:>5} {:>5} | {:>7} | {:>6}",
+        "Générateur hors-PTGRS", "φ_réel", "φ_perm", "G", "D", "P", "MIP", "no_ref", "t10/t6"
+    );
+    println!("{}", "-".repeat(92));
+    for f in &tr.families {
+        println!(
+            "{:<24} | {:>7.4} | {:>7.4} | {:>5.3} {:>5.3} {:>5.3} {:>5.3} | {:>7.4} | {:>5.2}x",
+            f.name, f.phi_real, f.phi_perm, f.g, f.d, f.p, f.mip, f.no_ref, f.retention
+        );
+    }
     println!("{}", "-".repeat(92));
     println!(
         "VERDICT RUPTURE DE GÉNÉRATEUR : {}/{} familles structurées hors-PTGRS transférées (Rule 30 = témoin chaotique).",
-        structured_passed, structured_total
+        tr.passed_count, tr.total_structured
     );
 }
 
 // ============================================================================
-// 10. Interface CLI stricte (`ask --model out/sharp_v21.phis --file perceived.eff`)
+// 10. Mode d'évaluation comparative (Step 0 vs LL vs MDL vs φ_sharp)
+// ============================================================================
+
+fn run_compare(
+    models: &[(&str, &PhisharpModel)],
+    seed_cal: u64,
+    seed_ood: u64,
+    seed_tr: u64,
+) {
+    let mut cals = Vec::with_capacity(models.len());
+    let mut oods = Vec::with_capacity(models.len());
+    let mut trs = Vec::with_capacity(models.len());
+
+    for (_, m) in models {
+        cals.push(evaluate_calibration(m, seed_cal));
+        oods.push(evaluate_ood(m, seed_ood));
+        trs.push(evaluate_transfer(m, seed_tr));
+    }
+
+    println!();
+    println!("==========================================================================================");
+    println!("=== COMPARAISON CONTRÔLÉE V2.1 : Step 0 vs Vraisemblance (LL) vs MDL vs φ_sharp        ===");
+    println!("=== (Architecture identique, PTGRS générique identique, seeds éval {}/{}/{})   ===", seed_cal, seed_ood, seed_tr);
+    println!("==========================================================================================");
+
+    // --- TABLEAU 1 : ÉTALONNAGE ---
+    println!();
+    println!("[1/3] PORTE D'ÉTALONNAGE (PTGRS générique, C connue après coup, seed={})", seed_cal);
+    println!(
+        "{:<16} | {:>8} | {:>9} | {:>7} {:>7} | {:>7} | {:>7} | {:>7} | {:>6}",
+        "Modèle", "φ_moy", "Rec_exc(C)", "Pear(φ)", "Spear(φ)", "E_perm", "Epiph", "Δφ_bij", "Verdict"
+    );
+    println!("{}", "-".repeat(94));
+    for (i, (label, _)) in models.iter().enumerate() {
+        let c = &cals[i];
+        let epiph_max = c.phi_l1_dead.max(c.phi_l1_clone).max(c.phi_l2_clone);
+        let verdict = if c.pass_corr && c.pass_neg && c.pass_inv {
+            "PASS"
+        } else {
+            "ARRÊT"
+        };
+        println!(
+            "{:<16} | {:>8.4} | {:>+9.4} | {:>+7.4} {:>+7.4} | {:>7.4} | {:>7.4} | {:>7.1e} | {:>6}",
+            label, c.mean_phi, c.mean_eq, c.r_phi, c.s_phi, c.perm_max, epiph_max, c.max_phi_diff, verdict
+        );
+    }
+
+    // --- TABLEAU 2 : BARREAU 1 (OOD) ---
+    println!();
+    println!("[2/3] BARREAU 1 : PTGRS HORS-DISTRIBUTION (d=2, 4, 8, seed={})", seed_ood);
+    println!(
+        "{:<16} | {:>4} | {:>7} {:>7} {:>6} | {:>7} | {:>5} {:>5} {:>5} | {:>9} {:>9}",
+        "Modèle", "Prof", "φ(t=6)", "φ(t=10)", "t10/t6", "no_ref", "G(t6)", "P(t6)", "MIP6", "Rec(C)t6", "Rec(C)t10"
+    );
+    println!("{}", "-".repeat(100));
+    for depth_idx in 0..3 {
+        for (i, (label, _)) in models.iter().enumerate() {
+            let d = &oods[i].depths[depth_idx];
+            let ret = if d.curves[DEFAULT_BUDGET] > 1e-6_f64 {
+                d.curves[10] / d.curves[DEFAULT_BUDGET]
+            } else {
+                0.0_f64
+            };
+            println!(
+                "{:<16} | d={:<2} | {:>7.4} {:>7.4} {:>5.2}x | {:>7.4} | {:>5.3} {:>5.3} {:>5.3} | {:>+9.4} {:>+9.4}",
+                label,
+                d.depth,
+                d.curves[DEFAULT_BUDGET],
+                d.curves[10],
+                ret,
+                d.no_ref_t6,
+                d.g_t6,
+                d.p_t6,
+                d.mip_t6,
+                d.rec_exc_t6,
+                d.rec_exc_t10
+            );
+        }
+        println!("{}", "-".repeat(100));
+    }
+
+    println!("  Résidu OOD (Δφ_sharp moyen, d=4) :");
+    for (i, (label, _)) in models.iter().enumerate() {
+        let o = &oods[i];
+        println!(
+            "    {:<16} : vrai={:+.4} | étranger C'={:+.4} | écho={:+.4}",
+            label, o.gain_true, o.gain_foreign, o.gain_echo
+        );
+    }
+
+    // --- TABLEAU 3 : RUPTURE DE GÉNÉRATEUR (HORS-PTGRS) ---
+    println!();
+    println!("[3/3] RUPTURE DE GÉNÉRATEUR HORS-PTGRS (φ_réel / P_réel à t=6, seed={})", seed_tr);
+    print!("{:<24}", "Générateur hors-PTGRS");
+    for (label, _) in models {
+        print!(" | {:>15}", label);
+    }
+    println!();
+    print!("{:<24}", "");
+    for _ in models {
+        print!(" | {:>7} {:>7}", "φ_réel", "P_réel");
+    }
+    println!();
+    println!("{}", "-".repeat(24 + models.len() * 18));
+
+    let n_fam = trs[0].families.len();
+    for f_idx in 0..n_fam {
+        let fname = trs[0].families[f_idx].name;
+        print!("{:<24}", fname);
+        for tr in &trs {
+            let f = &tr.families[f_idx];
+            print!(" | {:>7.4} {:>7.3}", f.phi_real, f.p);
+        }
+        println!();
+    }
+    println!("{}", "-".repeat(24 + models.len() * 18));
+    print!("{:<24}", "Moy 7 structurées");
+    for tr in &trs {
+        print!(" | {:>7.4} {:>7.3}", tr.mean_phi_structured, tr.mean_p_structured);
+    }
+    println!();
+    print!("{:<24}", "MIP moy (7 struct.)");
+    for tr in &trs {
+        print!(" | {:>15.3}", tr.mean_mip_structured);
+    }
+    println!();
+    print!("{:<24}", "Rule 30 (chaos, cible=0)");
+    for tr in &trs {
+        print!(" | {:>15.4}", tr.chaos_phi);
+    }
+    println!();
+    print!("{:<24}", "Familles transférées /7");
+    for tr in &trs {
+        let s = format!("{}/{}", tr.passed_count, tr.total_structured);
+        print!(" | {:>15}", s);
+    }
+    println!();
+
+    // --- LECTURE SCEPTIQUE AUTOMATIQUE (si les 4 modèles standards sont présents) ---
+    if models.len() == 4 {
+        let ood_rec_mean = |idx: usize| -> f64 {
+            oods[idx].depths.iter().map(|d| d.rec_exc_t6).sum::<f64>() / 3.0_f64
+        };
+        let ood_phi_mean = |idx: usize| -> f64 {
+            oods[idx]
+                .depths
+                .iter()
+                .map(|d| d.curves[DEFAULT_BUDGET])
+                .sum::<f64>()
+                / 3.0_f64
+        };
+
+        let rec0 = ood_rec_mean(0);
+        let rec_ll = ood_rec_mean(1);
+        let rec_mdl = ood_rec_mean(2);
+        let rec_phi = ood_rec_mean(3);
+
+        let phi0 = ood_phi_mean(0);
+        let phi_ll = ood_phi_mean(1);
+        let phi_mdl = ood_phi_mean(2);
+        let phi_phi = ood_phi_mean(3);
+
+        println!();
+        println!("--- SYNTHÈSE CONTRÔLE SCEPTIQUE ---");
+        println!(
+            "  OOD Rec_exc(C) moy (externe) : Step0={:+.4} | LL={:+.4} | MDL={:+.4} | φ_sharp={:+.4}",
+            rec0, rec_ll, rec_mdl, rec_phi
+        );
+        println!(
+            "  OOD φ_sharp moy (t=6)        : Step0={:.4}  | LL={:.4}  | MDL={:.4}  | φ_sharp={:.4}",
+            phi0, phi_ll, phi_mdl, phi_phi
+        );
+        println!(
+            "  Transfert P_réel moy (7x)    : Step0={:.3}   | LL={:.3}   | MDL={:.3}   | φ_sharp={:.3}",
+            trs[0].mean_p_structured,
+            trs[1].mean_p_structured,
+            trs[2].mean_p_structured,
+            trs[3].mean_p_structured
+        );
+        println!(
+            "  Transfert φ_réel moy (7x)    : Step0={:.4}  | LL={:.4}  | MDL={:.4}  | φ_sharp={:.4}",
+            trs[0].mean_phi_structured,
+            trs[1].mean_phi_structured,
+            trs[2].mean_phi_structured,
+            trs[3].mean_phi_structured
+        );
+
+        let beats_step0_external =
+            rec_phi > rec0 + 0.005_f64 || trs[3].mean_p_structured > trs[0].mean_p_structured + 0.02_f64;
+        let beats_step0_phi =
+            trs[3].mean_phi_structured > trs[0].mean_phi_structured + 0.02_f64;
+        let beats_baselines_external = rec_phi > rec_ll.max(rec_mdl) + 0.002_f64
+            && trs[3].mean_p_structured >= trs[1].mean_p_structured.max(trs[2].mean_p_structured);
+        let beats_baselines_phi =
+            trs[3].mean_phi_structured > trs[1].mean_phi_structured.max(trs[2].mean_phi_structured) + 0.01_f64;
+
+        println!(
+            "  Lecture : gain_vs_Step0(externe={}, φ={}) | gain_vs_LL/MDL(externe={}, φ={})",
+            beats_step0_external, beats_step0_phi, beats_baselines_external, beats_baselines_phi
+        );
+    }
+}
+
+// ============================================================================
+// 11. Interface CLI stricte
 // ============================================================================
 
 fn get_arg(args: &[String], flag: &str) -> Option<String> {
@@ -2932,57 +3393,117 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         eprintln!("Usage:");
-        eprintln!("  phisharp train         --out out/sharp_v21.phis [--steps 300] [--seed 42]");
-        eprintln!("  phisharp calibrate     --model out/sharp_v21.phis [--seed 101]");
-        eprintln!("  phisharp eval-ood      --model out/sharp_v21.phis [--seed 202]");
-        eprintln!("  phisharp eval-transfer --model out/sharp_v21.phis [--seed 303]");
-        eprintln!("  phisharp ask           --model out/sharp_v21.phis --file perceived.eff");
+        eprintln!("  phisharp train         --out out/sharp.phis [--objective phi|ll|mdl|untrained] [--steps 300] [--seed 42]");
+        eprintln!("  phisharp calibrate     --model out/sharp.phis [--seed 101]");
+        eprintln!("  phisharp eval-ood      --model out/sharp.phis [--seed 202]");
+        eprintln!("  phisharp eval-transfer --model out/sharp.phis [--seed 303]");
+        eprintln!("  phisharp compare       --untrained out/step0.phis --ll out/ll.phis --mdl out/mdl.phis --phi out/sharp.phis");
+        eprintln!("  phisharp compare-all   [--dir out] [--steps 300] [--seed 42]");
+        eprintln!("  phisharp ask           --model out/sharp.phis --file perceived.eff");
         std::process::exit(1);
     }
 
     match args[1].as_str() {
         "train" => {
-            let out =
-                get_arg(&args, "--out").unwrap_or_else(|| "out/sharp_v21.phis".to_string());
+            let out = get_arg(&args, "--out").unwrap_or_else(|| "out/sharp.phis".to_string());
+            let obj_str = get_arg(&args, "--objective").unwrap_or_else(|| "phi".to_string());
+            let objective = TrainObjective::from_str(&obj_str)
+                .expect("--objective invalide (attendu: phi, ll, mdl, untrained)");
             let steps: usize = get_arg(&args, "--steps")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(300);
             let seed: u64 = get_arg(&args, "--seed")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(42);
-            train_closed(Path::new(&out), steps, seed);
+            train_model(Path::new(&out), steps, seed, objective);
         }
         "calibrate" => {
             let model_path =
-                get_arg(&args, "--model").unwrap_or_else(|| "out/sharp_v21.phis".to_string());
+                get_arg(&args, "--model").unwrap_or_else(|| "out/sharp.phis".to_string());
             let seed: u64 = get_arg(&args, "--seed")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(101);
-            let model = PhisharpModel::load(Path::new(&model_path)).expect("Chargement modèle V2.1");
+            let model = PhisharpModel::load(Path::new(&model_path)).expect("Chargement modèle");
             run_calibration(&model, seed);
         }
         "eval-ood" => {
             let model_path =
-                get_arg(&args, "--model").unwrap_or_else(|| "out/sharp_v21.phis".to_string());
+                get_arg(&args, "--model").unwrap_or_else(|| "out/sharp.phis".to_string());
             let seed: u64 = get_arg(&args, "--seed")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(202);
-            let model = PhisharpModel::load(Path::new(&model_path)).expect("Chargement modèle V2.1");
+            let model = PhisharpModel::load(Path::new(&model_path)).expect("Chargement modèle");
             run_eval_ood(&model, seed);
         }
         "eval-transfer" => {
             let model_path =
-                get_arg(&args, "--model").unwrap_or_else(|| "out/sharp_v21.phis".to_string());
+                get_arg(&args, "--model").unwrap_or_else(|| "out/sharp.phis".to_string());
             let seed: u64 = get_arg(&args, "--seed")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(303);
-            let model = PhisharpModel::load(Path::new(&model_path)).expect("Chargement modèle V2.1");
+            let model = PhisharpModel::load(Path::new(&model_path)).expect("Chargement modèle");
             run_eval_transfer(&model, seed);
+        }
+        "compare" => {
+            let p0 = get_arg(&args, "--untrained").expect("--untrained requis");
+            let p_ll = get_arg(&args, "--ll").expect("--ll requis");
+            let p_mdl = get_arg(&args, "--mdl").expect("--mdl requis");
+            let p_phi = get_arg(&args, "--phi").expect("--phi requis");
+
+            let seed_cal: u64 = get_arg(&args, "--seed-cal")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(101);
+            let seed_ood: u64 = get_arg(&args, "--seed-ood")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(202);
+            let seed_tr: u64 = get_arg(&args, "--seed-transfer")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(303);
+
+            let m0 = PhisharpModel::load(Path::new(&p0)).expect("Chargement --untrained");
+            let m_ll = PhisharpModel::load(Path::new(&p_ll)).expect("Chargement --ll");
+            let m_mdl = PhisharpModel::load(Path::new(&p_mdl)).expect("Chargement --mdl");
+            let m_phi = PhisharpModel::load(Path::new(&p_phi)).expect("Chargement --phi");
+
+            let list = [
+                ("Step0 (rand)", &m0),
+                ("Baseline LL", &m_ll),
+                ("Baseline MDL", &m_mdl),
+                ("Phisharp φ", &m_phi),
+            ];
+            run_compare(&list, seed_cal, seed_ood, seed_tr);
+        }
+        "compare-all" => {
+            let dir = get_arg(&args, "--dir").unwrap_or_else(|| "out".to_string());
+            let steps: usize = get_arg(&args, "--steps")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(300);
+            let seed: u64 = get_arg(&args, "--seed")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(42);
+
+            let p0 = Path::new(&dir).join("sharp_step0.phis");
+            let p_ll = Path::new(&dir).join("sharp_ll.phis");
+            let p_mdl = Path::new(&dir).join("sharp_mdl.phis");
+            let p_phi = Path::new(&dir).join("sharp_phi.phis");
+
+            let m0 = train_model(&p0, 0, seed, TrainObjective::Untrained);
+            let m_ll = train_model(&p_ll, steps, seed, TrainObjective::Likelihood);
+            let m_mdl = train_model(&p_mdl, steps, seed, TrainObjective::Mdl);
+            let m_phi = train_model(&p_phi, steps, seed, TrainObjective::PhiSharp);
+
+            let list = [
+                ("Step0 (rand)", &m0),
+                ("Baseline LL", &m_ll),
+                ("Baseline MDL", &m_mdl),
+                ("Phisharp φ", &m_phi),
+            ];
+            run_compare(&list, 101, 202, 303);
         }
         "ask" => {
             let model_path = get_arg(&args, "--model").expect("--model requis");
             let file_path = get_arg(&args, "--file").expect("--file requis");
-            let model = PhisharpModel::load(Path::new(&model_path)).expect("Chargement modèle V2.1");
+            let model = PhisharpModel::load(Path::new(&model_path)).expect("Chargement modèle");
             let raw = fs::read(&file_path).expect("Lecture perceived.eff");
             let view = RelationalView::from_bytes(&raw);
             let out_bytes = model.ask_emit(&view, DEFAULT_BUDGET + 2, 48);
