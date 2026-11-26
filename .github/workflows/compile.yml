@@ -36,11 +36,8 @@ carg
           cargo run --release -- ask --model out/sharp.phis --file out/defs_fr.eff
           cp out/defs_fr.eff out/defs_hop3.eff
           printf 'vwxwmvwxwqvwxwtvwxwavwxwbvwxw' >> out/defs_hop3.eff
-# (si defs_fr.eff finissait par \n, recolle sur la dernière ligne)
           tr -d '\n' < /dev/null >/dev/null && python3 -c "s=open('out/defs_fr.eff').read().rstrip('\n')+'vwxwmvwxwqvwxwtvwxwavwxwbvwxw\n'; open('out/defs_hop3.eff','w').write(s)"
           cargo run --release -- ask --model out/sharp.phis --file out/defs_hop3.eff
-
-
           #cargo run --release -- sample --out out/mh_flat.eff --family multihop_flat --seed 23 > out/eval.txt 2>&1
           #tr -d '\n' < molds.eff > out/molds_flat.eff
           cargo run --release -- ask --model out/sharp.phis --file out/defs_fr.eff > out/ask.txt 2>&1
