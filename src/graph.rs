@@ -14,7 +14,7 @@ pub const EDGE_IN: usize = 12;
 pub const EDGE_HID: usize = 4;
 pub const NODE_IN: usize = EDGE_HID * 2 + 2;
 
-pub const GATE_IN: usize = EDGE_HID * 2 + 2; // loc_max(4) + cur_max(4) + loc_deg(1) + loc_has(1)
+pub const GATE_IN: usize = EDGE_HID * 2 + 2;
 pub const GATE_HID: usize = 4;
 
 const OFF_REL_EDGE_W: usize = 0; // 48
@@ -42,12 +42,12 @@ const MAGIC: &[u8; 4] = b"PHIS";
 const VERSION: u32 = 5;
 
 /// Substrat relationnel brut extrait de la matrice d'auto-égalité M(a,b) = [a!=b & E[a]==E[b]].
-/// Aucune règle de découpe (`\n`, `:`, etc.) ni feature sémantique n'est codée en dur.
 #[derive(Clone, Debug)]
 pub struct RawSubstrate {
     pub len: usize,
     pub offsets: Vec<usize>,
     pub edges: Vec<[f32; EDGE_IN]>,
+    pub edge_targets: Vec<u32>,
     pub deg: Vec<f32>,
 }
 
@@ -58,7 +58,6 @@ impl RawSubstrate {
         let max_edges = 12usize;
         let log_cap = (n.min(win_cap).max(2) as f32).ln();
 
-        // Exclut le self-swap trivial (j, t) pour qu'une lettre double isolée ne simule pas un miroir.
         let m_nb = |a: isize, b: isize, ti: isize, ji: isize| -> f32 {
             if a >= 0 && b >= 0 && a != b && !(a == ji && b == ti) {
                 let au = a as usize;
@@ -72,6 +71,7 @@ impl RawSubstrate {
 
         let mut offsets = Vec::with_capacity(n + 1);
         let mut edges = Vec::with_capacity(n * 6);
+        let mut edge_targets = Vec::with_capacity(n * 6);
         let mut deg = Vec::with_capacity(n);
         let mut candidates: Vec<(usize, usize, f32)> = Vec::with_capacity(32);
 
@@ -143,6 +143,7 @@ impl RawSubstrate {
                     log_dist,
                     dir,
                 ]);
+                edge_targets.push(j as u32);
             }
             offsets.push(edges.len());
         }
@@ -151,6 +152,7 @@ impl RawSubstrate {
             len: n,
             offsets,
             edges,
+            edge_targets,
             deg,
         }
     }
@@ -183,12 +185,12 @@ impl PhiGraph {
         Self { weights }
     }
 
-    /// Capteur relationnel 100% appris + porte causale neuronale `g(t) ∈ (0, 1)`.
-    pub fn encode_with_gate(&self, sub: &RawSubstrate) -> (Vec<[f32; REL_DIM]>, Vec<f32>) {
+    /// Capteur relationnel 100% appris + porte causale neuronale contextuelle (`±2`) et ponctuelle.
+    pub fn encode_with_gate(&self, sub: &RawSubstrate) -> (Vec<[f32; REL_DIM]>, Vec<f32>, Vec<f32>) {
         let w = &self.weights;
         let n = sub.len;
         if n == 0 {
-            return (Vec::new(), Vec::new());
+            return (Vec::new(), Vec::new(), Vec::new());
         }
 
         let mut pre = Vec::with_capacity(n);
@@ -263,11 +265,25 @@ impl PhiGraph {
             }
         }
 
-        // Porte causale apprise sur voisinage ±3 : distingue corps causal soutenu vs bord passif/bruit
-        let mut gates = Vec::with_capacity(n);
+        let eval_gate = |g_in: &[f32; GATE_IN]| -> f32 {
+            let mut logit = w[OFF_GATE_B2];
+            for h in 0..GATE_HID {
+                let base = OFF_GATE_W1 + h * GATE_IN;
+                let mut acc = w[OFF_GATE_B1 + h];
+                for k in 0..GATE_IN {
+                    acc += w[base + k] * g_in[k];
+                }
+                logit += w[OFF_GATE_W2 + h] * acc.tanh();
+            }
+            1.0 / (1.0 + (-logit.clamp(-12.0, 12.0)).exp())
+        };
+
+        // Porte contextuelle (±2) pour détecter les îlots + porte ponctuelle pour caler les bords
+        let mut gates_ctx = Vec::with_capacity(n);
+        let mut gates_pt = Vec::with_capacity(n);
         for t in 0..n {
-            let lo = t.saturating_sub(3);
-            let hi = (t + 3).min(n - 1);
+            let lo = t.saturating_sub(2);
+            let hi = (t + 2).min(n - 1);
             let inv_w = 1.0 / ((hi - lo + 1) as f32);
 
             let mut loc_max = [0.0f32; EDGE_HID];
@@ -281,7 +297,7 @@ impl PhiGraph {
                 loc_has += has_all[j] * inv_w;
             }
 
-            let g_in = [
+            let g_in_ctx = [
                 loc_max[0],
                 loc_max[1],
                 loc_max[2],
@@ -293,21 +309,23 @@ impl PhiGraph {
                 loc_deg,
                 loc_has,
             ];
-
-            let mut logit = w[OFF_GATE_B2];
-            for h in 0..GATE_HID {
-                let base = OFF_GATE_W1 + h * GATE_IN;
-                let mut acc = w[OFF_GATE_B1 + h];
-                for k in 0..GATE_IN {
-                    acc += w[base + k] * g_in[k];
-                }
-                logit += w[OFF_GATE_W2 + h] * acc.tanh();
-            }
-            let gate = 1.0 / (1.0 + (-logit.clamp(-12.0, 12.0)).exp());
-            gates.push(gate);
+            let g_in_pt = [
+                e_max_all[t][0],
+                e_max_all[t][1],
+                e_max_all[t][2],
+                e_max_all[t][3],
+                e_max_all[t][0],
+                e_max_all[t][1],
+                e_max_all[t][2],
+                e_max_all[t][3],
+                sub.deg[t],
+                has_all[t],
+            ];
+            gates_ctx.push(eval_gate(&g_in_ctx));
+            gates_pt.push(eval_gate(&g_in_pt));
         }
 
-        (pre, gates)
+        (pre, gates_ctx, gates_pt)
     }
 
     pub fn encode_relations(&self, sub: &RawSubstrate) -> Vec<[f32; REL_DIM]> {
@@ -507,7 +525,7 @@ impl PhiGraph {
         if version != VERSION || count != NUM_PARAMS || data.len() != 12 + count * 4 {
             return Err(io::Error::new(
                 ErrorKind::InvalidData,
-                "Version ou taille du modèle .phis incompatible (ré-entraîne avec v0.5)",
+                "Version ou taille du modèle .phis incompatible (ré-entraîne avec v0.5.1)",
             ));
         }
         let mut weights = Vec::with_capacity(count);
