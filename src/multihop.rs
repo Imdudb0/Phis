@@ -416,20 +416,35 @@ struct KeyHit {
     entry_idx: usize,
 }
 
-/// Nettoie automatiquement les affixes boilerplate partagés entre en-têtes de définitions
-/// (ex: `" = "`, `": "`, `" -> "`, `" | "`, `"; "`) sans aucun séparateur codé en dur.
+/// Nettoie les affixes boilerplate purement non-alphanumériques (`=`, `:`, `->`, `|`, `;`, espaces)
+/// sans jamais rogner une lettre/chiffre d'un identifiant de concept.
 fn strip_common_head_affixes(raw_heads: &[&[u8]]) -> Vec<Vec<u8>> {
-    let mut cleaned: Vec<Vec<u8>> = raw_heads.iter().map(|h| trim_edge_ws(h).to_vec()).collect();
-    if cleaned.len() < 2 {
+    let mut cleaned: Vec<Vec<u8>> = raw_heads
+        .iter()
+        .map(|h| {
+            let slice = match h.iter().rposition(|&b| b == b'\n') {
+                Some(nl) if trim_edge_ws(&h[nl + 1..]).len() >= 2 => &h[nl + 1..],
+                _ => *h,
+            };
+            trim_edge_ws(slice).to_vec()
+        })
+        .collect();
+
+    if cleaned.len() == 1 {
+        let h = &mut cleaned[0];
+        while h.len() > 2 && !is_word_byte(*h.last().unwrap()) {
+            h.pop();
+        }
+        *h = trim_edge_ws(h).to_vec();
         return cleaned;
     }
 
-    // 1. Suffixe commun à tous les en-têtes non vides (ex: `" ="`, `":"`, `" ->"`)
+    // 1. Suffixe boilerplate commun non-alphanumérique (ex: `" ="`, `":"`, `" ->"`)
     let min_len = cleaned.iter().map(|h| h.len()).min().unwrap_or(0);
     let mut suf = 0usize;
     while suf + 2 < min_len {
         let b = cleaned[0][cleaned[0].len() - 1 - suf];
-        if cleaned.iter().all(|h| h[h.len() - 1 - suf] == b) {
+        if !is_word_byte(b) && cleaned.iter().all(|h| h[h.len() - 1 - suf] == b) {
             suf += 1;
         } else {
             break;
@@ -443,28 +458,35 @@ fn strip_common_head_affixes(raw_heads: &[&[u8]]) -> Vec<Vec<u8>> {
         }
     }
 
-    // 2. Préfixe commun aux en-têtes 1..k (ex: `"| "`, `"; "`), étendu à 0 s'il le partage aussi
+    // 2. Préfixe séparateur commun aux en-têtes 1..k (ex: `"| "`, `"; "`), non-alphanumérique uniquement
     let tail_min = cleaned[1..].iter().map(|h| h.len()).min().unwrap_or(0);
     let mut pre = 0usize;
     while pre + 2 < tail_min {
         let b = cleaned[1][pre];
-        if cleaned[1..].iter().all(|h| h[pre] == b) {
+        if !is_word_byte(b) && cleaned[1..].iter().all(|h| h[pre] == b) {
             pre += 1;
         } else {
             break;
         }
     }
     if pre > 0 {
-        let prefix = cleaned[1][0..pre].to_vec();
-        if cleaned[0].len() > pre + 1 && cleaned[0].starts_with(&prefix) {
-            cleaned[0] = trim_edge_ws(&cleaned[0][pre..]).to_vec();
+        let sep_pre = cleaned[1][0..pre].to_vec();
+        // Si cleaned[0] contient ce séparateur en flux plat (après une queue résiduelle), coupe après
+        if let Some(pos) = cleaned[0]
+            .windows(sep_pre.len())
+            .rposition(|w| w == sep_pre.as_slice())
+        {
+            let tail = trim_edge_ws(&cleaned[0][pos + sep_pre.len()..]);
+            if tail.len() >= 2 {
+                cleaned[0] = tail.to_vec();
+            }
         }
         for h in &mut cleaned[1..] {
             *h = trim_edge_ws(&h[pre..]).to_vec();
         }
     }
 
-    // 3. Préfixe résiduel non-alphanumérique commun à tous (ex: `"- "`)
+    // 3. Préfixe résiduel non-alphanumérique commun à tous (ex: `"- "`, `"| "`)
     let all_min = cleaned.iter().map(|h| h.len()).min().unwrap_or(0);
     let mut ap = 0usize;
     while ap + 2 < all_min {
