@@ -13,4 +13,38 @@
 [1m[33mwarning[0m: `phisharp` (bin "phisharp") generated 1 warning
 [1m[92m    Finished[0m `release` profile [optimized] target(s) in 0.01s
 [1m[92m     Running[0m `target/release/phisharp ask --model out/sharp.phis --file out/defs_fr.eff`
-Erreur lecture effet 'out/defs_fr.eff': No such file or directory (os error 2)
+=== PHISHARP ABDUCTION REPORT (v0.6 — Flux Continu Auto-Segmenté) ===
+Effet (E)       : 'out/defs_fr.eff' (373 octets, 5 moules + 2 cause(s) cible, 0 déf. composées, 0 méta-bloc(s) démote)
+Cohérence scène : sélectivité=0.5328 (R_top=0.857 vs R_rest=0.378, paire [1]<->[6])
+Résidu cible    : décomposition multi-causes validée (res 0.4603 -> 0.1546, cos inter-causes=-0.499)
+
+Cause cible #1 (octets 328..355) | φ=+0.5202 [Gen=0.587 Disc=0.531 Proj=0.867 IIT=0.062 res=0.2424] :
+  "u.pqrsrqpqrsrqpqrsrqpqrsrqp"
+    Hop-1 #1 moule [0] (sans clé) | résonance=0.6790 | err=0.3302 | cos=+0.907 | octets_communs=30%
+       noyau : "miroir: ABCDCBAABCDCBAABCDCBAABCDCBA"
+    Hop-1 #2 moule [2] (sans clé) | résonance=0.6615 | err=0.3161 | cos=+0.754 | octets_communs=0%
+       noyau : ": QBDB;QBDB=QBDB0QBDB4QBDBFQBDB"
+    Hop-1 #3 moule [3] (sans clé) | résonance=0.5137 | err=0.3678 | cos=+0.185 | octets_communs=52%
+       noyau : ".trame: alpha_1 be"
+    Hop-1 #4 moule [4] (clé="a a") | résonance=0.2069 | err=0.6683 | cos=-0.628 | octets_communs=19%
+       noyau : "lpha_2 bet"
+       réf.  : "ta a"
+    Hop-1 #5 moule [1] (sans clé) | résonance=0.0958 | err=0.9921 | cos=-0.837 | octets_communs=7%
+       noyau : ".cycle: XYZXYZXYZXYZXYZXYZXYZXYZXYZ.noyau"
+
+Cause cible #2 (octets 355..373) | φ=+0.9374 [Gen=0.951 Disc=0.957 Proj=0.906 IIT=0.615 res=0.0229] :
+  "jkljkljkljkljkljkl"
+    Hop-1 #1 moule [1] (sans clé) | résonance=0.8602 | err=0.0712 | cos=+0.731 | octets_communs=33%
+       noyau : ".cycle: XYZXYZXYZXYZXYZXYZXYZXYZXYZ.noyau"
+    Hop-1 #2 moule [4] (clé="a a") | résonance=0.7882 | err=0.1183 | cos=+0.612 | octets_communs=33%
+       noyau : "lpha_2 bet"
+       réf.  : "ta a"
+    Hop-1 #3 moule [3] (sans clé) | résonance=0.2841 | err=0.5334 | cos=-0.478 | octets_communs=33%
+       noyau : ".trame: alpha_1 be"
+    Hop-1 #4 moule [2] (sans clé) | résonance=0.2698 | err=0.6619 | cos=-0.375 | octets_communs=0%
+       noyau : ": QBDB;QBDB=QBDB0QBDB4QBDBFQBDB"
+    Hop-1 #5 moule [0] (sans clé) | résonance=0.1439 | err=1.0461 | cos=-0.587 | octets_communs=0%
+       noyau : "miroir: ABCDCBAABCDCBAABCDCBAABCDCBA"
+
+Explication projetée (Hop-1, alphabet de E, marge=+0.0176) :
+  miroir: ABCDCBAABCDCBAABCDCBAABCDCBA
