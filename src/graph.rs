@@ -17,17 +17,18 @@ pub const NODE_IN: usize = EDGE_HID * 2 + 2;
 pub const GATE_IN: usize = EDGE_HID * 2 + 2;
 pub const GATE_HID: usize = 4;
 
-// --- Mémoire de Travail Positionnelle (Hop-2 / Hop-3 100% connexionniste) ---
-pub const WM_DIM: usize = 12;
+// --- Mémoire de Travail Positionnelle (directement dans l'espace orthogonal 24D de H) ---
+pub const WM_DIM: usize = STATE_DIM; // 24
 pub const WM_STEPS: usize = 4;
 const ECHO_IN: usize = 7;
 const ECHO_HID: usize = 6;
 const SCAN_IN: usize = 7;
-const SCAN_CTRL: usize = 4;
-const SCAN_BLOCK: usize = SCAN_CTRL * SCAN_IN + SCAN_CTRL * SCAN_CTRL + SCAN_CTRL + 3 * SCAN_CTRL + 3; // 63
+const SCAN_CTRL: usize = 5;
+const SCAN_BLOCK: usize =
+    SCAN_CTRL * SCAN_IN + SCAN_CTRL * SCAN_CTRL + SCAN_CTRL + 3 * SCAN_CTRL + 3; // 83
 const WM_UPD_IN: usize = 5;
 const WM_UPD_HID: usize = 4;
-const READ_IN: usize = 6;
+const READ_IN: usize = 7;
 const READ_HID: usize = 6;
 
 // --- Paramètres Hop-1 (0..1541) ---
@@ -51,29 +52,26 @@ const OFF_CTX: usize = OFF_BH + DIM * (2 * DIM); // 1461, len 32
 const OFF_U: usize = OFF_CTX + DIM * REL_DIM; // 1493, len 16
 const OFF_OUT: usize = OFF_U + DIM * DIM; // 1509, len 32
 
-// --- Paramètres Mémoire de Travail (1541..2136, +595 params) ---
+// --- Paramètres Mémoire de Travail (1541..1846, +305 params seulement) ---
 pub const WM_PARAM_START: usize = OFF_OUT + REL_DIM * DIM; // 1541
-const OFF_WM_INIT_W: usize = WM_PARAM_START; // 1541, len 288 (12 x 24)
-const OFF_WM_INIT_B: usize = OFF_WM_INIT_W + WM_DIM * STATE_DIM; // 1829, len 12
-const OFF_ECHO_W1: usize = OFF_WM_INIT_B + WM_DIM; // 1841, len 42
-const OFF_ECHO_B1: usize = OFF_ECHO_W1 + ECHO_HID * ECHO_IN; // 1883, len 6
-const OFF_ECHO_W2: usize = OFF_ECHO_B1 + ECHO_HID; // 1889, len 6
-const OFF_ECHO_B2: usize = OFF_ECHO_W2 + ECHO_HID; // 1895, len 1
-const OFF_SCAN_BWD: usize = OFF_ECHO_B2 + 1; // 1896, len 63
-const OFF_SCAN_FWD: usize = OFF_SCAN_BWD + SCAN_BLOCK; // 1959, len 63
-const OFF_WM_GAINS: usize = OFF_SCAN_FWD + SCAN_BLOCK; // 2022, len 36 (3 x 12)
-const OFF_WM_UPD_W1: usize = OFF_WM_GAINS + 3 * WM_DIM; // 2058, len 20
-const OFF_WM_UPD_B1: usize = OFF_WM_UPD_W1 + WM_UPD_HID * WM_UPD_IN; // 2078, len 4
-const OFF_WM_UPD_W2: usize = OFF_WM_UPD_B1 + WM_UPD_HID; // 2082, len 4
-const OFF_WM_UPD_B2: usize = OFF_WM_UPD_W2 + WM_UPD_HID; // 2086, len 1
-const OFF_READ_W1: usize = OFF_WM_UPD_B2 + 1; // 2087, len 36
-const OFF_READ_B1: usize = OFF_READ_W1 + READ_HID * READ_IN; // 2123, len 6
-const OFF_READ_W2: usize = OFF_READ_B1 + READ_HID; // 2129, len 6
-const OFF_READ_B2: usize = OFF_READ_W2 + READ_HID; // 2135, len 1
-pub const NUM_PARAMS: usize = OFF_READ_B2 + 1; // 2136
+const OFF_ECHO_W1: usize = WM_PARAM_START; // 1541, len 42
+const OFF_ECHO_B1: usize = OFF_ECHO_W1 + ECHO_HID * ECHO_IN; // 1583, len 6
+const OFF_ECHO_W2: usize = OFF_ECHO_B1 + ECHO_HID; // 1589, len 6
+const OFF_ECHO_B2: usize = OFF_ECHO_W2 + ECHO_HID; // 1595, len 1
+const OFF_SCAN_BWD: usize = OFF_ECHO_B2 + 1; // 1596, len 83
+const OFF_SCAN_FWD: usize = OFF_SCAN_BWD + SCAN_BLOCK; // 1679, len 83
+const OFF_WM_UPD_W1: usize = OFF_SCAN_FWD + SCAN_BLOCK; // 1762, len 20
+const OFF_WM_UPD_B1: usize = OFF_WM_UPD_W1 + WM_UPD_HID * WM_UPD_IN; // 1782, len 4
+const OFF_WM_UPD_W2: usize = OFF_WM_UPD_B1 + WM_UPD_HID; // 1786, len 4
+const OFF_WM_UPD_B2: usize = OFF_WM_UPD_W2 + WM_UPD_HID; // 1790, len 1
+const OFF_READ_W1: usize = OFF_WM_UPD_B2 + 1; // 1791, len 42
+const OFF_READ_B1: usize = OFF_READ_W1 + READ_HID * READ_IN; // 1833, len 6
+const OFF_READ_W2: usize = OFF_READ_B1 + READ_HID; // 1839, len 6
+const OFF_READ_B2: usize = OFF_READ_W2 + READ_HID; // 1845, len 1
+pub const NUM_PARAMS: usize = OFF_READ_B2 + 1; // 1846
 
 const MAGIC: &[u8; 4] = b"PHIS";
-const VERSION: u32 = 7;
+const VERSION: u32 = 8;
 
 #[inline]
 fn sigmoid(x: f32) -> f32 {
@@ -86,6 +84,19 @@ pub fn wm_norm(v: &[f32; WM_DIM]) -> f32 {
         s += x * x;
     }
     s.sqrt()
+}
+
+pub fn wm_normalize(v: &[f32; WM_DIM]) -> [f32; WM_DIM] {
+    let nrm = wm_norm(v);
+    if nrm < 1e-8 {
+        return [0.0; WM_DIM];
+    }
+    let inv = 1.0 / nrm;
+    let mut out = [0.0f32; WM_DIM];
+    for d in 0..WM_DIM {
+        out[d] = v[d] * inv;
+    }
+    out
 }
 
 pub fn wm_cosine(a: &[f32; WM_DIM], b: &[f32; WM_DIM]) -> f32 {
@@ -105,30 +116,57 @@ pub fn wm_cosine(a: &[f32; WM_DIM], b: &[f32; WM_DIM]) -> f32 {
     }
 }
 
-/// Nouveauté orthogonale idempotente :
-/// - `u1` reçu deux fois -> novelty = 0 (aucun double comptage)
-/// - `u2` orthogonal à `u1` -> novelty = `u2` (composition exacte `u1 + u2`)
-/// - `u1` reçu sur `u1 + u2` -> novelty = 0 (n'efface jamais `u2`).
+/// Alignement à norme amortie : tue les fuites microscopiques (`||v|| ~ 0.01 -> ~0.04`)
+/// tout en distinguant composition exacte Hop-2 (`0.85`) > sur-ensemble (`0.71`) > Hop-1 (`0.57`).
+pub fn wm_align(v: &[f32; WM_DIM], q: &[f32; WM_DIM]) -> f32 {
+    let mut dot = 0.0f32;
+    let mut nv = 0.0f32;
+    let mut nq = 0.0f32;
+    for d in 0..WM_DIM {
+        dot += v[d] * q[d];
+        nv += v[d] * v[d];
+        nq += q[d] * q[d];
+    }
+    let qn = nq.sqrt();
+    if qn < 1e-8 {
+        return 0.0;
+    }
+    let denom = (nv.sqrt() + 0.25) * qn;
+    (dot / denom).clamp(-1.0, 1.0)
+}
+
+/// Nouveauté orthogonale Gram-Schmidt exacte et idempotente :
+/// - `u1` reçu sur `u1` -> `0` (idempotent)
+/// - `u1` reçu sur `u1 + u2` -> `0` (n'efface jamais `u2`)
+/// - `u1 + u2` reçu sur `u1` -> `u2` (préserve 100% la composante nouvelle)
+/// - `u3` reçu sur `u1 + u2` -> `u3` (composition exacte `u1 + u2 + u3`).
 pub fn orth_novelty(msg: &[f32; WM_DIM], cur: &[f32; WM_DIM]) -> [f32; WM_DIM] {
     let mut dot = 0.0f32;
     let mut m2 = 0.0f32;
+    let mut z2 = 0.0f32;
     for d in 0..WM_DIM {
         dot += msg[d] * cur[d];
         m2 += msg[d] * msg[d];
+        z2 += cur[d] * cur[d];
     }
     if m2 < 1e-8 {
         return [0.0; WM_DIM];
     }
-    let overlap = (dot / m2).clamp(0.0, 1.0);
-    let keep = 1.0 - overlap;
+    if dot <= 0.0 || z2 < 1e-8 {
+        return *msg;
+    }
+    let gate = ((1.0 - dot / m2) * 2.0).clamp(0.0, 1.0);
+    if gate < 1e-6 {
+        return [0.0; WM_DIM];
+    }
+    let proj = (dot / (z2 + 1e-6)).min(1.0);
     let mut out = [0.0f32; WM_DIM];
     for d in 0..WM_DIM {
-        out[d] = keep * msg[d];
+        out[d] = gate * (msg[d] - proj * cur[d]);
     }
     out
 }
 
-/// Lien d'écho longue portée extrait uniquement des diagonales (>= 3 octets) de M(a,b).
 #[derive(Clone, Copy, Debug)]
 pub struct EchoEdge {
     pub src: u32,
@@ -138,9 +176,6 @@ pub struct EchoEdge {
     pub freq_src: f32,
 }
 
-/// Substrat relationnel complet extrait de la seule matrice d'auto-égalité M(a,b) = [E[a] == E[b]] :
-/// - Voisinage local (±30 octets) pour Hop-1 (invariance d'échelle)
-/// - Diagonales d'écho longue portée (|a-b| > 16, L >= 3) pour la Mémoire de Travail Hop-2/Hop-3.
 #[derive(Clone, Debug)]
 pub struct RawSubstrate {
     pub len: usize,
@@ -164,7 +199,6 @@ impl RawSubstrate {
         let max_edges = 12usize;
         let log_cap = (win_cap as f32).ln();
 
-        // Fréquence globale normalisée (invariante par bijection arbitraire des 256 octets)
         let mut counts = [0u32; 256];
         let mut max_c = 1u32;
         for &b in bytes {
@@ -276,7 +310,7 @@ impl RawSubstrate {
             offsets.push(edges.len());
         }
 
-        // Extraction des diagonales d'écho longue portée (|a - b| > 16, L >= 3)
+        // Diagonales d'écho longue portée (|a - b| > 16, L >= 3)
         let mut back_echo_len = vec![0.0f32; n];
         let mut fwd_echo_len = vec![0.0f32; n];
         let mut echo_deg_raw = vec![0u32; n];
@@ -398,7 +432,6 @@ impl PhiGraph {
         Self { weights }
     }
 
-    /// Capteur relationnel 100% appris + porte causale neuronale contextuelle (`±2`) et ponctuelle.
     pub fn encode_with_gate(&self, sub: &RawSubstrate) -> (Vec<[f32; REL_DIM]>, Vec<f32>, Vec<f32>) {
         let w = &self.weights;
         let n = sub.len;
@@ -709,30 +742,8 @@ impl PhiGraph {
     }
 
     // =========================================================================
-    // MÉMOIRE DE TRAVAIL POSITIONNELLE (Hop-1 -> Hop-2 -> Hop-3 connexionniste)
+    // MÉMOIRE DE TRAVAIL POSITIONNELLE (directement dans l'espace 24D de H)
     // =========================================================================
-
-    /// Projette une cause latente H (24D) dans l'espace normé de la mémoire de travail (12D).
-    pub fn project_cause_to_wm(&self, state: &[f32; STATE_DIM]) -> [f32; WM_DIM] {
-        let w = &self.weights;
-        let mut out = [0.0f32; WM_DIM];
-        let mut n2 = 0.0f32;
-        for d in 0..WM_DIM {
-            let base = OFF_WM_INIT_W + d * STATE_DIM;
-            let mut acc = w[OFF_WM_INIT_B + d];
-            for k in 0..STATE_DIM {
-                acc += w[base + k] * state[k];
-            }
-            let val = acc.tanh();
-            out[d] = val;
-            n2 += val * val;
-        }
-        let inv = 1.0 / (n2.sqrt().max(1e-6));
-        for x in &mut out {
-            *x *= inv;
-        }
-        out
-    }
 
     fn eval_echo_weight(&self, feat: &[f32; ECHO_IN]) -> f32 {
         let w = &self.weights;
@@ -775,8 +786,10 @@ impl PhiGraph {
         *ctrl = next_ctrl;
 
         let mut gates = [0.0f32; 3];
+        // Prior d'init non-évanescent sur `keep` (+1.5) pour franchir 10-15 octets dès l'étape 1
+        let init_bias = [1.5f32, 0.4f32, 0.4f32];
         for g in 0..3 {
-            let mut acc = w[off_out_b + g];
+            let mut acc = w[off_out_b + g] + init_bias[g];
             for h in 0..SCAN_CTRL {
                 acc += w[off_out_w + g * SCAN_CTRL + h] * ctrl[h];
             }
@@ -785,10 +798,10 @@ impl PhiGraph {
         (gates[0], gates[1], gates[2])
     }
 
-    /// Exécute `WM_STEPS` itérations de la mémoire de travail sur le flux :
-    /// 1. Transport non-réciproque le long des arêtes d'écho longue portée de M(a,b)
-    /// 2. Balayage directionnel arrière (`←`) et avant (`→`) à portes récurrentes apprises
-    /// 3. Mise à jour par nouveauté orthogonale idempotente (`cut_echoes = true` pour IIT).
+    /// Exécute `WM_STEPS` itérations de la mémoire de travail :
+    /// Sub-step A : transport par arêtes d'écho longue portée (appliqué immédiatement)
+    /// Sub-step B : balayages directionnels arrière (`←`) et avant (`→`) non-réciproques
+    /// Fusion par nouveauté orthogonale Gram-Schmidt exacte.
     pub fn propagate_working_memory(
         &self,
         sub: &RawSubstrate,
@@ -803,15 +816,6 @@ impl PhiGraph {
         let w = &self.weights;
         let mut z = init_z.to_vec();
 
-        let mut g_echo = [0.0f32; WM_DIM];
-        let mut g_bwd = [0.0f32; WM_DIM];
-        let mut g_fwd = [0.0f32; WM_DIM];
-        for d in 0..WM_DIM {
-            g_echo[d] = sigmoid(w[OFF_WM_GAINS + d]);
-            g_bwd[d] = sigmoid(w[OFF_WM_GAINS + WM_DIM + d]);
-            g_fwd[d] = sigmoid(w[OFF_WM_GAINS + 2 * WM_DIM + d]);
-        }
-
         let mut msg_echo = vec![[0.0f32; WM_DIM]; n];
         let mut msg_bwd = vec![[0.0f32; WM_DIM]; n];
         let mut msg_fwd = vec![[0.0f32; WM_DIM]; n];
@@ -820,23 +824,20 @@ impl PhiGraph {
         for _ in 0..WM_STEPS {
             for t in 0..n {
                 norms[t] = wm_norm(&z[t]);
-                msg_echo[t] = [0.0; WM_DIM];
-                msg_bwd[t] = [0.0; WM_DIM];
-                msg_fwd[t] = [0.0; WM_DIM];
             }
 
-            // 1. Transport par arêtes d'écho longue portée (M(a,b))
+            // Sub-step A : transport synchrone par échos longue portée de M(a,b), appliqué avant les scans
             if !cut_echoes {
                 for dst in 0..n {
+                    msg_echo[dst] = [0.0; WM_DIM];
                     let slice = &sub.echo_edges[sub.echo_offsets[dst]..sub.echo_offsets[dst + 1]];
                     if slice.is_empty() {
                         continue;
                     }
                     let mut acc = [0.0f32; WM_DIM];
-                    let mut w_sum = 0.0f32;
                     for edge in slice {
                         let src = edge.src as usize;
-                        if norms[src] < 1e-4 {
+                        if norms[src] < 0.05 {
                             continue;
                         }
                         let feat = [
@@ -849,22 +850,34 @@ impl PhiGraph {
                             gates_pt[src],
                         ];
                         let alpha = self.eval_echo_weight(&feat);
-                        if alpha > 0.02 {
+                        if alpha > 0.05 {
                             let nov = orth_novelty(&z[src], &acc);
                             for d in 0..WM_DIM {
                                 acc[d] += alpha * nov[d];
                             }
-                            w_sum += alpha;
                         }
                     }
-                    if w_sum > 0.0 {
-                        msg_echo[dst] = acc;
+                    msg_echo[dst] = acc;
+                }
+                for t in 0..n {
+                    if wm_norm(&msg_echo[t]) > 1e-4 {
+                        let nov = orth_novelty(&msg_echo[t], &z[t]);
+                        for d in 0..WM_DIM {
+                            z[t][d] += nov[d];
+                        }
+                        let nrm = wm_norm(&z[t]);
+                        if nrm > 3.0 {
+                            let sc = 3.0 / nrm;
+                            for x in &mut z[t] {
+                                *x *= sc;
+                            }
+                        }
+                        norms[t] = nrm.min(3.0);
                     }
                 }
             }
 
-            // 2. Balayage directionnel arrière (t = n-1 -> 0) : diffuse moules -> étiquettes
-            //    et compose les membres droits -> têtes de définitions.
+            // Sub-step B1 : balayage directionnel arrière (t = n-1 -> 0)
             let mut ctrl_b = [0.0f32; SCAN_CTRL];
             let mut carry_b = [0.0f32; WM_DIM];
             for t in (0..n).rev() {
@@ -883,10 +896,17 @@ impl PhiGraph {
                 for d in 0..WM_DIM {
                     carry_b[d] *= keep;
                 }
-                if norms[t] > 1e-4 {
+                if norms[t] > 0.05 {
                     let nov = orth_novelty(&z[t], &carry_b);
                     for d in 0..WM_DIM {
                         carry_b[d] += absorb * nov[d];
+                    }
+                    let cn = wm_norm(&carry_b);
+                    if cn > 3.0 {
+                        let sc = 3.0 / cn;
+                        for x in &mut carry_b {
+                            *x *= sc;
+                        }
                     }
                 }
                 for d in 0..WM_DIM {
@@ -894,7 +914,7 @@ impl PhiGraph {
                 }
             }
 
-            // 3. Balayage directionnel avant (t = 0 -> n-1, non-réciproque)
+            // Sub-step B2 : balayage directionnel avant (t = 0 -> n-1)
             let mut ctrl_f = [0.0f32; SCAN_CTRL];
             let mut carry_f = [0.0f32; WM_DIM];
             for t in 0..n {
@@ -913,10 +933,17 @@ impl PhiGraph {
                 for d in 0..WM_DIM {
                     carry_f[d] *= keep;
                 }
-                if norms[t] > 1e-4 {
+                if norms[t] > 0.05 {
                     let nov = orth_novelty(&z[t], &carry_f);
                     for d in 0..WM_DIM {
                         carry_f[d] += absorb * nov[d];
+                    }
+                    let cn = wm_norm(&carry_f);
+                    if cn > 3.0 {
+                        let sc = 3.0 / cn;
+                        for x in &mut carry_f {
+                            *x *= sc;
+                        }
                     }
                 }
                 for d in 0..WM_DIM {
@@ -924,17 +951,21 @@ impl PhiGraph {
                 }
             }
 
-            // 4. Fusion par nouveauté orthogonale idempotente dans la mémoire de travail Z
+            // Sub-step C : fusion orthogonale dans Z
             for t in 0..n {
-                let ne = (wm_norm(&msg_echo[t]) / 2.0).min(1.0);
                 let nb = (wm_norm(&msg_bwd[t]) / 2.0).min(1.0);
                 let nf = (wm_norm(&msg_fwd[t]) / 2.0).min(1.0);
-                if ne + nb + nf < 1e-5 {
+                if nb + nf < 1e-4 {
                     continue;
                 }
-
-                let upd_in = [(norms[t] / 2.0).min(1.0), ne, nb, nf, gates_pt[t]];
-                let mut logit = w[OFF_WM_UPD_B2];
+                let upd_in = [
+                    (norms[t] / 2.0).min(1.0),
+                    nb,
+                    nf,
+                    gates_pt[t],
+                    sub.back_echo_len[t],
+                ];
+                let mut logit = w[OFF_WM_UPD_B2] + 0.5;
                 for h in 0..WM_UPD_HID {
                     let base = OFF_WM_UPD_W1 + h * WM_UPD_IN;
                     let mut acc = w[OFF_WM_UPD_B1 + h];
@@ -945,18 +976,14 @@ impl PhiGraph {
                 }
                 let gamma = sigmoid(logit);
 
-                let nov_e = orth_novelty(&msg_echo[t], &z[t]);
                 let mut z_next = z[t];
-                for d in 0..WM_DIM {
-                    z_next[d] += gamma * g_echo[d] * nov_e[d];
-                }
                 let nov_b = orth_novelty(&msg_bwd[t], &z_next);
                 for d in 0..WM_DIM {
-                    z_next[d] += gamma * g_bwd[d] * nov_b[d];
+                    z_next[d] += gamma * nov_b[d];
                 }
                 let nov_f = orth_novelty(&msg_fwd[t], &z_next);
                 for d in 0..WM_DIM {
-                    z_next[d] += gamma * g_fwd[d] * nov_f[d];
+                    z_next[d] += gamma * nov_f[d];
                 }
 
                 let nrm = wm_norm(&z_next);
@@ -973,13 +1000,14 @@ impl PhiGraph {
         z
     }
 
-    /// Tête de lecture connexionniste : évalue le champ continu d'explication `P(t) ∈ (0, 1)`
-    /// sur chaque octet du contexte face au vecteur mémoire de la cible `z_query`.
+    /// Tête de lecture connexionniste inspirée IIT : compare l'alignement intact (`z_full`)
+    /// et l'alignement coupé (`z_cut`) pour unifier Hop-1 et Hop-2/Hop-3 en un seul champ `P(t)`.
     pub fn readout_explanation(
         &self,
         sub: &RawSubstrate,
         gates_pt: &[f32],
-        z: &[[f32; WM_DIM]],
+        z_full: &[[f32; WM_DIM]],
+        z_cut: &[[f32; WM_DIM]],
         z_query: &[f32; WM_DIM],
     ) -> Vec<f32> {
         let w = &self.weights;
@@ -987,16 +1015,14 @@ impl PhiGraph {
         let mut out = Vec::with_capacity(n);
 
         for t in 0..n {
-            let cos = wm_cosine(&z[t], z_query);
-            let mut dot = 0.0f32;
-            for d in 0..WM_DIM {
-                dot += z[t][d] * z_query[d];
-            }
-            let dot_n = (dot / 2.5).clamp(-1.0, 1.0);
-            let nrm = (wm_norm(&z[t]) / 2.0).min(1.0);
+            let align_full = wm_align(&z_full[t], z_query);
+            let align_cut = wm_align(&z_cut[t], z_query);
+            let align_delta = (align_full - align_cut).max(0.0);
+            let nrm = (wm_norm(&z_full[t]) / 2.0).min(1.0);
             let feat = [
-                cos,
-                dot_n,
+                align_full,
+                align_cut,
+                align_delta,
                 nrm,
                 gates_pt[t],
                 sub.back_echo_len[t],
@@ -1047,7 +1073,7 @@ impl PhiGraph {
         if version != VERSION || count != NUM_PARAMS || data.len() != 12 + count * 4 {
             return Err(io::Error::new(
                 ErrorKind::InvalidData,
-                "Version ou taille du modèle .phis incompatible (ré-entraîne avec v0.7)",
+                "Version ou taille du modèle .phis incompatible (ré-entraîne avec v0.7.1)",
             ));
         }
         let mut weights = Vec::with_capacity(count);
