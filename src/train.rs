@@ -1,14 +1,15 @@
-use crate::graph::{NUM_PARAMS, PhiGraph, STATE_DIM};
-use crate::multihop::analyze_multihop;
+use crate::graph::{NUM_PARAMS, PhiGraph, STATE_DIM, WM_PARAM_START};
 use crate::phi::{
-    PreparedComposite, PreparedEpisode, compute_composite_phi_prepared,
-    compute_phi_sharp_prepared, cosine_sim, discover_causal_regimes, project_query_to_regimes,
+    PreparedComposite, PreparedEpisode, PreparedMultiHop, compute_composite_phi_prepared,
+    compute_phi_sharp_prepared, compute_wm_phi_prepared, cosine_sim, discover_causal_regimes,
+    project_query_to_regimes, run_working_memory,
 };
 use crate::ptgrs::{
     CauseFamily, SepMode, sample_composite_episode, sample_episode, sample_episode_in_range,
     sample_multihop_episode,
 };
 use crate::rng::Rng;
+use std::ops::Range;
 use std::thread;
 use std::time::Instant;
 
@@ -29,6 +30,17 @@ fn span_iou(a: (usize, usize), b: (usize, usize)) -> f32 {
     let inter = (inter_e - inter_s) as f32;
     let union = ((a.1 - a.0) + (b.1 - b.0)) as f32 - inter;
     if union <= 0.0 { 0.0 } else { inter / union }
+}
+
+fn span_hits_concept(pred: (usize, usize), truth: (usize, usize)) -> bool {
+    let inter_s = pred.0.max(truth.0);
+    let inter_e = pred.1.min(truth.1);
+    if inter_e <= inter_s {
+        return false;
+    }
+    let inter = inter_e - inter_s;
+    let truth_len = truth.1.saturating_sub(truth.0).max(1);
+    inter * 2 >= truth_len && span_iou(pred, truth) >= 0.35
 }
 
 fn batch_collapse_penalty(states: &[[f32; STATE_DIM]]) -> f32 {
@@ -84,7 +96,7 @@ fn cross_specificity(
     spec_sum / (n as f32)
 }
 
-fn eval_batch(
+fn eval_hop1_batch(
     graph: &PhiGraph,
     singles: &[PreparedEpisode],
     composites: &[PreparedComposite],
@@ -129,6 +141,24 @@ fn eval_batch(
         + comp_w * mean_comp
 }
 
+fn eval_wm_batch(graph: &PhiGraph, multihops: &[PreparedMultiHop]) -> f32 {
+    if multihops.is_empty() {
+        return 0.0;
+    }
+    let sum: f32 = multihops
+        .iter()
+        .map(|mh| compute_wm_phi_prepared(graph, mh))
+        .sum();
+    sum / (multihops.len() as f32)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Hop1,
+    WorkingMemory,
+    Joint,
+}
+
 pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
     let start = Instant::now();
     let mut rng = Rng::new(cfg.seed);
@@ -136,6 +166,7 @@ pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
 
     let mut m = vec![0.0f32; NUM_PARAMS];
     let mut v = vec![0.0f32; NUM_PARAMS];
+    let mut param_steps = vec![0i32; NUM_PARAMS];
     let beta1 = 0.9f32;
     let beta2 = 0.999f32;
     let eps_adam = 1e-8f32;
@@ -145,32 +176,92 @@ pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
         .unwrap_or(4)
         .min(cfg.pop_pairs.max(1));
 
+    // Une seule séance en 3 phases fluides : Hop-1 (60%) -> Mémoire de Travail (30%) -> Joint (10%)
+    let p1_end = ((cfg.steps * 60) / 100).max(1);
+    let p2_end = ((cfg.steps * 90) / 100).max(p1_end);
+
     println!(
-        "Entraînement Phisharp v0.6 ({} paramètres, {} étapes, {} paires ES, {} threads)...",
-        NUM_PARAMS, cfg.steps, cfg.pop_pairs, n_threads
+        "Entraînement Phisharp v0.7 ({} params = {} Hop-1 + {} Mémoire de Travail, {} étapes, {} paires ES, {} threads)...",
+        NUM_PARAMS,
+        WM_PARAM_START,
+        NUM_PARAMS - WM_PARAM_START,
+        cfg.steps,
+        cfg.pop_pairs,
+        n_threads
+    );
+    println!(
+        "  Curriculum 1 séance : étapes 1..={} (Hop-1) -> {}..={} (Mémoire de Travail) -> {}..={} (Joint)",
+        p1_end,
+        p1_end + 1,
+        p2_end,
+        p2_end + 1,
+        cfg.steps
     );
 
     for step in 1..=cfg.steps {
-        let comp_w = 0.10 + 0.45 * ((step as f32) / 120.0).min(1.0);
-        let mut prep_rng = Rng::new(rng.next_u64());
-        let singles: Vec<PreparedEpisode> = CauseFamily::ALL
-            .iter()
-            .map(|&fam| {
-                let eff = sample_episode(&mut rng, fam).effect;
-                PreparedEpisode::from_bytes(&eff, &mut prep_rng)
-            })
-            .collect();
+        let phase = if step <= p1_end {
+            Phase::Hop1
+        } else if step <= p2_end {
+            Phase::WorkingMemory
+        } else {
+            Phase::Joint
+        };
 
-        let composites = vec![
-            PreparedComposite::from_bytes(
-                &sample_composite_episode(&mut rng, 3, false, false, false, SepMode::None).effect,
-            ),
-            PreparedComposite::from_bytes(
-                &sample_composite_episode(&mut rng, 3, true, false, false, SepMode::Random).effect,
-            ),
-        ];
+        let active_range: Range<usize> = match phase {
+            Phase::Hop1 => 0..WM_PARAM_START,
+            Phase::WorkingMemory => WM_PARAM_START..NUM_PARAMS,
+            Phase::Joint => 0..NUM_PARAMS,
+        };
+        let step_sigma = match phase {
+            Phase::Hop1 => cfg.sigma,
+            Phase::WorkingMemory => cfg.sigma * 1.15,
+            Phase::Joint => cfg.sigma * 0.65,
+        };
+        let step_lr = match phase {
+            Phase::Hop1 => cfg.lr,
+            Phase::WorkingMemory => cfg.lr * 1.25,
+            Phase::Joint => cfg.lr * 0.40,
+        };
+        let comp_w = 0.10 + 0.45 * ((step as f32) / 120.0).min(1.0);
+
+        // Préparation des lots PTGRS (E seul est vu par le modèle)
+        let mut singles: Vec<PreparedEpisode> = Vec::new();
+        let mut composites: Vec<PreparedComposite> = Vec::new();
+        let mut multihops: Vec<PreparedMultiHop> = Vec::new();
+
+        if phase != Phase::WorkingMemory {
+            let mut prep_rng = Rng::new(rng.next_u64());
+            singles = CauseFamily::ALL
+                .iter()
+                .map(|&fam| {
+                    let eff = sample_episode(&mut rng, fam).effect;
+                    PreparedEpisode::from_bytes(&eff, &mut prep_rng)
+                })
+                .collect();
+            composites = vec![
+                PreparedComposite::from_bytes(
+                    &sample_composite_episode(&mut rng, 3, false, false, false, SepMode::None)
+                        .effect,
+                ),
+                PreparedComposite::from_bytes(
+                    &sample_composite_episode(&mut rng, 3, true, false, false, SepMode::Random)
+                        .effect,
+                ),
+            ];
+        }
+
+        if phase != Phase::Hop1 {
+            // 3 scènes multi-sauts : Hop-2 multiligne, Hop-2 flux plat, Hop-3 récursif (E seul)
+            multihops = vec![
+                PreparedMultiHop::from_bytes(&sample_multihop_episode(&mut rng, false, false, 2).effect),
+                PreparedMultiHop::from_bytes(&sample_multihop_episode(&mut rng, true, false, 2).effect),
+                PreparedMultiHop::from_bytes(&sample_multihop_episode(&mut rng, false, false, 3).effect),
+            ];
+        }
 
         let pair_seeds: Vec<u64> = (0..cfg.pop_pairs).map(|_| rng.next_u64()).collect();
+        let a_start = active_range.start;
+        let a_end = active_range.end;
 
         let results: Vec<(u64, f32, f32)> = thread::scope(|s| {
             let chunk_size = cfg.pop_pairs.div_ceil(n_threads);
@@ -179,30 +270,36 @@ pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
                 let theta_ref = &theta;
                 let singles_ref = &singles;
                 let comp_ref = &composites;
-                let sigma = cfg.sigma;
+                let mh_ref = &multihops;
                 handles.push(s.spawn(move || {
                     let mut local = Vec::with_capacity(chunk.len());
                     for &pseed in chunk {
                         let mut prng = Rng::new(pseed);
-                        let mut w_pos = Vec::with_capacity(NUM_PARAMS);
-                        let mut w_neg = Vec::with_capacity(NUM_PARAMS);
-                        for &w in theta_ref {
-                            let noise = prng.next_normal() * sigma;
-                            w_pos.push(w + noise);
-                            w_neg.push(w - noise);
+                        let mut w_pos = theta_ref.clone();
+                        let mut w_neg = theta_ref.clone();
+                        for i in a_start..a_end {
+                            let noise = prng.next_normal() * step_sigma;
+                            w_pos[i] += noise;
+                            w_neg[i] -= noise;
                         }
-                        let f_pos = eval_batch(
-                            &PhiGraph::from_weights(w_pos),
-                            singles_ref,
-                            comp_ref,
-                            comp_w,
-                        );
-                        let f_neg = eval_batch(
-                            &PhiGraph::from_weights(w_neg),
-                            singles_ref,
-                            comp_ref,
-                            comp_w,
-                        );
+                        let g_pos = PhiGraph::from_weights(w_pos);
+                        let g_neg = PhiGraph::from_weights(w_neg);
+                        let (f_pos, f_neg) = match phase {
+                            Phase::Hop1 => (
+                                eval_hop1_batch(&g_pos, singles_ref, comp_ref, comp_w),
+                                eval_hop1_batch(&g_neg, singles_ref, comp_ref, comp_w),
+                            ),
+                            Phase::WorkingMemory => (
+                                eval_wm_batch(&g_pos, mh_ref),
+                                eval_wm_batch(&g_neg, mh_ref),
+                            ),
+                            Phase::Joint => (
+                                eval_hop1_batch(&g_pos, singles_ref, comp_ref, comp_w)
+                                    + 0.70 * eval_wm_batch(&g_pos, mh_ref),
+                                eval_hop1_batch(&g_neg, singles_ref, comp_ref, comp_w)
+                                    + 0.70 * eval_wm_batch(&g_neg, mh_ref),
+                            ),
+                        };
                         local.push((pseed, f_pos, f_neg));
                     }
                     local
@@ -219,8 +316,8 @@ pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
         let var: f32 = diffs.iter().map(|d| d * d).sum::<f32>() / (diffs.len() as f32);
         let std = var.sqrt().max(1e-6);
 
-        let mut grad = vec![0.0f32; NUM_PARAMS];
-        let scale = 1.0 / (2.0 * (cfg.pop_pairs as f32) * cfg.sigma * std);
+        let mut grad = vec![0.0f32; a_end - a_start];
+        let scale = 1.0 / (2.0 * (cfg.pop_pairs as f32) * step_sigma * std);
         for (&(pseed, _, _), &diff) in results.iter().zip(diffs.iter()) {
             let mut prng = Rng::new(pseed);
             let coeff = diff * scale;
@@ -229,67 +326,125 @@ pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
             }
         }
 
-        let t = step as i32;
-        let b1_corr = 1.0 - beta1.powi(t);
-        let b2_corr = 1.0 - beta2.powi(t);
-        for i in 0..NUM_PARAMS {
-            let g = grad[i] - 1e-4 * theta[i];
+        for (offset, &raw_g) in grad.iter().enumerate() {
+            let i = a_start + offset;
+            param_steps[i] += 1;
+            let t = param_steps[i];
+            let b1_corr = 1.0 - beta1.powi(t);
+            let b2_corr = 1.0 - beta2.powi(t);
+            let g = raw_g - 1e-4 * theta[i];
             m[i] = beta1 * m[i] + (1.0 - beta1) * g;
             v[i] = beta2 * v[i] + (1.0 - beta2) * g * g;
             let m_hat = m[i] / b1_corr;
             let v_hat = v[i] / b2_corr;
-            theta[i] += cfg.lr * m_hat / (v_hat.sqrt() + eps_adam);
+            theta[i] += step_lr * m_hat / (v_hat.sqrt() + eps_adam);
         }
 
-        if step == 1 || step % 25 == 0 || step == cfg.steps {
+        let log_now = step == 1
+            || step == p1_end
+            || step == p1_end + 1
+            || step == p2_end
+            || step == cfg.steps
+            || step % 25 == 0;
+
+        if log_now {
             let model = PhiGraph::from_weights(theta.clone());
-            let mut phi = 0.0;
-            let mut gen_sum = 0.0;
-            let mut disc = 0.0;
-            let mut integ = 0.0;
-            let mut gate_c = 0.0;
-            let mut min_gate_c = 1.0f32;
-            let mut res = 0.0;
-            let mut states = Vec::with_capacity(singles.len());
-            let mut residuals = Vec::with_capacity(singles.len());
-            for ep in &singles {
-                let r = compute_phi_sharp_prepared(&model, ep, false);
-                phi += r.phi_sharp;
-                gen_sum += r.generativity;
-                disc += r.discrimination;
-                integ += r.integration;
-                gate_c += r.gate_contrast;
-                if r.gate_contrast < min_gate_c {
-                    min_gate_c = r.gate_contrast;
+            match phase {
+                Phase::Hop1 => {
+                    let mut phi = 0.0;
+                    let mut gen_sum = 0.0;
+                    let mut disc = 0.0;
+                    let mut integ = 0.0;
+                    let mut gate_c = 0.0;
+                    let mut min_gate_c = 1.0f32;
+                    let mut res = 0.0;
+                    let mut states = Vec::with_capacity(singles.len());
+                    let mut residuals = Vec::with_capacity(singles.len());
+                    for ep in &singles {
+                        let r = compute_phi_sharp_prepared(&model, ep, false);
+                        phi += r.phi_sharp;
+                        gen_sum += r.generativity;
+                        disc += r.discrimination;
+                        integ += r.integration;
+                        gate_c += r.gate_contrast;
+                        if r.gate_contrast < min_gate_c {
+                            min_gate_c = r.gate_contrast;
+                        }
+                        res += r.residual;
+                        states.push(r.trace.final_state);
+                        residuals.push(r.residual);
+                    }
+                    let n = singles.len() as f32;
+                    let coll = batch_collapse_penalty(&states);
+                    let spec = cross_specificity(&model, &singles, &states, &residuals);
+                    let sel: f32 = composites
+                        .iter()
+                        .map(|c| compute_composite_phi_prepared(&model, c).selectivity)
+                        .sum::<f32>()
+                        / (composites.len() as f32);
+                    println!(
+                        "[H1] step {:>4}/{:<4} | φ={:+.4} | Gen={:.3} Disc={:.3} Spec={:.3} Gate={:.2}/{:.2} IIT={:.3} RefSel={:.3} | res={:.3} coll={:.3} ({:.1}s)",
+                        step,
+                        cfg.steps,
+                        phi / n,
+                        gen_sum / n,
+                        disc / n,
+                        spec,
+                        gate_c / n,
+                        min_gate_c,
+                        integ / n,
+                        sel,
+                        res / n,
+                        coll,
+                        start.elapsed().as_secs_f32()
+                    );
                 }
-                res += r.residual;
-                states.push(r.trace.final_state);
-                residuals.push(r.residual);
+                Phase::WorkingMemory => {
+                    let wm_phi = eval_wm_batch(&model, &multihops);
+                    // Diag détaillé sur un échantillon frais Hop-2
+                    let mut drng = Rng::new(cfg.seed ^ (step as u64).wrapping_mul(0x9E37_79B9));
+                    let ep = sample_multihop_episode(&mut drng, false, false, 2);
+                    if let Some(r) = run_working_memory(&model, &ep.effect) {
+                        println!(
+                            "[WM] step {:>4}/{:<4} | φ_wm={:+.4} | head_cos={:.3} (cut={:.3}, IIT_echo={:+.3}) | HSel={:.3} RSel={:.3} RDisc={:.3} ({:.1}s)",
+                            step,
+                            cfg.steps,
+                            wm_phi,
+                            r.head_cos,
+                            r.head_cos_cut,
+                            r.iit_echo_gain,
+                            r.head_sel,
+                            r.readout_sel,
+                            r.readout_disc,
+                            start.elapsed().as_secs_f32()
+                        );
+                    } else {
+                        println!(
+                            "[WM] step {:>4}/{:<4} | φ_wm={:+.4} ({:.1}s)",
+                            step,
+                            cfg.steps,
+                            wm_phi,
+                            start.elapsed().as_secs_f32()
+                        );
+                    }
+                }
+                Phase::Joint => {
+                    let h1_phi: f32 = singles
+                        .iter()
+                        .map(|ep| compute_phi_sharp_prepared(&model, ep, false).phi_sharp)
+                        .sum::<f32>()
+                        / (singles.len() as f32);
+                    let wm_phi = eval_wm_batch(&model, &multihops);
+                    println!(
+                        "[JT] step {:>4}/{:<4} | φ_h1={:+.4} | φ_wm={:+.4} ({:.1}s)",
+                        step,
+                        cfg.steps,
+                        h1_phi,
+                        wm_phi,
+                        start.elapsed().as_secs_f32()
+                    );
+                }
             }
-            let n = singles.len() as f32;
-            let coll = batch_collapse_penalty(&states);
-            let spec = cross_specificity(&model, &singles, &states, &residuals);
-            let sel: f32 = composites
-                .iter()
-                .map(|c| compute_composite_phi_prepared(&model, c).selectivity)
-                .sum::<f32>()
-                / (composites.len() as f32);
-            println!(
-                "step {:>4}/{:<4} | φ={:+.4} | Gen={:.3} Disc={:.3} Spec={:.3} Gate={:.2}/{:.2} IIT={:.3} RefSel={:.3} | res={:.3} coll={:.3} ({:.1}s)",
-                step,
-                cfg.steps,
-                phi / n,
-                gen_sum / n,
-                disc / n,
-                spec,
-                gate_c / n,
-                min_gate_c,
-                integ / n,
-                sel,
-                res / n,
-                coll,
-                start.elapsed().as_secs_f32()
-            );
         }
     }
 
@@ -325,11 +480,14 @@ fn evaluate_post_hoc(model: &PhiGraph, seed: u64) {
     let same_avg = same_sum / (trials as f32);
     let diff_avg = diff_sum / (trials as f32);
 
-    // 2. Projection 1-saut sur flux continus auto-segmentés
+    // 2. Flux continu 1-saut auto-segmenté
     let proj_trials = 50;
     let mut hits_glued = 0usize;
     let mut hits_tagged = 0usize;
     let mut ref_hits = 0usize;
+    let mut sum_cos = 0.0f32;
+    let mut sum_err = 0.0f32;
+    let mut sum_ov = 0.0f32;
 
     for _ in 0..proj_trials {
         let ep_raw = sample_composite_episode(&mut rng, 4, false, false, true, SepMode::None);
@@ -363,6 +521,9 @@ fn evaluate_post_hoc(model: &PhiGraph, seed: u64) {
                     && span_iou((top.core_start, top.core_end), true_m) >= 0.45
                 {
                     hits_tagged += 1;
+                    sum_cos += top.cos_sim;
+                    sum_err += top.cross_err;
+                    sum_ov += top.byte_overlap;
                     if let (Some(ext_ref), Some(gt_tag)) = (top.referent, true_tag)
                         && span_iou(ext_ref, gt_tag) >= 0.50
                     {
@@ -373,35 +534,45 @@ fn evaluate_post_hoc(model: &PhiGraph, seed: u64) {
         }
     }
 
-    // 3. Projection Multi-Sauts sur Définitions Composées (4 concepts, hasard = 25%, 0 octet commun)
-    let mh_trials = 50;
-    let mut mh_decomposed = 0usize;
-    let mut mh_hits = 0usize;
-    let mut mh_flat_hits = 0usize;
-    let mut mh_margin = 0.0f32;
+    // 3. Mémoire de Travail Connexionniste : Hop-2 & Hop-3 (0 parsing symbolique, 0 octet commun)
+    let wm_trials = 50;
+    let mut h2_hits = 0usize;
+    let mut h2_flat_hits = 0usize;
+    let mut h3_hits = 0usize;
+    let mut h2_iit_sum = 0.0f32;
+    let mut h3_iit_sum = 0.0f32;
+    let mut h2_margin_sum = 0.0f32;
 
-    for _ in 0..mh_trials {
-        let ep = sample_multihop_episode(&mut rng, false, false);
-        if let Some(ana) = analyze_multihop(model, &ep.effect) {
-            if ana.target_spans.len() >= 2 {
-                mh_decomposed += 1;
-            }
-            if let Some(top) = ana.hop2_matches.first()
-                && top.concept.name_bytes == ep.hidden_concept_name
+    for _ in 0..wm_trials {
+        let ep2 = sample_multihop_episode(&mut rng, false, false, 2);
+        if let Some(rep) = run_working_memory(model, &ep2.effect) {
+            h2_iit_sum += rep.iit_echo_gain;
+            if let Some(top) = rep.top_spans.first()
+                && span_hits_concept((top.start, top.end), ep2.hidden_concept_span)
             {
-                mh_hits += 1;
-                if ana.hop2_matches.len() >= 2 {
-                    mh_margin += top.score - ana.hop2_matches[1].score;
+                h2_hits += 1;
+                if let Some(sec) = rep.top_spans.get(1) {
+                    h2_margin_sum += top.peak_p - sec.peak_p;
                 }
             }
         }
 
-        let ep_flat = sample_multihop_episode(&mut rng, true, false);
-        if let Some(ana) = analyze_multihop(model, &ep_flat.effect)
-            && let Some(top) = ana.hop2_matches.first()
-            && top.concept.name_bytes == ep_flat.hidden_concept_name
+        let ep2f = sample_multihop_episode(&mut rng, true, false, 2);
+        if let Some(rep) = run_working_memory(model, &ep2f.effect)
+            && let Some(top) = rep.top_spans.first()
+            && span_hits_concept((top.start, top.end), ep2f.hidden_concept_span)
         {
-            mh_flat_hits += 1;
+            h2_flat_hits += 1;
+        }
+
+        let ep3 = sample_multihop_episode(&mut rng, false, false, 3);
+        if let Some(rep) = run_working_memory(model, &ep3.effect) {
+            h3_iit_sum += rep.iit_echo_gain;
+            if let Some(top) = rep.top_spans.first()
+                && span_hits_concept((top.start, top.end), ep3.hidden_concept_span)
+            {
+                h3_hits += 1;
+            }
         }
     }
 
@@ -417,37 +588,45 @@ fn evaluate_post_hoc(model: &PhiGraph, seed: u64) {
         proj_trials,
         100.0 * (hits_glued as f32) / (proj_trials as f32)
     );
+    let denom_t = hits_tagged.max(1) as f32;
     println!(
-        "  Moules étiquetés, sép. aléatoire (0 octet commun)  : {}/{} ({:.1}%)  [référent exact={}/{}]",
+        "  Moules étiquetés, sép. aléatoire (0 octet commun)  : {}/{} ({:.1}%)  [réf={}/{}, cos={:+.3}, err={:.3}, ov={:.0}%]",
         hits_tagged,
         proj_trials,
         100.0 * (hits_tagged as f32) / (proj_trials as f32),
         ref_hits,
-        hits_tagged
+        hits_tagged,
+        sum_cos / denom_t,
+        sum_err / denom_t,
+        100.0 * (sum_ov / denom_t)
     );
 
-    println!("\n--- Évaluation post-hoc 3 : Multi-Sauts sur Définitions Composées (4 concepts, hasard = 25%) ---");
     println!(
-        "  Décomposition 2 causes (cible hybride)             : {}/{} ({:.1}%)",
-        mh_decomposed,
-        mh_trials,
-        100.0 * (mh_decomposed as f32) / (mh_trials as f32)
+        "\n--- Évaluation post-hoc 3 : Mémoire de Travail 100% Connexionniste (0 parsing symbolique) ---"
     );
     println!(
-        "  Concept composé exact (multiligne, 0 octet commun) : {}/{} ({:.1}%)  [marge Top1-Top2 = {:+.4}]",
-        mh_hits,
-        mh_trials,
-        100.0 * (mh_hits as f32) / (mh_trials as f32),
-        if mh_hits > 0 {
-            mh_margin / (mh_hits as f32)
+        "  Hop-2 multiligne (4 déf., hasard = 25%) : {}/{} ({:.1}%)  [marge P={:+.3}, gain IIT échos={:+.3}]",
+        h2_hits,
+        wm_trials,
+        100.0 * (h2_hits as f32) / (wm_trials as f32),
+        if h2_hits > 0 {
+            h2_margin_sum / (h2_hits as f32)
         } else {
             0.0
-        }
+        },
+        h2_iit_sum / (wm_trials as f32)
     );
     println!(
-        "  Concept composé exact (flux plat, 0 octet commun)  : {}/{} ({:.1}%)",
-        mh_flat_hits,
-        mh_trials,
-        100.0 * (mh_flat_hits as f32) / (mh_trials as f32)
+        "  Hop-2 flux plat  (4 déf., hasard = 25%) : {}/{} ({:.1}%)",
+        h2_flat_hits,
+        wm_trials,
+        100.0 * (h2_flat_hits as f32) / (wm_trials as f32)
+    );
+    println!(
+        "  Hop-3 récursif   (5 déf., 3 causes)     : {}/{} ({:.1}%)  [gain IIT échos={:+.3}]",
+        h3_hits,
+        wm_trials,
+        100.0 * (h3_hits as f32) / (wm_trials as f32),
+        h3_iit_sum / (wm_trials as f32)
     );
 }
