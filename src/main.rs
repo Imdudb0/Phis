@@ -9,7 +9,7 @@ const DIM: usize = 8;
 const K1: usize = 6; // Nœuds causaux réifiés (Niveau 1)
 const K2: usize = 3; // Nœuds méta-relationnels (Niveau 2)
 const DEFAULT_BUDGET: usize = 6;
-const MAGIC: &[u8; 8] = b"PHIS24V2";
+const MAGIC: &[u8; 8] = b"PHIS2421";
 
 // ============================================================================
 // 1. PRNG déterministe (SplitMix64 + Box-Muller, zéro dépendance)
@@ -86,8 +86,7 @@ struct MultiScaleGroundTruth {
 }
 
 impl PtgrsCause {
-    /// Générateur d'entraînement strictement générique : aucune structure linguistique
-    /// ni moule prédéfini ; uniquement des graphes de réécriture aléatoires.
+    /// Générateur d'entraînement strictement générique (aucun format NL ni moule ciblé).
     fn sample_generic(rng: &mut Rng) -> Self {
         let mut pool: Vec<u8> = (0u8..=255).collect();
         rng.shuffle(&mut pool);
@@ -99,7 +98,7 @@ impl PtgrsCause {
 
         let mut rules = Vec::with_capacity(n_nonterms);
         for (idx, &nt) in nonterms.iter().enumerate() {
-            let primary_len = 2 + rng.range_usize(3); // longueur 2..4
+            let primary_len = 2 + rng.range_usize(3);
             let mut rhs_primary = Vec::with_capacity(primary_len);
             let nt_pos = rng.range_usize(primary_len);
             let target_nt = nonterms[(idx + 1 + rng.range_usize(n_nonterms - 1)) % n_nonterms];
@@ -112,7 +111,7 @@ impl PtgrsCause {
                 }
             }
 
-            let alt_len = 2 + rng.range_usize(2); // longueur 2..3 (terminaux purs)
+            let alt_len = 2 + rng.range_usize(2);
             let mut rhs_alt = Vec::with_capacity(alt_len);
             for _ in 0..alt_len {
                 rhs_alt.push(terminals[rng.range_usize(n_terms)]);
@@ -134,8 +133,7 @@ impl PtgrsCause {
         }
     }
 
-    /// Famille PTGRS hors-distribution (barreau 1) : double branchement récursif
-    /// et compositions plus profondes jamais vues à l'entraînement.
+    /// Famille PTGRS hors-distribution (barreau 1) : double branchement récursif.
     fn sample_ood(rng: &mut Rng, depth_family: usize) -> Self {
         let mut pool: Vec<u8> = (0u8..=255).collect();
         rng.shuffle(&mut pool);
@@ -254,9 +252,9 @@ impl PtgrsCause {
 
 #[derive(Clone)]
 struct ScaleGraph {
-    r: [Vec<f64>; 3],     // R^(1), R^(2), R^(3) : v_size * v_size
-    w: [Vec<f64>; 3],     // Poids de lignes normalisés (somme = 1 par échelle)
-    h_marg: [f64; 3],     // Entropie croisée de référence unigramme P_marg par échelle
+    r: [Vec<f64>; 3], // R^(1), R^(2), R^(3) : v_size * v_size
+    w: [Vec<f64>; 3], // Poids de lignes normalisés (somme = 1 par échelle)
+    h_marg: [f64; 3], // Entropie croisée de référence unigramme P_marg par échelle
 }
 
 #[derive(Clone)]
@@ -266,7 +264,7 @@ struct RelationalView {
     v_size: usize,
     p_marg: Vec<f64>,
     graph: ScaleGraph,
-    shuf_graph: ScaleGraph, // Contre-exemple E- conservant exactement les marginales P_marg
+    shuf_graph: ScaleGraph, // Contre-exemple E- à marginales P_marg exactement identiques
     node_init: Vec<[f64; DIM]>,
 }
 
@@ -357,7 +355,6 @@ impl RelationalView {
 
         let graph = build_scale_graph(&seq, v_size, &p_marg);
 
-        // Graphe arrière lag-1 uniquement pour enrichir la signature relationnelle locale
         let mut bwd_c = vec![0.0_f64; v_size * v_size];
         let mut bwd_s = vec![0.0_f64; v_size];
         for win in seq.windows(2) {
@@ -367,7 +364,6 @@ impl RelationalView {
             }
         }
 
-        // Distance moyenne de récurrence par symbole (capte périodicité / profondeur)
         let mut last_pos = vec![None::<usize>; v_size];
         let mut gap_sum = vec![0.0_f64; v_size];
         let mut gap_cnt = vec![0.0_f64; v_size];
@@ -442,8 +438,6 @@ impl RelationalView {
             ];
         }
 
-        // Contre-exemple E- : permutation déterministe ne dépendant ni des valeurs d'octets
-        // ni de l'alphabet, préservant exactement p_marg.
         let mut shuf_seq = seq.clone();
         let mut shuf_rng = Rng::new(
             0xD1B5_4A32_D192_ED03u64
@@ -472,8 +466,8 @@ impl RelationalView {
 }
 
 // ============================================================================
-// 4. Architecture connexionniste hiérarchique top-down Phisharp V2
-//    (Réification L0 -> L1 -> L2 et déploiement vertical H => R^(1..3))
+// 4. Architecture connexionniste hiérarchique top-down Phisharp V2.1
+//    Liaisons dynamiques A(t), E_emit(t), G(t) co-évoluant avec H1(t) et H2(t)
 // ============================================================================
 
 const OFF_W_LAT1: usize = 0;
@@ -483,7 +477,9 @@ const OFF_W_DOWN_21: usize = OFF_W_UP_12 + K2 * K1;
 
 const OFF_U_IN: usize = OFF_W_DOWN_21 + K1 * K2;
 const OFF_U_OBS_1: usize = OFF_U_IN + DIM * DIM;
-const OFF_U_LAT1: usize = OFF_U_OBS_1 + DIM * DIM;
+const OFF_U_G_OUT: usize = OFF_U_OBS_1 + DIM * DIM;
+const OFF_U_G_IN: usize = OFF_U_G_OUT + DIM * DIM;
+const OFF_U_LAT1: usize = OFF_U_G_IN + DIM * DIM;
 const OFF_U_UP_12: usize = OFF_U_LAT1 + DIM * DIM;
 const OFF_U_LAT2: usize = OFF_U_UP_12 + DIM * DIM;
 const OFF_U_DOWN_21: usize = OFF_U_LAT2 + DIM * DIM;
@@ -498,7 +494,7 @@ const OFF_U_REF2: usize = OFF_U_REF1 + DIM * DIM;
 const OFF_B1: usize = OFF_U_REF2 + DIM * DIM;
 const OFF_B2: usize = OFF_B1 + DIM;
 const OFF_GATES: usize = OFF_B2 + DIM;
-const PARAM_COUNT: usize = OFF_GATES + 4;
+const PARAM_COUNT: usize = OFF_GATES + 8;
 
 const SCALE_W: [f64; 3] = [0.50_f64, 0.30_f64, 0.20_f64];
 
@@ -506,40 +502,158 @@ const SCALE_W: [f64; 3] = [0.50_f64, 0.30_f64, 0.20_f64];
 struct HierState {
     h1: Vec<[f64; DIM]>,
     h2: Vec<[f64; DIM]>,
+    l_a: Vec<f64>, // v_size * k1 : potentiels dynamiques d'ancrage L0 -> L1
+    l_e: Vec<f64>, // k1 * v_size : potentiels dynamiques d'émission L1 -> L0
+    l_g: Vec<f64>, // k1 * k1     : potentiels dynamiques de réécriture latente
 }
 
 impl HierState {
-    fn zeros(k1: usize, k2: usize) -> Self {
+    fn zeros(v_size: usize, k1: usize, k2: usize) -> Self {
         Self {
             h1: vec![[0.0_f64; DIM]; k1],
             h2: vec![[0.0_f64; DIM]; k2],
+            l_a: vec![0.0_f64; v_size * k1],
+            l_e: vec![0.0_f64; k1 * v_size],
+            l_g: vec![0.0_f64; k1 * k1],
         }
     }
 
-    fn seeded() -> Self {
+    /// Initialisation douce strictement invariante au renommage bijectif d'alphabet
+    /// (dépend uniquement des indices d'ordre d'apparition u, k).
+    fn seeded(v_size: usize) -> Self {
         let mut h1 = vec![[0.0_f64; DIM]; K1];
         for (k, v) in h1.iter_mut().enumerate() {
             for d in 0..DIM {
-                v[d] = 0.08_f64 * (((k + 1) * (d + 2)) as f64).sin();
+                v[d] = 0.12_f64 * (((k + 1) * (d + 2)) as f64 * 1.13_f64).sin();
             }
             rms_norm(v);
         }
         let mut h2 = vec![[0.0_f64; DIM]; K2];
         for (m, v) in h2.iter_mut().enumerate() {
             for d in 0..DIM {
-                v[d] = 0.08_f64 * (((m + 3) * (d + 1)) as f64).cos();
+                v[d] = 0.12_f64 * (((m + 3) * (d + 1)) as f64 * 1.29_f64).cos();
             }
             rms_norm(v);
         }
-        Self { h1, h2 }
+
+        // Brisure de symétrie légère entre symboles et causes latentes (permet de résoudre
+        // les graphes réguliers/cycles tout en restant 100 % invariant par bijection).
+        let mut l_a = vec![0.0_f64; v_size * K1];
+        for u in 0..v_size {
+            for k in 0..K1 {
+                l_a[u * K1 + k] = 0.18_f64 * (((u + 1) * (k + 2)) as f64 * 1.37_f64).sin();
+            }
+            center_row(&mut l_a[u * K1..(u + 1) * K1]);
+        }
+
+        let mut l_e = vec![0.0_f64; K1 * v_size];
+        for k in 0..K1 {
+            for u in 0..v_size {
+                l_e[k * v_size + u] = 0.18_f64 * (((k + 1) * (u + 3)) as f64 * 1.19_f64).cos();
+            }
+            center_row(&mut l_e[k * v_size..(k + 1) * v_size]);
+        }
+
+        let l_g = vec![0.0_f64; K1 * K1];
+
+        Self {
+            h1,
+            h2,
+            l_a,
+            l_e,
+            l_g,
+        }
+    }
+
+    fn with_dead_l1_node(&self, v_size: usize) -> Self {
+        let old_k1 = self.h1.len();
+        let new_k1 = old_k1 + 1;
+        let mut h1 = self.h1.clone();
+        h1.push([0.0_f64; DIM]);
+
+        let mut l_a = vec![0.0_f64; v_size * new_k1];
+        for u in 0..v_size {
+            for k in 0..old_k1 {
+                l_a[u * new_k1 + k] = self.l_a[u * old_k1 + k];
+            }
+        }
+        let mut l_e = vec![0.0_f64; new_k1 * v_size];
+        for k in 0..old_k1 {
+            for u in 0..v_size {
+                l_e[k * v_size + u] = self.l_e[k * v_size + u];
+            }
+        }
+        let mut l_g = vec![0.0_f64; new_k1 * new_k1];
+        for a in 0..old_k1 {
+            for b in 0..old_k1 {
+                l_g[a * new_k1 + b] = self.l_g[a * old_k1 + b];
+            }
+        }
+
+        Self {
+            h1,
+            h2: self.h2.clone(),
+            l_a,
+            l_e,
+            l_g,
+        }
+    }
+
+    fn with_cloned_l1_node(&self, v_size: usize, src_k: usize) -> Self {
+        let old_k1 = self.h1.len();
+        let new_k1 = old_k1 + 1;
+        let mut h1 = self.h1.clone();
+        h1.push(self.h1[src_k]);
+
+        let mut l_a = vec![0.0_f64; v_size * new_k1];
+        for u in 0..v_size {
+            for k in 0..old_k1 {
+                l_a[u * new_k1 + k] = self.l_a[u * old_k1 + k];
+            }
+            l_a[u * new_k1 + old_k1] = self.l_a[u * old_k1 + src_k];
+        }
+        let mut l_e = vec![0.0_f64; new_k1 * v_size];
+        for k in 0..old_k1 {
+            for u in 0..v_size {
+                l_e[k * v_size + u] = self.l_e[k * v_size + u];
+            }
+        }
+        for u in 0..v_size {
+            l_e[old_k1 * v_size + u] = self.l_e[src_k * v_size + u];
+        }
+        let mut l_g = vec![0.0_f64; new_k1 * new_k1];
+        for a in 0..old_k1 {
+            for b in 0..old_k1 {
+                l_g[a * new_k1 + b] = self.l_g[a * old_k1 + b];
+            }
+            l_g[a * new_k1 + old_k1] = self.l_g[a * old_k1 + src_k];
+            l_g[old_k1 * new_k1 + a] = self.l_g[src_k * old_k1 + a];
+        }
+        l_g[old_k1 * new_k1 + old_k1] = self.l_g[src_k * old_k1 + src_k];
+
+        Self {
+            h1,
+            h2: self.h2.clone(),
+            l_a,
+            l_e,
+            l_g,
+        }
+    }
+
+    fn with_cloned_l2_node(&self, src_m: usize) -> Self {
+        let mut out = self.clone();
+        out.h2.push(self.h2[src_m]);
+        out
     }
 }
 
 struct TopDownUnfold {
     a_ground: Vec<f64>,   // V * k1
-    g_op: Vec<f64>,       // k1 * k1 (opérateur de réécriture latent non-réciproque)
+    g_op: Vec<f64>,       // k1 * k1
     emit: Vec<f64>,       // k1 * V
-    r_hat: [Vec<f64>; 3], // R_hat^(1..3) : V * V (déployées verticalement sans lire E)
+    ge: [Vec<f64>; 3],    // G^s * E_emit (k1 * V)
+    ag: [Vec<f64>; 3],    // A * G^s      (V * k1)
+    r_hat: [Vec<f64>; 3], // R_hat^(1..3) = A * G^s * E_emit (V * V)
 }
 
 #[derive(Clone)]
@@ -600,6 +714,16 @@ fn vec_norm(v: &[f64; DIM]) -> f64 {
 }
 
 #[inline]
+fn vec_dist(a: &[f64; DIM], b: &[f64; DIM]) -> f64 {
+    let mut s = 0.0_f64;
+    for i in 0..DIM {
+        let d = a[i] - b[i];
+        s += d * d;
+    }
+    s.sqrt()
+}
+
+#[inline]
 fn rms_norm(v: &mut [f64; DIM]) {
     let mean_sq = dot(v, v) / (DIM as f64);
     if mean_sq < 1e-18_f64 {
@@ -608,6 +732,17 @@ fn rms_norm(v: &mut [f64; DIM]) {
     let denom = (mean_sq + 0.25_f64).sqrt();
     for x in v.iter_mut() {
         *x /= denom;
+    }
+}
+
+#[inline]
+fn center_row(row: &mut [f64]) {
+    if row.is_empty() {
+        return;
+    }
+    let mean = row.iter().sum::<f64>() / (row.len() as f64);
+    for x in row.iter_mut() {
+        *x = (*x - mean).clamp(-6.0_f64, 6.0_f64);
     }
 }
 
@@ -620,17 +755,27 @@ fn softmax_slice(logits: &[f64], out: &mut [f64]) {
     }
     let mut sum_e = 0.0_f64;
     for (o, &l) in out.iter_mut().zip(logits.iter()) {
-        let e = (l - max_l).exp();
+        let e = if l < -1e8_f64 {
+            0.0_f64
+        } else {
+            (l - max_l).exp()
+        };
         *o = e;
         sum_e += e;
     }
-    let inv = 1.0_f64 / (sum_e + 1e-12_f64);
-    for o in out.iter_mut() {
-        *o *= inv;
+    if sum_e <= 1e-15_f64 {
+        let u = 1.0_f64 / (out.len().max(1) as f64);
+        for o in out.iter_mut() {
+            *o = u;
+        }
+    } else {
+        let inv = 1.0_f64 / sum_e;
+        for o in out.iter_mut() {
+            *o *= inv;
+        }
     }
 }
 
-/// Produit matriciel dense C(m x n) = A(m x p) * B(p x n).
 fn mat_mul(a: &[f64], b: &[f64], m: usize, p: usize, n: usize) -> Vec<f64> {
     let mut c = vec![0.0_f64; m * n];
     for i in 0..m {
@@ -659,7 +804,7 @@ impl PhisharpModel {
             } else if i < OFF_B1 {
                 0.35_f64
             } else {
-                0.10_f64
+                0.15_f64
             };
             *p = rng.next_normal() * scale;
         }
@@ -686,14 +831,14 @@ impl PhisharpModel {
         if data.len() < 16 || &data[0..8] != MAGIC {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "Format de modèle .phis V2 invalide",
+                "Format de modèle .phis V2.1 invalide",
             ));
         }
         let count = u64::from_le_bytes(data[8..16].try_into().unwrap()) as usize;
         if count != PARAM_COUNT || data.len() != 16 + count * 8 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "Nombre de paramètres V2 incompatible",
+                "Nombre de paramètres V2.1 incompatible",
             ));
         }
         let mut params = Vec::with_capacity(count);
@@ -737,7 +882,9 @@ impl PhisharpModel {
     }
 
     fn u_in(&self) -> &[f64] { &self.params[OFF_U_IN..OFF_U_OBS_1] }
-    fn u_obs_1(&self) -> &[f64] { &self.params[OFF_U_OBS_1..OFF_U_LAT1] }
+    fn u_obs_1(&self) -> &[f64] { &self.params[OFF_U_OBS_1..OFF_U_G_OUT] }
+    fn u_g_out(&self) -> &[f64] { &self.params[OFF_U_G_OUT..OFF_U_G_IN] }
+    fn u_g_in(&self) -> &[f64] { &self.params[OFF_U_G_IN..OFF_U_LAT1] }
     fn u_lat1(&self) -> &[f64] { &self.params[OFF_U_LAT1..OFF_U_UP_12] }
     fn u_up_12(&self) -> &[f64] { &self.params[OFF_U_UP_12..OFF_U_LAT2] }
     fn u_lat2(&self) -> &[f64] { &self.params[OFF_U_LAT2..OFF_U_DOWN_21] }
@@ -751,34 +898,48 @@ impl PhisharpModel {
     fn u_ref2(&self) -> &[f64] { &self.params[OFF_U_REF2..OFF_B1] }
     fn b1(&self) -> &[f64] { &self.params[OFF_B1..OFF_B2] }
     fn b2(&self) -> &[f64] { &self.params[OFF_B2..OFF_GATES] }
-    fn gates(&self) -> (f64, f64, f64, f64) {
-        (
-            self.params[OFF_GATES],
-            self.params[OFF_GATES + 1],
-            self.params[OFF_GATES + 2],
-            self.params[OFF_GATES + 3],
-        )
-    }
+    fn gates(&self) -> &[f64] { &self.params[OFF_GATES..PARAM_COUNT] }
 
-    /// Déploiement vertical pur H = (H1, H2) ==> R_hat^(1..3) = A * G^s * E_emit.
-    /// Zéro lecture gauche-droite de la séquence E.
+    /// Déploiement vertical pur H = (H1, H2, L_A, L_E, L_G) ==> R_hat^(1..3) = A * G^s * E_emit.
+    /// Zéro lecture gauche-droite de E. Respecte les coupes MIP (cut_l1 et cut_vertical).
     fn unfold_top_down(
         &self,
         node_init: &[[f64; DIM]],
         state: &HierState,
+        cut_l1: Option<u32>,
         cut_vertical: bool,
     ) -> TopDownUnfold {
         let v = node_init.len();
         let k1 = state.h1.len();
         let k2 = state.h2.len();
 
-        if v == 0 || k1 == 0 {
+        let mut h1_norms = vec![0.0_f64; k1];
+        let mut any_active = false;
+        for k in 0..k1 {
+            let n = vec_norm(&state.h1[k]);
+            h1_norms[k] = n;
+            if n > 1e-9_f64 {
+                any_active = true;
+            }
+        }
+
+        if v == 0 || k1 == 0 || !any_active {
             let unif = if v > 0 { 1.0_f64 / (v as f64) } else { 0.0_f64 };
             let r = vec![unif; v * v];
             return TopDownUnfold {
-                a_ground: Vec::new(),
-                g_op: Vec::new(),
-                emit: Vec::new(),
+                a_ground: vec![if k1 > 0 { 1.0_f64 / (k1 as f64) } else { 0.0_f64 }; v * k1],
+                g_op: vec![if k1 > 0 { 1.0_f64 / (k1 as f64) } else { 0.0_f64 }; k1 * k1],
+                emit: vec![unif; k1 * v],
+                ge: [
+                    vec![unif; k1 * v],
+                    vec![unif; k1 * v],
+                    vec![unif; k1 * v],
+                ],
+                ag: [
+                    vec![if k1 > 0 { 1.0_f64 / (k1 as f64) } else { 0.0_f64 }; v * k1],
+                    vec![if k1 > 0 { 1.0_f64 / (k1 as f64) } else { 0.0_f64 }; v * k1],
+                    vec![if k1 > 0 { 1.0_f64 / (k1 as f64) } else { 0.0_f64 }; v * k1],
+                ],
                 r_hat: [r.clone(), r.clone(), r],
             };
         }
@@ -802,6 +963,9 @@ impl PhisharpModel {
             }
 
             for k in 0..k1 {
+                if h1_norms[k] <= 1e-9_f64 {
+                    continue;
+                }
                 let mut td = [0.0_f64; DIM];
                 for m in 0..k2 {
                     let w = self.w_down_21(k, m);
@@ -811,33 +975,50 @@ impl PhisharpModel {
                         }
                     }
                 }
-                let base_norm = vec_norm(&state.h1[k]);
-                if base_norm > 1e-12_f64 {
-                    for d in 0..DIM {
-                        h1_eff[k][d] += 0.65_f64 * td[d].tanh();
-                    }
-                    rms_norm(&mut h1_eff[k]);
+                for d in 0..DIM {
+                    h1_eff[k][d] += 0.65_f64 * td[d].tanh();
                 }
+                rms_norm(&mut h1_eff[k]);
             }
         }
 
-        // 2. Opérateur latent non-réciproque G (k1 x k1) et ses puissances G^1, G^2, G^3
+        // 2. Opérateur latent non-réciproque G (k1 x k1) gouverné par (H1, H2, L_G)
         let mut g_op = vec![0.0_f64; k1 * k1];
         let mut row_logits = vec![0.0_f64; k1];
-        let mut h1_norms = vec![0.0_f64; k1];
-        for k in 0..k1 {
-            h1_norms[k] = vec_norm(&h1_eff[k]);
-        }
 
         for a in 0..k1 {
+            if h1_norms[a] <= 1e-9_f64 {
+                g_op[a * k1 + a] = 1.0_f64;
+                continue;
+            }
             let ug_a = mat_vec(self.u_g(), &h1_eff[a]);
             let mut qa = [0.0_f64; DIM];
             for d in 0..DIM {
-                qa[d] = ug_a[d] + 0.50_f64 * h1_eff[a][d] * g2_ctx[d];
+                qa[d] = ug_a[d] + 0.55_f64 * h1_eff[a][d] * g2_ctx[d];
             }
+            let side_a = cut_l1.map(|m| ((m >> a.min(30)) & 1) != 0);
+
             for b in 0..k1 {
+                if h1_norms[b] <= 1e-9_f64 {
+                    row_logits[b] = -1e9_f64;
+                    continue;
+                }
+                if let Some(sa) = side_a {
+                    let sb = ((cut_l1.unwrap() >> b.min(30)) & 1) != 0;
+                    if sa != sb {
+                        row_logits[b] = -1e9_f64;
+                        continue;
+                    }
+                }
                 let active = (h1_norms[a] * h1_norms[b]).tanh();
-                row_logits[b] = dot(&qa, &h1_eff[b]) + self.w_lat1(b, a) * active;
+                let meta_gate = if cut_vertical {
+                    0.50_f64
+                } else {
+                    0.35_f64 + 1.25_f64 * sigmoid(dot(&g2_ctx, &h1_eff[a]) + dot(&g2_ctx, &h1_eff[b]))
+                };
+                row_logits[b] = dot(&qa, &h1_eff[b])
+                    + self.w_lat1(b, a) * active
+                    + meta_gate * state.l_g[a * k1 + b];
             }
             softmax_slice(&row_logits, &mut g_op[a * k1..(a + 1) * k1]);
         }
@@ -845,18 +1026,22 @@ impl PhisharpModel {
         let g2 = mat_mul(&g_op, &g_op, k1, k1, k1);
         let g3 = mat_mul(&g2, &g_op, k1, k1, k1);
 
-        // 3. Ancrage relationnel A (V x k1)
+        // 3. Ancrage relationnel dynamique A (V x k1) : L_A + couplage (node_init, H1)
         let mut a_ground = vec![0.0_f64; v * k1];
         let mut sym_in = vec![[0.0_f64; DIM]; v];
         for u in 0..v {
             sym_in[u] = mat_vec(self.u_in(), &node_init[u]);
             for k in 0..k1 {
-                row_logits[k] = dot(&sym_in[u], &h1_eff[k]);
+                if h1_norms[k] <= 1e-9_f64 {
+                    row_logits[k] = -1e9_f64;
+                } else {
+                    row_logits[k] = state.l_a[u * k1 + k] + 0.45_f64 * dot(&sym_in[u], &h1_eff[k]);
+                }
             }
             softmax_slice(&row_logits, &mut a_ground[u * k1..(u + 1) * k1]);
         }
 
-        // 4. Émission top-down E_emit (k1 x V) : strictement uniforme si H = 0
+        // 4. Émission top-down dynamique E_emit (k1 x V) : L_E + couplage (H1, node_init)
         let mut z_sym = vec![[0.0_f64; DIM]; v];
         let mut u_sym_x = vec![[0.0_f64; DIM]; v];
         for u in 0..v {
@@ -869,7 +1054,7 @@ impl PhisharpModel {
             }
             let proj = mat_vec(self.u_down_10(), &h_mix);
             for d in 0..DIM {
-                z_sym[u][d] = (proj[d] + 0.55_f64 * proj[d] * node_init[u][d]).tanh();
+                z_sym[u][d] = (proj[d] + 0.50_f64 * proj[d] * node_init[u][d]).tanh();
             }
             u_sym_x[u] = mat_vec(self.u_sym(), &node_init[u]);
         }
@@ -877,6 +1062,13 @@ impl PhisharpModel {
         let mut emit = vec![0.0_f64; k1 * v];
         let mut emit_logits = vec![0.0_f64; v];
         for k in 0..k1 {
+            if h1_norms[k] <= 1e-9_f64 {
+                let unif = 1.0_f64 / (v as f64);
+                for u in 0..v {
+                    emit[k * v + u] = unif;
+                }
+                continue;
+            }
             let ek = mat_vec(self.u_emit(), &h1_eff[k]);
             let act_k = h1_norms[k].tanh();
             for u in 0..v {
@@ -884,7 +1076,7 @@ impl PhisharpModel {
                 for d in 0..DIM {
                     target_u[d] = z_sym[u][d] + act_k * u_sym_x[u][d];
                 }
-                emit_logits[u] = dot(&ek, &target_u);
+                emit_logits[u] = state.l_e[k * v + u] + 0.45_f64 * dot(&ek, &target_u);
             }
             softmax_slice(&emit_logits, &mut emit[k * v..(k + 1) * v]);
         }
@@ -894,6 +1086,10 @@ impl PhisharpModel {
         let ge2 = mat_mul(&g2, &emit, k1, k1, v);
         let ge3 = mat_mul(&g3, &emit, k1, k1, v);
 
+        let ag1 = mat_mul(&a_ground, &g_op, v, k1, k1);
+        let ag2 = mat_mul(&a_ground, &g2, v, k1, k1);
+        let ag3 = mat_mul(&a_ground, &g3, v, k1, k1);
+
         let r_hat1 = mat_mul(&a_ground, &ge1, v, k1, v);
         let r_hat2 = mat_mul(&a_ground, &ge2, v, k1, v);
         let r_hat3 = mat_mul(&a_ground, &ge3, v, k1, v);
@@ -902,11 +1098,14 @@ impl PhisharpModel {
             a_ground,
             g_op,
             emit,
+            ge: [ge1, ge2, ge3],
+            ag: [ag1, ag2, ag3],
             r_hat: [r_hat1, r_hat2, r_hat3],
         }
     }
 
-    /// Une étape abductive hiérarchique (réification L0 -> L1 -> L2 + rétroaction L2 -> L1).
+    /// Une étape abductive hiérarchique : co-évolution de (L_A, L_E, L_G, H1, H2)
+    /// à partir du résidu matriciel multi-échelle Δ^(s) = R^(s) - R_hat^(s).
     fn abductive_step(
         &self,
         view: &RelationalView,
@@ -920,20 +1119,26 @@ impl PhisharpModel {
         let k1 = state.h1.len();
         let k2 = state.h2.len();
 
-        let unfold = self.unfold_top_down(&view.node_init, state, cut_vertical);
+        let unfold = self.unfold_top_down(&view.node_init, state, cut_l1, cut_vertical);
         let res_norm = multi_scale_l1(&view.graph, &unfold.r_hat, v);
 
-        // 1. Résidu relationnel multi-échelle au niveau 0 (s'annule quand R_hat == R)
+        // 1. Résidu matriciel multi-échelle Δ^(s) = R^(s) - R_hat^(s)
+        let mut delta = [
+            vec![0.0_f64; v * v],
+            vec![0.0_f64; v * v],
+            vec![0.0_f64; v * v],
+        ];
         let mut delta_obs = vec![[0.0_f64; DIM]; v];
-        for u in 0..v {
-            for s in 0..3 {
-                let sw = SCALE_W[s];
+        for s in 0..3 {
+            let sw = SCALE_W[s];
+            for u in 0..v {
                 if view.graph.w[s][u] <= 0.0_f64 {
                     continue;
                 }
                 let base = u * v;
                 for w in 0..v {
                     let diff = view.graph.r[s][base + w] - unfold.r_hat[s][base + w];
+                    delta[s][base + w] = diff;
                     if diff.abs() > 1e-12_f64 {
                         let c = sw * diff;
                         for d in 0..DIM {
@@ -944,18 +1149,216 @@ impl PhisharpModel {
             }
         }
 
-        let (wa1, ba1, wa2, ba2) = self.gates();
-        // Portes d'intégration pilotées par le résidu (contractent en attracteur stable)
-        let alpha1 = 0.12_f64 + 0.46_f64 * sigmoid(wa1 * res_norm + ba1);
-        let alpha2 = 0.12_f64 + 0.46_f64 * sigmoid(wa2 * res_norm + ba2);
+        // 2. Projections relationnelles du résidu vers L_A, L_E et L_G (100 % non-réciproques)
+        let mut grad_a = vec![0.0_f64; v * k1];
+        let mut grad_e = vec![0.0_f64; k1 * v];
+        let mut grad_g = vec![0.0_f64; k1 * k1];
 
-        // 2. Mise à jour Niveau 1 (bottom-up résiduel + couplage non-réciproque + top-down L2)
+        // Masses d'usage par cause latente pour invariance d'échelle par rapport à V et K1
+        let mut mass_a = [vec![0.0_f64; k1], vec![0.0_f64; k1], vec![0.0_f64; k1]];
+        let mut mass_ag = [vec![0.0_f64; k1], vec![0.0_f64; k1], vec![0.0_f64; k1]];
+        for s in 0..3 {
+            for u in 0..v {
+                let wu = view.graph.w[s][u];
+                if wu <= 0.0_f64 {
+                    continue;
+                }
+                for k in 0..k1 {
+                    mass_a[s][k] += wu * unfold.a_ground[u * k1 + k];
+                    mass_ag[s][k] += wu * unfold.ag[s][u * k1 + k];
+                }
+            }
+        }
+
+        // (a) Flux résiduel sur L_A : Δ^(s) * (G^s E_emit)^T
+        for s in 0..3 {
+            let sw = SCALE_W[s];
+            for u in 0..v {
+                if view.graph.w[s][u] <= 0.0_f64 {
+                    continue;
+                }
+                let u_base = u * v;
+                for k in 0..k1 {
+                    let k_base = k * v;
+                    let mut acc = 0.0_f64;
+                    for w in 0..v {
+                        acc += delta[s][u_base + w] * unfold.ge[s][k_base + w];
+                    }
+                    grad_a[u * k1 + k] += sw * acc;
+                }
+            }
+        }
+
+        // (b) Flux résiduel sur L_E : (A G^s)^T * diag(w^(s)) * Δ^(s) (normalisé par masse)
+        for s in 0..3 {
+            let sw = SCALE_W[s];
+            for k in 0..k1 {
+                let inv_m = sw / (mass_ag[s][k] + 0.02_f64);
+                let k_base = k * v;
+                for u in 0..v {
+                    let wu = view.graph.w[s][u];
+                    if wu <= 0.0_f64 {
+                        continue;
+                    }
+                    let coeff = inv_m * wu * unfold.ag[s][u * k1 + k];
+                    if coeff.abs() <= 1e-12_f64 {
+                        continue;
+                    }
+                    let u_base = u * v;
+                    for w in 0..v {
+                        grad_e[k_base + w] += coeff * delta[s][u_base + w];
+                    }
+                }
+            }
+        }
+
+        // (c) Flux résiduel dans l'espace latent G : projets gauche/droite aux échelles 1..3
+        for s in 0..3 {
+            let sw = SCALE_W[s];
+            // M_delta[u, b] = sum_w Δ^(s)[u, w] * E_emit[b, w]
+            let mut d_emit = vec![0.0_f64; v * k1];
+            for u in 0..v {
+                if view.graph.w[s][u] <= 0.0_f64 {
+                    continue;
+                }
+                let u_base = u * v;
+                for b in 0..k1 {
+                    let b_base = b * v;
+                    let mut acc = 0.0_f64;
+                    for w in 0..v {
+                        acc += delta[s][u_base + w] * unfold.emit[b_base + w];
+                    }
+                    d_emit[u * k1 + b] = acc;
+                }
+            }
+
+            if s == 0 {
+                for a in 0..k1 {
+                    let inv_m = sw / (mass_a[0][a] + 0.02_f64);
+                    for u in 0..v {
+                        let wu = view.graph.w[0][u];
+                        if wu <= 0.0_f64 {
+                            continue;
+                        }
+                        let c = inv_m * wu * unfold.a_ground[u * k1 + a];
+                        for b in 0..k1 {
+                            grad_g[a * k1 + b] += c * d_emit[u * k1 + b];
+                        }
+                    }
+                }
+            } else {
+                // Pour s = 1 (lag 2) et s = 2 (lag 3) : contributions amont (A G^{s-1}) et aval (G^{s-1} E)
+                let left_mat = &unfold.ag[s - 1];
+                let left_mass = &mass_ag[s - 1];
+                let right_mat = &unfold.ge[s - 1];
+
+                let mut d_right = vec![0.0_f64; v * k1];
+                for u in 0..v {
+                    if view.graph.w[s][u] <= 0.0_f64 {
+                        continue;
+                    }
+                    let u_base = u * v;
+                    for b in 0..k1 {
+                        let b_base = b * v;
+                        let mut acc = 0.0_f64;
+                        for w in 0..v {
+                            acc += delta[s][u_base + w] * right_mat[b_base + w];
+                        }
+                        d_right[u * k1 + b] = acc;
+                    }
+                }
+
+                for a in 0..k1 {
+                    let inv_ml = 0.5_f64 * sw / (left_mass[a] + 0.02_f64);
+                    let inv_ma = 0.5_f64 * sw / (mass_a[s][a] + 0.02_f64);
+                    for u in 0..v {
+                        let wu = view.graph.w[s][u];
+                        if wu <= 0.0_f64 {
+                            continue;
+                        }
+                        let cl = inv_ml * wu * left_mat[u * k1 + a];
+                        let ca = inv_ma * wu * unfold.a_ground[u * k1 + a];
+                        for b in 0..k1 {
+                            grad_g[a * k1 + b] += cl * d_emit[u * k1 + b] + ca * d_right[u * k1 + b];
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(mask) = cut_l1 {
+            for a in 0..k1 {
+                let sa = ((mask >> a.min(30)) & 1) != 0;
+                for b in 0..k1 {
+                    let sb = ((mask >> b.min(30)) & 1) != 0;
+                    if sa != sb {
+                        grad_g[a * k1 + b] = 0.0_f64;
+                    }
+                }
+            }
+        }
+
+        // 3. Portes d'intégration pilotées par le résidu (contractent en attracteur stable)
+        let g = self.gates();
+        let alpha1 = 0.14_f64 + 0.46_f64 * sigmoid(g[0] * res_norm + g[1]);
+        let alpha2 = 0.14_f64 + 0.46_f64 * sigmoid(g[2] * res_norm + g[3]);
+        let eta_ae = 0.60_f64 + 3.40_f64 * sigmoid(g[4] * res_norm + g[5]);
+        let eta_g = 0.50_f64 + 3.00_f64 * sigmoid(g[6] * res_norm + g[7]);
+
+        // Mise à jour des liaisons dynamiques L_A, L_E, L_G avec amortissement doux + centrage
+        let mut next_l_a = state.l_a.clone();
+        for u in 0..v {
+            let active = view.graph.w[0][u] > 0.0_f64
+                || view.graph.w[1][u] > 0.0_f64
+                || view.graph.w[2][u] > 0.0_f64;
+            for k in 0..k1 {
+                let idx = u * k1 + k;
+                if active {
+                    next_l_a[idx] = 0.94_f64 * state.l_a[idx] + eta_ae * grad_a[idx];
+                } else {
+                    next_l_a[idx] = 0.94_f64 * state.l_a[idx];
+                }
+            }
+            center_row(&mut next_l_a[u * k1..(u + 1) * k1]);
+        }
+
+        let mut next_l_e = state.l_e.clone();
+        for k in 0..k1 {
+            for w in 0..v {
+                let idx = k * v + w;
+                next_l_e[idx] = 0.94_f64 * state.l_e[idx] + eta_ae * grad_e[idx];
+            }
+            center_row(&mut next_l_e[k * v..(k + 1) * v]);
+        }
+
+        let mut next_l_g = state.l_g.clone();
+        for a in 0..k1 {
+            let sa = cut_l1.map(|m| ((m >> a.min(30)) & 1) != 0);
+            for b in 0..k1 {
+                let idx = a * k1 + b;
+                if let Some(side_a) = sa {
+                    let side_b = ((cut_l1.unwrap() >> b.min(30)) & 1) != 0;
+                    if side_a != side_b {
+                        next_l_g[idx] = 0.0_f64;
+                        continue;
+                    }
+                }
+                next_l_g[idx] = 0.94_f64 * state.l_g[idx] + eta_g * grad_g[idx];
+            }
+            center_row(&mut next_l_g[a * k1..(a + 1) * k1]);
+        }
+
+        // 4. Mise à jour Niveau 1 (résidu latent Δ_G non-réciproque + Δ_obs + W_lat1 + L2->L1)
         let mut next_h1 = vec![[0.0_f64; DIM]; k1];
         let b1 = self.b1();
 
         let mut lat1_msg = vec![[0.0_f64; DIM]; k1];
+        let mut g_out_msg = vec![[0.0_f64; DIM]; k1];
+        let mut g_in_msg = vec![[0.0_f64; DIM]; k1];
         for src in 0..k1 {
             lat1_msg[src] = mat_vec(self.u_lat1(), &state.h1[src]);
+            g_out_msg[src] = mat_vec(self.u_g_out(), &state.h1[src]);
+            g_in_msg[src] = mat_vec(self.u_g_in(), &state.h1[src]);
         }
         let mut down2_msg = vec![[0.0_f64; DIM]; k2];
         for m in 0..k2 {
@@ -967,9 +1370,11 @@ impl PhisharpModel {
         }
 
         for dst in 0..k1 {
+            if vec_norm(&state.h1[dst]) <= 1e-9_f64 {
+                continue;
+            }
             let mut acc = [0.0_f64; DIM];
 
-            // Signal abductif bottom-up pondéré par l'ancrage A[u, dst]
             for u in 0..v {
                 let wu = view.graph.w[0][u];
                 if wu <= 0.0_f64 {
@@ -981,7 +1386,6 @@ impl PhisharpModel {
                 }
             }
 
-            // Couplage latéral non-réciproque W_lat1
             for src in 0..k1 {
                 if let Some(mask) = cut_l1 {
                     let s_dst = ((mask >> dst.min(30)) & 1) != 0;
@@ -991,20 +1395,21 @@ impl PhisharpModel {
                     }
                 }
                 let w = self.w_lat1(dst, src);
-                if w != 0.0_f64 {
-                    for d in 0..DIM {
-                        acc[d] += w * lat1_msg[src][d];
-                    }
+                let dg_out = grad_g[dst * k1 + src];
+                let dg_in = grad_g[src * k1 + dst];
+                for d in 0..DIM {
+                    acc[d] += w * lat1_msg[src][d]
+                        + 1.20_f64 * dg_out * g_out_msg[src][d]
+                        + 1.20_f64 * dg_in * g_in_msg[src][d];
                 }
             }
 
-            // Contrainte verticale descendante L2 -> L1
             if !cut_vertical {
                 for m in 0..k2 {
                     let w = self.w_down_21(dst, m);
                     if w != 0.0_f64 {
                         for d in 0..DIM {
-                            acc[d] += 0.55_f64 * w * down2_msg[m][d];
+                            acc[d] += 0.60_f64 * w * down2_msg[m][d];
                         }
                     }
                 }
@@ -1017,7 +1422,7 @@ impl PhisharpModel {
             rms_norm(&mut next_h1[dst]);
         }
 
-        // 3. Mise à jour Niveau 2 (réification pure de L1 et de son graphe G, zéro accès à L0)
+        // 5. Mise à jour Niveau 2 (réification pure de L1 et de son graphe G, zéro accès à L0)
         let mut next_h2 = vec![[0.0_f64; DIM]; k2];
         let b2 = self.b2();
 
@@ -1032,7 +1437,9 @@ impl PhisharpModel {
             }
             let mut combined = [0.0_f64; DIM];
             for d in 0..DIM {
-                combined[d] = next_h1[k][d] + 0.50_f64 * flow[d] + 0.40_f64 * (next_h1[k][d] - state.h1[k][d]);
+                combined[d] = next_h1[k][d]
+                    + 0.50_f64 * flow[d]
+                    + 0.45_f64 * (next_h1[k][d] - state.h1[k][d]);
             }
             e1_reified[k] = mat_vec(self.u_up_12(), &combined);
         }
@@ -1043,6 +1450,9 @@ impl PhisharpModel {
         }
 
         for dst in 0..k2 {
+            if vec_norm(&state.h2[dst]) <= 1e-9_f64 {
+                continue;
+            }
             let mut acc = [0.0_f64; DIM];
 
             if !cut_vertical {
@@ -1082,10 +1492,19 @@ impl PhisharpModel {
         let mut next_state = HierState {
             h1: next_h1,
             h2: next_h2,
+            l_a: next_l_a,
+            l_e: next_l_e,
+            l_g: next_l_g,
         };
 
-        // 4. Réfutation active conservatrice (teste une contre-hypothèse aux niveaux L1 et L2)
-        if use_refutation && cut_l1.is_none() && cut_l2.is_none() && !cut_vertical && k1 > 0 && k2 > 0 {
+        // 6. Réfutation active conservatrice (teste une contre-hypothèse sur L1, L2 et G)
+        if use_refutation
+            && cut_l1.is_none()
+            && cut_l2.is_none()
+            && !cut_vertical
+            && k1 > 0
+            && k2 > 0
+        {
             let mut peak1 = 0usize;
             let mut best_n1 = -1.0_f64;
             for (k, h) in next_state.h1.iter().enumerate() {
@@ -1108,34 +1527,70 @@ impl PhisharpModel {
             let mut refuted = next_state.clone();
             let p1 = mat_vec(self.u_ref1(), &refuted.h1[peak1]);
             for d in 0..DIM {
-                refuted.h1[peak1][d] -= 0.32_f64 * p1[d].tanh();
+                refuted.h1[peak1][d] -= 0.35_f64 * p1[d].tanh();
             }
             rms_norm(&mut refuted.h1[peak1]);
 
             let p2 = mat_vec(self.u_ref2(), &refuted.h2[peak2]);
             for d in 0..DIM {
-                refuted.h2[peak2][d] -= 0.32_f64 * p2[d].tanh();
+                refuted.h2[peak2][d] -= 0.35_f64 * p2[d].tanh();
             }
             rms_norm(&mut refuted.h2[peak2]);
 
+            // Teste aussi la réfutation de l'arête dominante sortant de peak1 dans L_G
+            let mut dom_b = 0usize;
+            let mut dom_val = f64::NEG_INFINITY;
+            for b in 0..k1 {
+                let val = refuted.l_g[peak1 * k1 + b];
+                if val > dom_val {
+                    dom_val = val;
+                    dom_b = b;
+                }
+            }
+            refuted.l_g[peak1 * k1 + dom_b] -= 0.65_f64;
+            center_row(&mut refuted.l_g[peak1 * k1..(peak1 + 1) * k1]);
+
             let gain_curr = multi_scale_gain(&view.graph, &unfold.r_hat, v);
-            let unfold_base = self.unfold_top_down(&view.node_init, &next_state, false);
+            let unfold_base = self.unfold_top_down(&view.node_init, &next_state, None, false);
             let gain_base = multi_scale_gain(&view.graph, &unfold_base.r_hat, v);
-            let unfold_ref = self.unfold_top_down(&view.node_init, &refuted, false);
+            let unfold_ref = self.unfold_top_down(&view.node_init, &refuted, None, false);
             let gain_ref = multi_scale_gain(&view.graph, &unfold_ref.r_hat, v);
 
             if gain_ref > gain_base {
                 next_state = refuted;
             } else if gain_base >= gain_curr {
-                // Consolide ce qui a résisté à la réfutation
+                // Consolide la composante qui a survécu à la tentative de réfutation
                 for d in 0..DIM {
                     let d1 = next_state.h1[peak1][d] - refuted.h1[peak1][d];
-                    next_state.h1[peak1][d] += 0.12_f64 * d1;
+                    next_state.h1[peak1][d] += 0.14_f64 * d1;
                     let d2 = next_state.h2[peak2][d] - refuted.h2[peak2][d];
-                    next_state.h2[peak2][d] += 0.12_f64 * d2;
+                    next_state.h2[peak2][d] += 0.14_f64 * d2;
                 }
                 rms_norm(&mut next_state.h1[peak1]);
                 rms_norm(&mut next_state.h2[peak2]);
+            } else {
+                // Amortit tout dépassement pour stabiliser l'attracteur aux grands budgets
+                for k in 0..k1 {
+                    for d in 0..DIM {
+                        next_state.h1[k][d] = 0.5_f64 * (state.h1[k][d] + next_state.h1[k][d]);
+                    }
+                    rms_norm(&mut next_state.h1[k]);
+                }
+                for m in 0..k2 {
+                    for d in 0..DIM {
+                        next_state.h2[m][d] = 0.5_f64 * (state.h2[m][d] + next_state.h2[m][d]);
+                    }
+                    rms_norm(&mut next_state.h2[m]);
+                }
+                for i in 0..next_state.l_a.len() {
+                    next_state.l_a[i] = 0.5_f64 * (state.l_a[i] + next_state.l_a[i]);
+                }
+                for i in 0..next_state.l_e.len() {
+                    next_state.l_e[i] = 0.5_f64 * (state.l_e[i] + next_state.l_e[i]);
+                }
+                for i in 0..next_state.l_g.len() {
+                    next_state.l_g[i] = 0.5_f64 * (state.l_g[i] + next_state.l_g[i]);
+                }
             }
         }
 
@@ -1150,7 +1605,7 @@ impl PhisharpModel {
         capture_steps: &[usize],
         record_phi: bool,
     ) -> AbductionTrace {
-        let mut state = HierState::zeros(K1, K2);
+        let mut state = HierState::zeros(view.v_size, K1, K2);
         let mut snapshots = Vec::new();
         let mut phi_history = Vec::new();
 
@@ -1171,7 +1626,7 @@ impl PhisharpModel {
             };
         }
 
-        state = HierState::seeded();
+        state = HierState::seeded(view.v_size);
         for step in 1..=budget {
             state = self.abductive_step(view, &state, use_refutation, None, None, false);
             if capture_steps.contains(&step) {
@@ -1202,11 +1657,11 @@ impl PhisharpModel {
         self.evaluate_phi_state(view, &trace.state, budget, use_refutation)
     }
 
-    /// Substitut V2 de φ_sharp :
-    /// - Générativité, Discrimination, Projection strictement au-dessus des marginales P_marg
+    /// Substitut V2.1 de φ_sharp :
+    /// - G, D, P mesurés strictement au-dessus des marginales P_marg
     /// - Combinaison sans compensation min(G, D, P)
-    /// - MIP exacte hiérarchique (coupes L1, coupes L2, coupe verticale L1<->L2, ablations de nœuds)
-    /// - Stabilité différentielle (réfutation L1+L2 et déplacement) + pénalité de résidu
+    /// - MIP exacte hiérarchique + facteur d'unicité (annule nœuds morts et clones)
+    /// - VERROU ANTI-GOODHART : poids STRICTEMENT NUL sur MIP tant que G, D ou P <= 0
     fn evaluate_phi_state(
         &self,
         view: &RelationalView,
@@ -1228,7 +1683,7 @@ impl PhisharpModel {
             };
         }
 
-        let unfold = self.unfold_top_down(&view.node_init, state, false);
+        let unfold = self.unfold_top_down(&view.node_init, state, None, false);
 
         // 1. Générativité multi-échelle au-dessus de H(P_marg)
         let gen_raw = multi_scale_gain(&view.graph, &unfold.r_hat, v);
@@ -1245,72 +1700,104 @@ impl PhisharpModel {
             0.0_f64
         } else {
             let tr_half = self.run_abduction(&first_half, budget, use_refutation, &[], false);
-            let unfold_half = self.unfold_top_down(&first_half.node_init, &tr_half.state, false);
+            let unfold_half = self.unfold_top_down(&first_half.node_init, &tr_half.state, None, false);
             multi_scale_gain(&second_half.graph, &unfold_half.r_hat, v)
         };
 
-        // 4. Intégration causale exacte (MIP hiérarchique complète)
+        // 4. Intégration causale exacte (MIP hiérarchique + unicité des unités causales)
         let k1 = state.h1.len();
         let k2 = state.h2.len();
         let mip_integration = if budget == 0 || k1 <= 1 || k2 <= 1 {
             0.0_f64
         } else {
-            let full_next = self.abductive_step(view, state, false, None, None, false);
-            let pred_full = self.unfold_top_down(&view.node_init, &full_next, false);
-
-            let mut min_div = f64::INFINITY;
-
-            // (a) Toutes les bipartitions internes de Niveau 1
-            let masks1 = 1u32 << (k1.min(10) - 1);
-            for mask in 1..masks1 {
-                let cut_next = self.abductive_step(view, state, false, Some(mask), None, false);
-                let pred_cut = self.unfold_top_down(&view.node_init, &cut_next, false);
-                let div = multi_scale_pred_tvd(&pred_full.r_hat, &pred_cut.r_hat, &view.graph.w, v);
-                if div < min_div {
-                    min_div = div;
+            // Facteur d'unicité causale : une copie clonée sur L1 ou L2 donne distance = 0 -> MIP = 0
+            let mut min_dist = f64::INFINITY;
+            for a in 0..k1 {
+                for b in (a + 1)..k1 {
+                    let d = vec_dist(&state.h1[a], &state.h1[b]);
+                    if d < min_dist {
+                        min_dist = d;
+                    }
                 }
             }
-
-            // (b) Toutes les bipartitions internes de Niveau 2
-            let masks2 = 1u32 << (k2.min(10) - 1);
-            for mask in 1..masks2 {
-                let cut_next = self.abductive_step(view, state, false, None, Some(mask), false);
-                let pred_cut = self.unfold_top_down(&view.node_init, &cut_next, false);
-                let div = multi_scale_pred_tvd(&pred_full.r_hat, &pred_cut.r_hat, &view.graph.w, v);
-                if div < min_div {
-                    min_div = div;
+            for a in 0..k2 {
+                for b in (a + 1)..k2 {
+                    let d = vec_dist(&state.h2[a], &state.h2[b]);
+                    if d < min_dist {
+                        min_dist = d;
+                    }
                 }
             }
+            let uniq_factor = (min_dist * 3.0_f64).tanh().clamp(0.0_f64, 1.0_f64);
 
-            // (c) Coupe verticale entre Niveau 1 et Niveau 2 (interdit un L2 décoratif)
-            let vcut_next = self.abductive_step(view, state, false, None, None, true);
-            let pred_vcut = self.unfold_top_down(&view.node_init, &vcut_next, true);
-            let vdiv = multi_scale_pred_tvd(&pred_full.r_hat, &pred_vcut.r_hat, &view.graph.w, v);
-            if vdiv < min_div {
-                min_div = vdiv;
-            }
+            if uniq_factor <= 1e-9_f64 {
+                0.0_f64
+            } else {
+                let full_next = self.abductive_step(view, state, false, None, None, false);
+                let pred_full = self.unfold_top_down(&view.node_init, &full_next, None, false);
 
-            // (d) Ablation individuelle de chaque nœud (rejet des branches épiphénoménales)
-            for drop1 in 0..k1 {
-                let mut abl = state.clone();
-                abl.h1[drop1] = [0.0_f64; DIM];
-                let pred_abl = self.unfold_top_down(&view.node_init, &abl, false);
-                let eff = multi_scale_pred_tvd(&unfold.r_hat, &pred_abl.r_hat, &view.graph.w, v);
-                if eff < min_div {
-                    min_div = eff;
+                let mut min_div = f64::INFINITY;
+
+                // (a) Toutes les bipartitions internes de Niveau 1
+                let masks1 = 1u32 << (k1.min(10) - 1);
+                for mask in 1..masks1 {
+                    let cut_next =
+                        self.abductive_step(view, state, false, Some(mask), None, false);
+                    let pred_cut =
+                        self.unfold_top_down(&view.node_init, &cut_next, Some(mask), false);
+                    let div =
+                        multi_scale_pred_tvd(&pred_full.r_hat, &pred_cut.r_hat, &view.graph.w, v);
+                    if div < min_div {
+                        min_div = div;
+                    }
                 }
-            }
-            for drop2 in 0..k2 {
-                let mut abl = state.clone();
-                abl.h2[drop2] = [0.0_f64; DIM];
-                let pred_abl = self.unfold_top_down(&view.node_init, &abl, false);
-                let eff = multi_scale_pred_tvd(&unfold.r_hat, &pred_abl.r_hat, &view.graph.w, v);
-                if eff < min_div {
-                    min_div = eff;
-                }
-            }
 
-            (min_div * 10.0_f64).tanh().clamp(0.0_f64, 1.0_f64)
+                // (b) Toutes les bipartitions internes de Niveau 2
+                let masks2 = 1u32 << (k2.min(10) - 1);
+                for mask in 1..masks2 {
+                    let cut_next =
+                        self.abductive_step(view, state, false, None, Some(mask), false);
+                    let pred_cut = self.unfold_top_down(&view.node_init, &cut_next, None, false);
+                    let div =
+                        multi_scale_pred_tvd(&pred_full.r_hat, &pred_cut.r_hat, &view.graph.w, v);
+                    if div < min_div {
+                        min_div = div;
+                    }
+                }
+
+                // (c) Coupe verticale L1 <-> L2 (interdit un L2 décoratif)
+                let vcut_next = self.abductive_step(view, state, false, None, None, true);
+                let pred_vcut = self.unfold_top_down(&view.node_init, &vcut_next, None, true);
+                let vdiv =
+                    multi_scale_pred_tvd(&pred_full.r_hat, &pred_vcut.r_hat, &view.graph.w, v);
+                if vdiv < min_div {
+                    min_div = vdiv;
+                }
+
+                // (d) Ablation de chaque nœud individuel (annule les branches mortes/épiphénoménales)
+                for drop1 in 0..k1 {
+                    let mut abl = state.clone();
+                    abl.h1[drop1] = [0.0_f64; DIM];
+                    let pred_abl = self.unfold_top_down(&view.node_init, &abl, None, false);
+                    let eff =
+                        multi_scale_pred_tvd(&unfold.r_hat, &pred_abl.r_hat, &view.graph.w, v);
+                    if eff < min_div {
+                        min_div = eff;
+                    }
+                }
+                for drop2 in 0..k2 {
+                    let mut abl = state.clone();
+                    abl.h2[drop2] = [0.0_f64; DIM];
+                    let pred_abl = self.unfold_top_down(&view.node_init, &abl, None, false);
+                    let eff =
+                        multi_scale_pred_tvd(&unfold.r_hat, &pred_abl.r_hat, &view.graph.w, v);
+                    if eff < min_div {
+                        min_div = eff;
+                    }
+                }
+
+                ((min_div * 10.0_f64).tanh().clamp(0.0_f64, 1.0_f64)) * uniq_factor
+            }
         };
 
         // 5. Stabilité différentielle (réfutation partielle L1+L2 + déplacement central)
@@ -1322,7 +1809,7 @@ impl PhisharpModel {
                 ref_state.h1[0][d] *= 0.72_f64;
                 ref_state.h2[0][d] *= 0.72_f64;
             }
-            let pred_ref = self.unfold_top_down(&view.node_init, &ref_state, false);
+            let pred_ref = self.unfold_top_down(&view.node_init, &ref_state, None, false);
             let g_ref = multi_scale_gain(&view.graph, &pred_ref.r_hat, v);
             let ref_stab = (g_ref / gen_raw).clamp(0.0_f64, 1.0_f64);
 
@@ -1347,12 +1834,14 @@ impl PhisharpModel {
         let phi_sharp =
             base_min * (mip_integration * diff_stability).sqrt() * (1.0_f64 - 0.5_f64 * residual_norm);
 
-        let shaping_score = if phi_sharp > 0.0_f64 {
-            phi_sharp + 0.08_f64 * (g_c + d_c + p_c) / 3.0_f64
+        // VERROU ANTI-GOODHART STRICT :
+        // Zéro récompense sur MIP ou diff_stability tant que G, D et P ne battent pas tous P_marg.
+        let shaping_score = if gen_raw > 0.0_f64 && disc_raw > 0.0_f64 && proj_raw > 0.0_f64 {
+            phi_sharp + 0.05_f64 * base_min
         } else {
-            0.25_f64 * (0.40_f64 * gen_raw + 0.30_f64 * disc_raw + 0.30_f64 * proj_raw)
-                + 0.05_f64 * mip_integration
-                - 0.05_f64 * residual_norm
+            let min_raw = gen_raw.min(disc_raw).min(proj_raw);
+            0.55_f64 * min_raw + 0.25_f64 * (gen_raw + disc_raw + proj_raw) / 3.0_f64
+                - 0.10_f64 * residual_norm
         };
 
         PhiReport {
@@ -1367,7 +1856,7 @@ impl PhisharpModel {
         }
     }
 
-    /// Canal `ask` pur : déploiement vertical depuis l'opérateur latent G (sans autorégression)
+    /// Canal `ask` pur : déploiement vertical depuis l'opérateur latent G (sans autorégression),
     /// sélectionné par clôture de résidu auto-référentielle : max [φ_sharp(E + ΔE) - φ_sharp(E)] - λ·Écho.
     fn ask_emit(&self, view: &RelationalView, budget: usize, out_len: usize) -> Vec<u8> {
         if view.vocab.is_empty() || view.seq.is_empty() {
@@ -1375,12 +1864,11 @@ impl PhisharpModel {
         }
         let v = view.v_size;
         let trace = self.run_abduction(view, budget, true, &[], false);
-        let unfold = self.unfold_top_down(&view.node_init, &trace.state, false);
+        let unfold = self.unfold_top_down(&view.node_init, &trace.state, None, false);
         let phi_base = self
             .evaluate_phi_state(view, &trace.state, budget, true)
             .phi_sharp;
 
-        // Identifie les symboles présentant le plus fort résidu multi-échelle dans E
         let mut node_res: Vec<(usize, f64)> = (0..v)
             .filter(|&u| view.graph.w[0][u] > 0.0_f64)
             .map(|u| {
@@ -1397,7 +1885,6 @@ impl PhisharpModel {
             .collect();
         node_res.sort_by(|a, b| b.1.total_cmp(&a.1));
 
-        // 4-grammes présents dans E (en indices de vocabulaire => 100 % invariant par bijection)
         let mut e_4grams: HashSet<[usize; 4]> = HashSet::new();
         for w in view.seq.windows(4) {
             e_4grams.insert([w[0], w[1], w[2], w[3]]);
@@ -1416,7 +1903,6 @@ impl PhisharpModel {
                 0
             };
 
-            // Déploiement strictement dans l'espace latent G, puis projection verticale E_emit
             let mut lat_dist = vec![0.0_f64; k1];
             for k in 0..k1 {
                 lat_dist[k] = unfold.a_ground[anchor * k1 + k];
@@ -1430,7 +1916,6 @@ impl PhisharpModel {
             sym_visits[anchor] = 1;
 
             for _ in 1..out_len {
-                // Avance de l'état dans l'espace causal latent : p_{t+1} = p_t * G
                 let mut next_lat = vec![0.0_f64; k1];
                 for src in 0..k1 {
                     let ps = lat_dist[src];
@@ -1439,7 +1924,8 @@ impl PhisharpModel {
                     }
                     for dst in 0..k1 {
                         let vis = *edge_visits.get(&(src, dst)).unwrap_or(&0) as f64;
-                        next_lat[dst] += ps * unfold.g_op[src * k1 + dst] / (1.0_f64 + 0.6_f64 * vis);
+                        next_lat[dst] +=
+                            ps * unfold.g_op[src * k1 + dst] / (1.0_f64 + 0.6_f64 * vis);
                     }
                 }
                 let sum_l: f64 = next_lat.iter().sum();
@@ -1449,7 +1935,6 @@ impl PhisharpModel {
                     }
                 }
 
-                // Trouve l'arête latente dominante pour amortir les cycles courts
                 let src_peak = lat_dist
                     .iter()
                     .enumerate()
@@ -1466,7 +1951,6 @@ impl PhisharpModel {
 
                 lat_dist = next_lat;
 
-                // Projection top-down pure : p_sym = lat_dist * E_emit
                 let mut best_sym = 0usize;
                 let mut best_p = f64::NEG_INFINITY;
                 for u in 0..v {
@@ -1484,7 +1968,6 @@ impl PhisharpModel {
                 cand_idx.push(best_sym);
             }
 
-            // Évaluation auto-référentielle : φ_sharp(E ⊕ ΔE) - φ_sharp(E) - λ * Echo
             let mut extended_seq = view.seq.clone();
             extended_seq.extend_from_slice(&cand_idx);
             let ext_view = RelationalView::from_indexed(view.vocab.clone(), extended_seq);
@@ -1515,7 +1998,7 @@ impl PhisharpModel {
 }
 
 // ============================================================================
-// 5. Métriques d'information, baselines (LL, MDL), équivalence C, corrélations
+// 5. Métriques d'information, baselines (LL, MDL), récupération excédentaire C
 // ============================================================================
 
 fn scale_gain(target: &[f64], pred: &[f64], row_w: &[f64], h_marg: f64, v: usize) -> f64 {
@@ -1632,7 +2115,13 @@ fn log_likelihood_graph(graph: &ScaleGraph, r_hat: &[Vec<f64>; 3], v: usize) -> 
     ll
 }
 
-fn mdl_graph(graph: &ScaleGraph, r_hat: &[Vec<f64>; 3], state: &HierState, seq_len: usize, v: usize) -> f64 {
+fn mdl_graph(
+    graph: &ScaleGraph,
+    r_hat: &[Vec<f64>; 3],
+    state: &HierState,
+    seq_len: usize,
+    v: usize,
+) -> f64 {
     let ll = log_likelihood_graph(graph, r_hat, v);
     let mut energy = 0.0_f64;
     for h in state.h1.iter().chain(state.h2.iter()) {
@@ -1646,9 +2135,10 @@ fn mdl_graph(graph: &ScaleGraph, r_hat: &[Vec<f64>; 3], state: &HierState, seq_l
     ll - 0.02_f64 * energy * n.ln() / n
 }
 
-/// Équivalence observationnelle multi-échelle avec la vraie cause cachée C
-/// (mesure directe de récupération de la structure conditionnelle de C au-delà du hasard).
-fn observational_equivalence_c(
+/// Étalonnage corrigé : mesure EXCLUSIVEMENT la récupération excédentaire normalisée
+/// de la structure conditionnelle de C au-dessus des marginales P_marg.
+/// Un prédicteur marginal obtient 0.0 et un prédicteur uniforme <= 0.0 quelle que soit V.
+fn observational_equivalence_excess(
     view: &RelationalView,
     r_hat: &[Vec<f64>; 3],
     truth: &MultiScaleGroundTruth,
@@ -1658,7 +2148,7 @@ fn observational_equivalence_c(
     let mut total = 0.0_f64;
 
     for s in 0..3 {
-        let mut sim_sum = 0.0_f64;
+        let mut rec_sum = 0.0_f64;
         let mut w_sum = 0.0_f64;
         for u in 0..v {
             let wu = view.graph.w[s][u];
@@ -1667,26 +2157,26 @@ fn observational_equivalence_c(
             }
             let bu = view.vocab[u];
             let mut c_mass = 0.0_f64;
-            let mut tvd = 0.0_f64;
+            let mut tvd_pred = 0.0_f64;
             let mut tvd_marg = 0.0_f64;
 
             for w in 0..v {
                 let bw = view.vocab[w];
                 let pt = *maps[s].get(&(bu, bw)).unwrap_or(&0.0_f64);
                 c_mass += pt;
-                tvd += (pt - r_hat[s][u * v + w]).abs();
+                tvd_pred += (pt - r_hat[s][u * v + w]).abs();
                 tvd_marg += (pt - view.p_marg[w]).abs();
             }
             if c_mass > 0.5_f64 {
-                // Récupération de la structure causale de C au-delà des marginales
-                let excess_recovery = (0.5_f64 * (tvd_marg - tvd)).clamp(-1.0_f64, 1.0_f64);
-                let direct_sim = (1.0_f64 - 0.5_f64 * tvd).clamp(0.0_f64, 1.0_f64);
-                sim_sum += wu * (0.5_f64 * direct_sim + 0.5_f64 * excess_recovery);
+                let tvd_p = 0.5_f64 * tvd_pred;
+                let tvd_m = 0.5_f64 * tvd_marg;
+                let excess = ((tvd_m - tvd_p) / (tvd_m + 0.05_f64)).clamp(-1.0_f64, 1.0_f64);
+                rec_sum += wu * excess;
                 w_sum += wu;
             }
         }
         if w_sum > 0.0_f64 {
-            total += SCALE_W[s] * (sim_sum / w_sum);
+            total += SCALE_W[s] * (rec_sum / w_sum);
         }
     }
     total
@@ -1747,7 +2237,7 @@ fn train_closed(out_path: &Path, steps: usize, seed: u64) {
     let mut rng = Rng::new(seed);
     let mut model = PhisharpModel::new_random(&mut rng);
 
-    let pop_pairs = 16usize; // 32 évaluations antithétiques par étape
+    let pop_pairs = 16usize;
     let sigma: f64 = 0.075;
     let lr: f64 = 0.055;
     let batch_size = 6usize;
@@ -1758,13 +2248,13 @@ fn train_closed(out_path: &Path, steps: usize, seed: u64) {
     let beta2: f64 = 0.999;
 
     println!(
-        "=== ENTRAÎNEMENT FERMÉ PHISHARP V2 (PTGRS générique + top-down hiérarchique, {} params) ===",
+        "=== ENTRAÎNEMENT FERMÉ PHISHARP V2.1 (PTGRS générique + A/E/G dynamiques, {} params) ===",
         PARAM_COUNT
     );
 
     for step in 1..=steps {
         let t_budget = 3 + rng.range_usize(5); // T dans 3..=7
-        let t_next = t_budget + 2; // Contrainte d'attracteur jusqu'à T+2 (jusqu'à 9)
+        let t_next = t_budget + 2;
 
         let mut batch_views = Vec::with_capacity(batch_size);
         for _ in 0..batch_size {
@@ -1884,24 +2374,25 @@ fn train_closed(out_path: &Path, steps: usize, seed: u64) {
         }
     }
 
-    model.save(out_path).expect("Échec écriture modèle V2");
-    println!("Modèle V2 figé sauvegardé : {}", out_path.display());
+    model.save(out_path).expect("Échec écriture modèle V2.1");
+    println!("Modèle V2.1 figé sauvegardé : {}", out_path.display());
 }
 
 // ============================================================================
-// 7. Porte d'étalonnage V2 (C connue après coup + 6 témoins négatifs)
+// 7. Porte d'étalonnage V2.1 (récupération excédentaire C + 6 témoins négatifs)
 // ============================================================================
 
 fn run_calibration(model: &PhisharpModel, seed: u64) {
     let mut rng = Rng::new(seed);
     let mut eval_rng = Rng::new(seed ^ 0x55AA_CC33);
-    println!("=== PORTE D'ÉTALONNAGE V2 (PTGRS générique, C connue après coup) ===");
+    println!("=== PORTE D'ÉTALONNAGE V2.1 (PTGRS générique, récupération excédentaire C) ===");
 
     let mut eq_scores = Vec::new();
     let mut phi_scores = Vec::new();
     let mut ll_scores = Vec::new();
     let mut mdl_scores = Vec::new();
 
+    // 1. Inter-causes (36 essais variant V, profondeur, longueur et budget)
     for trial in 0..36 {
         let cause = PtgrsCause::sample_generic(&mut rng);
         let depth = 3 + (trial % 3);
@@ -1925,11 +2416,17 @@ fn run_calibration(model: &PhisharpModel, seed: u64) {
         let use_ref = (trial % 4) != 1;
         let trace = model.run_abduction(&view, budget, use_ref, &[], false);
         let rep = model.evaluate_phi_state(&view, &trace.state, budget, use_ref);
-        let unfold = model.unfold_top_down(&view.node_init, &trace.state, false);
+        let unfold = model.unfold_top_down(&view.node_init, &trace.state, None, false);
 
-        let eq = observational_equivalence_c(&view, &unfold.r_hat, &truth);
+        let eq = observational_equivalence_excess(&view, &unfold.r_hat, &truth);
         let ll = log_likelihood_graph(&view.graph, &unfold.r_hat, view.v_size);
-        let mdl = mdl_graph(&view.graph, &unfold.r_hat, &trace.state, view.seq.len(), view.v_size);
+        let mdl = mdl_graph(
+            &view.graph,
+            &unfold.r_hat,
+            &trace.state,
+            view.seq.len(),
+            view.v_size,
+        );
 
         eq_scores.push(eq);
         phi_scores.push(rep.phi_sharp);
@@ -1946,16 +2443,57 @@ fn run_calibration(model: &PhisharpModel, seed: u64) {
     let s_mdl = spearman_corr(&mdl_scores, &eq_scores);
 
     let mean_phi = phi_scores.iter().sum::<f64>() / (phi_scores.len() as f64);
+    let mean_eq = eq_scores.iter().sum::<f64>() / (eq_scores.len() as f64);
+
+    // 2. Intra-cause (suivi pur de la trajectoire t = 0,1,2,4,6,8 sur 12 causes fixes)
+    let traj_budgets = [0usize, 1, 2, 4, 6, 8];
+    let mut within_r_phi = 0.0_f64;
+    let mut within_r_ll = 0.0_f64;
+    let mut within_r_mdl = 0.0_f64;
+    for _ in 0..12 {
+        let cause = PtgrsCause::sample_generic(&mut rng);
+        let bytes = cause.emit_effect(&mut rng, 4, 160);
+        let view = RelationalView::from_bytes(&bytes);
+        let truth = cause.ground_truth_multi_scale(&mut eval_rng, 4);
+
+        let tr = model.run_abduction(&view, 8, true, &traj_budgets, false);
+        let mut eqs = Vec::with_capacity(traj_budgets.len());
+        let mut phis = Vec::with_capacity(traj_budgets.len());
+        let mut lls = Vec::with_capacity(traj_budgets.len());
+        let mut mdls = Vec::with_capacity(traj_budgets.len());
+
+        for (b, st) in &tr.snapshots {
+            let rep = model.evaluate_phi_state(&view, st, *b, true);
+            let unf = model.unfold_top_down(&view.node_init, st, None, false);
+            eqs.push(observational_equivalence_excess(&view, &unf.r_hat, &truth));
+            phis.push(rep.phi_sharp);
+            lls.push(log_likelihood_graph(&view.graph, &unf.r_hat, view.v_size));
+            mdls.push(mdl_graph(&view.graph, &unf.r_hat, st, view.seq.len(), view.v_size));
+        }
+        within_r_phi += pearson_corr(&phis, &eqs);
+        within_r_ll += pearson_corr(&lls, &eqs);
+        within_r_mdl += pearson_corr(&mdls, &eqs);
+    }
+    within_r_phi /= 12.0_f64;
+    within_r_ll /= 12.0_f64;
+    within_r_mdl /= 12.0_f64;
 
     println!(
-        "Pearson  vs équiv. multi-échelle(C) : φ_sharp={:+.4} | Vraisemblance={:+.4} | MDL={:+.4}",
+        "Inter-causes Pearson  vs Rec_exc(C) : φ_sharp={:+.4} | Vraisemblance={:+.4} | MDL={:+.4}",
         r_phi, r_ll, r_mdl
     );
     println!(
-        "Spearman vs équiv. multi-échelle(C) : φ_sharp={:+.4} | Vraisemblance={:+.4} | MDL={:+.4}",
+        "Inter-causes Spearman vs Rec_exc(C) : φ_sharp={:+.4} | Vraisemblance={:+.4} | MDL={:+.4}",
         s_phi, s_ll, s_mdl
     );
-    println!("φ_sharp moyen sur PTGRS (t=0..8)    : {:.4}", mean_phi);
+    println!(
+        "Intra-cause  Pearson  (t=0..8, 12x) : φ_sharp={:+.4} | Vraisemblance={:+.4} | MDL={:+.4}",
+        within_r_phi, within_r_ll, within_r_mdl
+    );
+    println!(
+        "Moyennes PTGRS (t=0..8)             : φ_sharp={:.4} | Rec_exc(C)={:+.4}",
+        mean_phi, mean_eq
+    );
 
     // Témoin 1 : octets aléatoires uniformes (10x)
     let mut rand_phi = 0.0_f64;
@@ -1966,17 +2504,17 @@ fn run_calibration(model: &PhisharpModel, seed: u64) {
     }
     rand_phi /= 10.0_f64;
 
-    // Témoin 2 : H := E (aucune intégration latente : h1 = [], h2 = [] => MIP = 0)
+    // Témoin 2 : H := E (aucune intégration latente : k1 = 0, k2 = 0 => MIP = 0)
     let cause_ref = PtgrsCause::sample_generic(&mut rng);
     let bytes_ref = cause_ref.emit_effect(&mut rng, 4, 160);
     let view_ref = RelationalView::from_bytes(&bytes_ref);
-    let empty_state = HierState::zeros(0, 0);
+    let empty_state = HierState::zeros(view_ref.v_size, 0, 0);
     let h_eq_e_phi = model
         .evaluate_phi_state(&view_ref, &empty_state, DEFAULT_BUDGET, true)
         .phi_sharp;
 
     // Témoin 3 : cause sur-générale (état latent nul => prédiction uniforme, D = 0)
-    let zero_state = HierState::zeros(K1, K2);
+    let zero_state = HierState::zeros(view_ref.v_size, K1, K2);
     let overgen_phi = model
         .evaluate_phi_state(&view_ref, &zero_state, DEFAULT_BUDGET, true)
         .phi_sharp;
@@ -1997,26 +2535,23 @@ fn run_calibration(model: &PhisharpModel, seed: u64) {
     }
     let perm_mean = perm_sum / 10.0_f64;
 
-    // Témoin 5 : branches épiphénoménales (morte ET clone sur L1 et sur L2)
+    // Témoin 5 : branches épiphénoménales (nœud mort L1, clone L1, clone L2)
     let trace_ref = model.run_abduction(&view_ref, DEFAULT_BUDGET, true, &[], false);
     let phi_clean = model
         .evaluate_phi_state(&view_ref, &trace_ref.state, DEFAULT_BUDGET, true)
         .phi_sharp;
 
-    let mut l1_dead = trace_ref.state.clone();
-    l1_dead.h1.push([0.0_f64; DIM]);
+    let l1_dead = trace_ref.state.with_dead_l1_node(view_ref.v_size);
     let phi_l1_dead = model
         .evaluate_phi_state(&view_ref, &l1_dead, DEFAULT_BUDGET, true)
         .phi_sharp;
 
-    let mut l1_clone = trace_ref.state.clone();
-    l1_clone.h1.push(trace_ref.state.h1[0]);
+    let l1_clone = trace_ref.state.with_cloned_l1_node(view_ref.v_size, 0);
     let phi_l1_clone = model
         .evaluate_phi_state(&view_ref, &l1_clone, DEFAULT_BUDGET, true)
         .phi_sharp;
 
-    let mut l2_clone = trace_ref.state.clone();
-    l2_clone.h2.push(trace_ref.state.h2[0]);
+    let l2_clone = trace_ref.state.with_cloned_l2_node(0);
     let phi_l2_clone = model
         .evaluate_phi_state(&view_ref, &l2_clone, DEFAULT_BUDGET, true)
         .phi_sharp;
@@ -2062,25 +2597,30 @@ fn run_calibration(model: &PhisharpModel, seed: u64) {
         max_phi_diff, ask_exact
     );
 
-    let pass_corr = (r_phi > r_ll && r_phi > r_mdl && r_phi > 0.35_f64)
-        || (s_phi > s_ll && s_phi > s_mdl && s_phi > 0.40_f64 && r_phi > 0.30_f64);
-    let pass_neg = rand_phi < 0.03_f64
+    let signal_alive = mean_phi > 0.03_f64 && phi_clean > 0.03_f64;
+    let pass_corr = signal_alive
+        && ((r_phi > r_ll && r_phi > r_mdl && r_phi > 0.40_f64)
+            || (s_phi > s_ll && s_phi > s_mdl && s_phi > 0.45_f64 && r_phi > 0.35_f64));
+    let pass_neg = signal_alive
+        && rand_phi < 0.03_f64
         && h_eq_e_phi < 1e-9_f64
         && overgen_phi < 0.02_f64
         && perm_mean < 0.03_f64
         && perm_max < 0.08_f64
-        && phi_l1_dead <= phi_clean + 1e-9_f64
-        && phi_l1_clone <= phi_clean + 1e-9_f64
-        && phi_l2_clone <= phi_clean + 1e-9_f64;
+        && phi_l1_dead < 1e-9_f64
+        && phi_l1_clone < 1e-9_f64
+        && phi_l2_clone < 1e-9_f64;
     let pass_inv = max_phi_diff < 1e-9_f64 && ask_exact;
 
-    println!("--- VERDICT ÉTALONNAGE V2 ---");
+    println!("--- VERDICT ÉTALONNAGE V2.1 ---");
     if pass_corr && pass_neg && pass_inv {
-        println!("PASS : A est lisible. Passage au barreau 1 (OOD) et à la rupture de générateur autorisé.");
+        println!(
+            "PASS : A est lisible. Passage au barreau 1 (OOD) et à la rupture de générateur autorisé."
+        );
     } else {
         println!(
-            "ARRÊT : Étalonnage échoué (corr_ok={}, neg_ok={}, inv_ok={}). A non lisible.",
-            pass_corr, pass_neg, pass_inv
+            "ARRÊT : Étalonnage échoué (alive={}, corr_ok={}, neg_ok={}, inv_ok={}). A non lisible.",
+            signal_alive, pass_corr, pass_neg, pass_inv
         );
     }
 }
@@ -2091,7 +2631,7 @@ fn run_calibration(model: &PhisharpModel, seed: u64) {
 
 fn run_eval_ood(model: &PhisharpModel, seed: u64) {
     let mut rng = Rng::new(seed);
-    println!("=== ÉVALUATION BARREAU 1 V2 (PTGRS OOD : profondeurs d=2, 4, 8) ===");
+    println!("=== ÉVALUATION BARREAU 1 V2.1 (PTGRS OOD : profondeurs d=2, 4, 8) ===");
 
     let max_t = 10usize;
     let all_snaps: Vec<usize> = (0..=max_t).collect();
@@ -2134,7 +2674,6 @@ fn run_eval_ood(model: &PhisharpModel, seed: u64) {
         );
     }
 
-    // Test du résidu : vrai complément vs complément étranger C' vs simple écho de E
     println!("--- Test du résidu (vrai complément vs étranger C' vs écho) ---");
     let mut gain_true = 0.0_f64;
     let mut gain_foreign = 0.0_f64;
@@ -2185,14 +2724,11 @@ fn run_eval_ood(model: &PhisharpModel, seed: u64) {
 }
 
 // ============================================================================
-// 9. Test de RUPTURE DE GÉNÉRATEUR (hors-PTGRS : Automates Cellulaires & Algo)
-//    Valide le transfert pur de l'opérateur « abduire » hors de sa classe.
+// 9. Test de RUPTURE DE GÉNÉRATEUR (hors-PTGRS : CA 1D & séquences algorithmiques)
 // ============================================================================
 
-/// Génère une trace d'automate cellulaire 1D (règle de Wolfram 0..255) sérialisée
-/// par blocs spatiaux de 3 cellules (alphabet de 8 symboles).
 fn gen_elementary_ca(rule: u8, seed: u64, target_len: usize) -> Vec<u8> {
-    let width = 12usize; // 4 blocs de 3 bits par génération
+    let width = 12usize;
     let mut cells = vec![0u8; width];
     let mut rng = Rng::new(seed);
     for c in &mut cells {
@@ -2202,7 +2738,6 @@ fn gen_elementary_ca(rule: u8, seed: u64, target_len: usize) -> Vec<u8> {
         cells[width / 2] = 1;
     }
 
-    // Chauffe courte pour entrer sur l'attracteur de l'automate
     for _ in 0..6 {
         let mut next = vec![0u8; width];
         for i in 0..width {
@@ -2235,7 +2770,6 @@ fn gen_elementary_ca(rule: u8, seed: u64, target_len: usize) -> Vec<u8> {
     out
 }
 
-/// Fibonacci modulaire (récurrence arithmétique d'ordre 2, totalement hors PTGRS).
 fn gen_fibonacci_mod(modulus: u8, seed: u64, target_len: usize) -> Vec<u8> {
     let mut rng = Rng::new(seed);
     let mut a = (1 + (rng.next_u64() as u8) % (modulus - 1)) % modulus;
@@ -2250,7 +2784,6 @@ fn gen_fibonacci_mod(modulus: u8, seed: u64, target_len: usize) -> Vec<u8> {
     out
 }
 
-/// Traces dynamiques de Collatz (résidus mod 8 le long de trajectoires enchaînées).
 fn gen_collatz_trace(seed: u64, target_len: usize) -> Vec<u8> {
     let mut rng = Rng::new(seed);
     let mut n = 27u64 + (rng.next_u64() % 500);
@@ -2268,7 +2801,6 @@ fn gen_collatz_trace(seed: u64, target_len: usize) -> Vec<u8> {
     out
 }
 
-/// Suite de Thue-Morse (non périodique, purement algorithmique) par blocs de 3 bits.
 fn gen_thue_morse_blocks(offset: u64, target_len: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(target_len);
     for i in 0..target_len {
@@ -2281,17 +2813,16 @@ fn gen_thue_morse_blocks(offset: u64, target_len: usize) -> Vec<u8> {
     out
 }
 
-/// Trames structurées de protocole / log : [delim, champ, (compteur + champ) % 5, checksum % 5].
 fn gen_structured_frames(seed: u64, target_len: usize) -> Vec<u8> {
     let mut rng = Rng::new(seed);
     let mut counter = (rng.next_u64() % 5) as u8;
     let mut out = Vec::with_capacity(target_len + 4);
     while out.len() < target_len {
-        let field = (counter % 3) + 1; // champs 1..3
-        let val = (counter + field) % 5; // valeurs 0..4
+        let field = (counter % 3) + 1;
+        let val = (counter + field) % 5;
         let chk = (field + val + 2) % 5;
-        out.push(9u8); // délimiteur de trame
-        out.push(5u8 + field); // identifiant de champ (6..8)
+        out.push(9u8);
+        out.push(5u8 + field);
         out.push(val);
         out.push(chk);
         counter = (counter + 1) % 5;
@@ -2302,7 +2833,7 @@ fn gen_structured_frames(seed: u64, target_len: usize) -> Vec<u8> {
 
 fn run_eval_transfer(model: &PhisharpModel, seed: u64) {
     let mut rng = Rng::new(seed);
-    println!("=== TEST DE RUPTURE DE GÉNÉRATEUR V2 (HORS-PTGRS : CA 1D & ALGORITHMIQUE) ===");
+    println!("=== TEST DE RUPTURE DE GÉNÉRATEUR V2.1 (HORS-PTGRS : CA 1D & ALGORITHMIQUE) ===");
     println!(
         "{:<24} | {:>7} | {:>7} | {:>5} {:>5} {:>5} {:>5} | {:>7} | {:>6}",
         "Générateur hors-PTGRS", "φ_réel", "φ_perm", "G", "D", "P", "MIP", "no_ref", "t10/t6"
@@ -2390,7 +2921,7 @@ fn run_eval_transfer(model: &PhisharpModel, seed: u64) {
 }
 
 // ============================================================================
-// 10. Interface CLI stricte (`ask --model out/sharp_v2.phis --file perceived.eff`)
+// 10. Interface CLI stricte (`ask --model out/sharp_v21.phis --file perceived.eff`)
 // ============================================================================
 
 fn get_arg(args: &[String], flag: &str) -> Option<String> {
@@ -2401,17 +2932,18 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         eprintln!("Usage:");
-        eprintln!("  phisharp train         --out out/sharp_v2.phis [--steps 300] [--seed 42]");
-        eprintln!("  phisharp calibrate     --model out/sharp_v2.phis [--seed 101]");
-        eprintln!("  phisharp eval-ood      --model out/sharp_v2.phis [--seed 202]");
-        eprintln!("  phisharp eval-transfer --model out/sharp_v2.phis [--seed 303]");
-        eprintln!("  phisharp ask           --model out/sharp_v2.phis --file perceived.eff");
+        eprintln!("  phisharp train         --out out/sharp_v21.phis [--steps 300] [--seed 42]");
+        eprintln!("  phisharp calibrate     --model out/sharp_v21.phis [--seed 101]");
+        eprintln!("  phisharp eval-ood      --model out/sharp_v21.phis [--seed 202]");
+        eprintln!("  phisharp eval-transfer --model out/sharp_v21.phis [--seed 303]");
+        eprintln!("  phisharp ask           --model out/sharp_v21.phis --file perceived.eff");
         std::process::exit(1);
     }
 
     match args[1].as_str() {
         "train" => {
-            let out = get_arg(&args, "--out").unwrap_or_else(|| "out/sharp_v2.phis".to_string());
+            let out =
+                get_arg(&args, "--out").unwrap_or_else(|| "out/sharp_v21.phis".to_string());
             let steps: usize = get_arg(&args, "--steps")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(300);
@@ -2422,35 +2954,35 @@ fn main() {
         }
         "calibrate" => {
             let model_path =
-                get_arg(&args, "--model").unwrap_or_else(|| "out/sharp_v2.phis".to_string());
+                get_arg(&args, "--model").unwrap_or_else(|| "out/sharp_v21.phis".to_string());
             let seed: u64 = get_arg(&args, "--seed")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(101);
-            let model = PhisharpModel::load(Path::new(&model_path)).expect("Chargement modèle V2");
+            let model = PhisharpModel::load(Path::new(&model_path)).expect("Chargement modèle V2.1");
             run_calibration(&model, seed);
         }
         "eval-ood" => {
             let model_path =
-                get_arg(&args, "--model").unwrap_or_else(|| "out/sharp_v2.phis".to_string());
+                get_arg(&args, "--model").unwrap_or_else(|| "out/sharp_v21.phis".to_string());
             let seed: u64 = get_arg(&args, "--seed")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(202);
-            let model = PhisharpModel::load(Path::new(&model_path)).expect("Chargement modèle V2");
+            let model = PhisharpModel::load(Path::new(&model_path)).expect("Chargement modèle V2.1");
             run_eval_ood(&model, seed);
         }
         "eval-transfer" => {
             let model_path =
-                get_arg(&args, "--model").unwrap_or_else(|| "out/sharp_v2.phis".to_string());
+                get_arg(&args, "--model").unwrap_or_else(|| "out/sharp_v21.phis".to_string());
             let seed: u64 = get_arg(&args, "--seed")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(303);
-            let model = PhisharpModel::load(Path::new(&model_path)).expect("Chargement modèle V2");
+            let model = PhisharpModel::load(Path::new(&model_path)).expect("Chargement modèle V2.1");
             run_eval_transfer(&model, seed);
         }
         "ask" => {
             let model_path = get_arg(&args, "--model").expect("--model requis");
             let file_path = get_arg(&args, "--file").expect("--file requis");
-            let model = PhisharpModel::load(Path::new(&model_path)).expect("Chargement modèle V2");
+            let model = PhisharpModel::load(Path::new(&model_path)).expect("Chargement modèle V2.1");
             let raw = fs::read(&file_path).expect("Lecture perceived.eff");
             let view = RelationalView::from_bytes(&raw);
             let out_bytes = model.ask_emit(&view, DEFAULT_BUDGET + 2, 48);
