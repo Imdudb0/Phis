@@ -1,10 +1,18 @@
-[1m[33mwarning[0m[1m: field `dst_idx` is never read[0m
+[1m[33mwarning[0m[1m: fields `dst_idx`, `cross_err`, `cos_sim`, and `byte_overlap` are never read[0m
   [1m[94m--> [0msrc/phi.rs:62:9
    [1m[94m|[0m
 [1m[94m61[0m [1m[94m|[0m pub struct ProjectionMatch {
-   [1m[94m|[0m            [1m[94m---------------[0m [1m[94mfield in this struct[0m
+   [1m[94m|[0m            [1m[94m---------------[0m [1m[94mfields in this struct[0m
 [1m[94m62[0m [1m[94m|[0m     pub dst_idx: usize,
    [1m[94m|[0m         [1m[33m^^^^^^^[0m
+[1m[94m63[0m [1m[94m|[0m     pub score: f32,
+[1m[94m64[0m [1m[94m|[0m     pub cross_err: f32,
+   [1m[94m|[0m         [1m[33m^^^^^^^^^[0m
+[1m[94m65[0m [1m[94m|[0m     pub cos_sim: f32,
+   [1m[94m|[0m         [1m[33m^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m69[0m [1m[94m|[0m     pub byte_overlap: f32,
+   [1m[94m|[0m         [1m[33m^^^^^^^^^^^^[0m
    [1m[94m|[0m
    [1m[94m= [0m[1mnote[0m: `ProjectionMatch` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
    [1m[94m= [0m[1mnote[0m: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
@@ -24,38 +32,44 @@
 
 [1m[33mwarning[0m: `phisharp` (bin "phisharp") generated 2 warnings
 [1m[92m    Finished[0m `release` profile [optimized] target(s) in 0.01s
-[1m[92m     Running[0m `target/release/phisharp train --out out/sharp.phis --steps 300`
-Entraînement Phisharp v0.7 (2136 params = 1541 Hop-1 + 595 Mémoire de Travail, 300 étapes, 24 paires ES, 4 threads)...
-  Curriculum 1 séance : étapes 1..=180 (Hop-1) -> 181..=270 (Mémoire de Travail) -> 271..=300 (Joint)
-[H1] step    1/300  | φ=+0.0979 | Gen=0.343 Disc=0.057 Spec=0.002 Gate=0.25/0.25 IIT=0.071 RefSel=0.256 | res=0.486 coll=0.846 (0.1s)
-[H1] step   25/300  | φ=+0.4645 | Gen=0.680 Disc=0.405 Spec=0.024 Gate=0.25/0.25 IIT=0.109 RefSel=0.282 | res=0.184 coll=0.698 (1.6s)
-[H1] step   50/300  | φ=+0.6067 | Gen=0.814 Disc=0.627 Spec=0.091 Gate=0.25/0.24 IIT=0.173 RefSel=0.247 | res=0.100 coll=0.605 (3.1s)
-[H1] step   75/300  | φ=+0.6339 | Gen=0.823 Disc=0.731 Spec=0.113 Gate=0.25/0.25 IIT=0.213 RefSel=0.369 | res=0.097 coll=0.406 (4.7s)
-[H1] step  100/300  | φ=+0.6455 | Gen=0.806 Disc=0.740 Spec=0.137 Gate=0.26/0.25 IIT=0.255 RefSel=0.397 | res=0.106 coll=0.389 (6.3s)
-[H1] step  125/300  | φ=+0.6325 | Gen=0.793 Disc=0.742 Spec=0.144 Gate=0.28/0.26 IIT=0.233 RefSel=0.273 | res=0.116 coll=0.367 (7.8s)
-[H1] step  150/300  | φ=+0.6604 | Gen=0.819 Disc=0.755 Spec=0.180 Gate=0.32/0.28 IIT=0.281 RefSel=0.503 | res=0.098 coll=0.397 (9.3s)
-[H1] step  175/300  | φ=+0.6578 | Gen=0.795 Disc=0.697 Spec=0.184 Gate=0.40/0.30 IIT=0.332 RefSel=0.462 | res=0.113 coll=0.397 (10.7s)
-[H1] step  180/300  | φ=+0.6583 | Gen=0.780 Disc=0.746 Spec=0.204 Gate=0.40/0.24 IIT=0.322 RefSel=0.297 | res=0.125 coll=0.303 (11.0s)
-[WM] step  181/300  | φ_wm=+0.4631 | head_cos=0.960 (cut=0.960, IIT_echo=+0.000) | HSel=0.839 RSel=0.269 RDisc=0.007 (11.1s)
-[WM] step  200/300  | φ_wm=+0.6901 | head_cos=0.725 (cut=0.684, IIT_echo=+0.041) | HSel=0.420 RSel=0.314 RDisc=0.107 (12.7s)
-[WM] step  225/300  | φ_wm=+0.7337 | head_cos=0.984 (cut=0.984, IIT_echo=+0.001) | HSel=0.746 RSel=0.579 RDisc=0.490 (14.8s)
-[WM] step  250/300  | φ_wm=+0.8474 | head_cos=0.965 (cut=0.969, IIT_echo=+0.000) | HSel=0.551 RSel=0.706 RDisc=0.878 (17.1s)
-[WM] step  270/300  | φ_wm=+0.9723 | head_cos=0.989 (cut=0.990, IIT_echo=+0.000) | HSel=0.695 RSel=0.892 RDisc=0.968 (19.0s)
-[JT] step  275/300  | φ_h1=+0.6570 | φ_wm=+0.9073 (19.8s)
-[JT] step  300/300  | φ_h1=+0.6746 | φ_wm=+0.9011 (23.4s)
+[1m[92m     Running[0m `target/release/phisharp train --out out/sharp.phis --steps 450`
+Entraînement Phisharp v0.7.1 (1846 params = 1541 Hop-1 + 305 Mémoire de Travail, 450 étapes, 24 paires ES, 4 threads)...
+  Curriculum 1 séance : étapes 1..=247 (Hop-1) -> 248..=405 (Mémoire de Travail) -> 406..=450 (Joint)
+[H1] step    1/450  | φ=+0.0683 | Gen=0.325 Disc=0.040 Spec=0.001 Gate=0.25/0.25 IIT=0.077 RefSel=0.253 | res=0.511 coll=0.872 (0.1s)
+[H1] step   25/450  | φ=+0.4820 | Gen=0.635 Disc=0.599 Spec=0.018 Gate=0.25/0.24 IIT=0.098 RefSel=0.258 | res=0.215 coll=0.715 (1.7s)
+[H1] step   50/450  | φ=+0.5728 | Gen=0.755 Disc=0.691 Spec=0.030 Gate=0.27/0.26 IIT=0.132 RefSel=0.324 | res=0.134 coll=0.427 (3.3s)
+[H1] step   75/450  | φ=+0.6062 | Gen=0.807 Disc=0.712 Spec=0.110 Gate=0.29/0.27 IIT=0.152 RefSel=0.420 | res=0.103 coll=0.233 (4.9s)
+[H1] step  100/450  | φ=+0.6265 | Gen=0.800 Disc=0.781 Spec=0.160 Gate=0.33/0.29 IIT=0.168 RefSel=0.511 | res=0.107 coll=0.225 (6.5s)
+[H1] step  125/450  | φ=+0.6356 | Gen=0.762 Disc=0.790 Spec=0.187 Gate=0.41/0.33 IIT=0.227 RefSel=0.323 | res=0.129 coll=0.318 (8.0s)
+[H1] step  150/450  | φ=+0.6679 | Gen=0.788 Disc=0.798 Spec=0.271 Gate=0.44/0.31 IIT=0.220 RefSel=0.341 | res=0.112 coll=0.329 (9.4s)
+[H1] step  175/450  | φ=+0.6851 | Gen=0.788 Disc=0.780 Spec=0.309 Gate=0.57/0.37 IIT=0.197 RefSel=0.401 | res=0.112 coll=0.165 (10.9s)
+[H1] step  200/450  | φ=+0.6713 | Gen=0.761 Disc=0.815 Spec=0.315 Gate=0.67/0.55 IIT=0.206 RefSel=0.443 | res=0.130 coll=0.188 (12.4s)
+[H1] step  225/450  | φ=+0.6716 | Gen=0.797 Disc=0.786 Spec=0.411 Gate=0.67/0.38 IIT=0.164 RefSel=0.407 | res=0.107 coll=0.217 (13.9s)
+[H1] step  247/450  | φ=+0.7022 | Gen=0.759 Disc=0.796 Spec=0.331 Gate=0.79/0.65 IIT=0.273 RefSel=0.414 | res=0.131 coll=0.137 (15.2s)
+[WM] step  248/450  | φ_wm=+0.2739 | align=0.079 (cut=0.000, IIT_echo=+0.079) | HSel=0.060 RSel=0.135 RDisc=0.000 (15.4s)
+[WM] step  250/450  | φ_wm=+0.1534 | align=0.277 (cut=0.149, IIT_echo=+0.128) | HSel=0.092 RSel=0.135 RDisc=0.003 (15.7s)
+[WM] step  275/450  | φ_wm=+0.5353 | align=0.455 (cut=0.000, IIT_echo=+0.455) | HSel=0.218 RSel=0.134 RDisc=0.033 (19.1s)
+[WM] step  300/450  | φ_wm=+0.5090 | align=0.542 (cut=0.146, IIT_echo=+0.396) | HSel=0.196 RSel=0.217 RDisc=0.455 (22.5s)
+[WM] step  325/450  | φ_wm=+0.6107 | align=0.429 (cut=0.000, IIT_echo=+0.429) | HSel=0.202 RSel=0.645 RDisc=0.717 (25.8s)
+[WM] step  350/450  | φ_wm=+0.7879 | align=0.292 (cut=0.000, IIT_echo=+0.292) | HSel=0.161 RSel=0.081 RDisc=0.082 (29.2s)
+[WM] step  375/450  | φ_wm=+0.3915 | align=0.572 (cut=0.000, IIT_echo=+0.572) | HSel=0.248 RSel=0.624 RDisc=0.309 (32.5s)
+[WM] step  400/450  | φ_wm=+0.5771 | align=0.741 (cut=0.000, IIT_echo=+0.741) | HSel=0.338 RSel=0.434 RDisc=0.955 (36.0s)
+[WM] step  405/450  | φ_wm=+0.7667 | align=0.484 (cut=0.000, IIT_echo=+0.484) | HSel=0.210 RSel=0.441 RDisc=0.934 (36.7s)
+[JT] step  425/450  | φ_h1=+0.7195 | φ_wm=+0.9703 (40.6s)
+[JT] step  450/450  | φ_h1=+0.7031 | φ_wm=+0.8166 (45.5s)
 
 --- Évaluation post-hoc 1 : Abstraction Méta-relationnelle (0 octet commun) ---
-  Même cause cachée : cos = +0.9533
-  Causes différentes: cos = -0.0424
-  Marge             : +0.9956
+  Même cause cachée : cos = +0.9646
+  Causes différentes: cos = +0.0372
+  Marge             : +0.9274
 
 --- Évaluation post-hoc 2 : Flux continu 1-saut auto-segmenté (4 moules, hasard = 25%) ---
-  Moules collés SANS séparateur (0 octet commun)     : 48/50 (96.0%)
-  Moules étiquetés, sép. aléatoire (0 octet commun)  : 46/50 (92.0%)  [réf=45/46, cos=+0.929, err=0.142, ov=0%]
+  Moules collés SANS séparateur (0 octet commun)     : 41/50 (82.0%)
+  Moules étiquetés, sép. aléatoire (0 octet commun)  : 42/50 (84.0%)  [référent exact=42/42]
 
 --- Évaluation post-hoc 3 : Mémoire de Travail 100% Connexionniste (0 parsing symbolique) ---
-  Hop-2 multiligne (4 déf., hasard = 25%) : 0/50 (0.0%)  [marge P=+0.000, gain IIT échos=+0.033]
-  Hop-2 flux plat  (4 déf., hasard = 25%) : 0/50 (0.0%)
-  Hop-3 récursif   (5 déf., 3 causes)     : 0/50 (0.0%)  [gain IIT échos=+0.038]
+  Hop-2 multiligne (4 déf., hasard = 25%) : P(t)=15/50 (30.0%) | Δ_IIT=24/50 (48.0%)  [marge P=+0.020, IIT_echo=+0.617]
+  Hop-2 flux plat  (4 déf., hasard = 25%) : P(t)=10/50 (20.0%)
+  Hop-3 récursif   (5 déf., 3 causes)     : P(t)=6/50 (12.0%) | Δ_IIT=5/50 (10.0%)  [IIT_echo=+0.589]
 
 Modèle sauvegardé dans 'out/sharp.phis'.
