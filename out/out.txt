@@ -11,35 +11,35 @@
    [1m[94m= [0m[1mnote[0m: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
 
 [1m[33mwarning[0m: `phisharp` (bin "phisharp") generated 1 warning
-[1m[92m    Finished[0m `release` profile [optimized] target(s) in 0.00s
+[1m[92m    Finished[0m `release` profile [optimized] target(s) in 0.01s
 [1m[92m     Running[0m `target/release/phisharp train --out out/sharp.phis --steps 300`
 Entraînement Phisharp v0.6 (1541 paramètres, 300 étapes, 24 paires ES, 4 threads)...
 step    1/300  | φ=+0.0579 | Gen=0.307 Disc=0.043 Spec=0.007 Gate=0.25/0.25 IIT=0.072 RefSel=0.258 | res=0.537 coll=0.878 (0.1s)
-step   25/300  | φ=+0.4370 | Gen=0.618 Disc=0.440 Spec=0.014 Gate=0.26/0.25 IIT=0.147 RefSel=0.316 | res=0.223 coll=0.661 (1.5s)
-step   50/300  | φ=+0.5389 | Gen=0.743 Disc=0.554 Spec=0.121 Gate=0.28/0.26 IIT=0.171 RefSel=0.349 | res=0.140 coll=0.524 (3.0s)
-step   75/300  | φ=+0.5644 | Gen=0.773 Disc=0.675 Spec=0.133 Gate=0.30/0.26 IIT=0.114 RefSel=0.445 | res=0.125 coll=0.392 (4.3s)
-step  100/300  | φ=+0.5843 | Gen=0.773 Disc=0.713 Spec=0.218 Gate=0.34/0.29 IIT=0.140 RefSel=0.392 | res=0.122 coll=0.369 (5.7s)
-step  125/300  | φ=+0.6103 | Gen=0.765 Disc=0.709 Spec=0.186 Gate=0.43/0.38 IIT=0.226 RefSel=0.422 | res=0.125 coll=0.323 (7.2s)
-step  150/300  | φ=+0.7094 | Gen=0.809 Disc=0.781 Spec=0.247 Gate=0.47/0.38 IIT=0.366 RefSel=0.392 | res=0.100 coll=0.244 (8.6s)
-step  175/300  | φ=+0.7251 | Gen=0.826 Disc=0.792 Spec=0.259 Gate=0.52/0.42 IIT=0.344 RefSel=0.432 | res=0.090 coll=0.353 (9.9s)
-step  200/300  | φ=+0.7113 | Gen=0.806 Disc=0.787 Spec=0.257 Gate=0.68/0.55 IIT=0.340 RefSel=0.488 | res=0.100 coll=0.150 (11.2s)
-step  225/300  | φ=+0.7586 | Gen=0.849 Disc=0.816 Spec=0.206 Gate=0.75/0.53 IIT=0.321 RefSel=0.280 | res=0.077 coll=0.547 (12.6s)
-step  250/300  | φ=+0.7311 | Gen=0.829 Disc=0.784 Spec=0.228 Gate=0.77/0.66 IIT=0.293 RefSel=0.442 | res=0.086 coll=0.505 (13.9s)
-step  275/300  | φ=+0.7354 | Gen=0.798 Disc=0.821 Spec=0.219 Gate=0.80/0.73 IIT=0.332 RefSel=0.399 | res=0.105 coll=0.443 (15.2s)
-step  300/300  | φ=+0.7698 | Gen=0.812 Disc=0.830 Spec=0.304 Gate=0.87/0.75 IIT=0.332 RefSel=0.451 | res=0.096 coll=0.311 (16.5s)
+step   25/300  | φ=+0.4371 | Gen=0.618 Disc=0.440 Spec=0.014 Gate=0.26/0.25 IIT=0.147 RefSel=0.316 | res=0.223 coll=0.660 (1.7s)
+step   50/300  | φ=+0.5380 | Gen=0.742 Disc=0.553 Spec=0.121 Gate=0.28/0.26 IIT=0.170 RefSel=0.350 | res=0.141 coll=0.523 (3.3s)
+step   75/300  | φ=+0.5484 | Gen=0.762 Disc=0.669 Spec=0.128 Gate=0.30/0.26 IIT=0.099 RefSel=0.444 | res=0.133 coll=0.453 (4.8s)
+step  100/300  | φ=+0.5683 | Gen=0.747 Disc=0.711 Spec=0.219 Gate=0.31/0.28 IIT=0.136 RefSel=0.409 | res=0.139 coll=0.451 (6.4s)
+step  125/300  | φ=+0.6266 | Gen=0.782 Disc=0.746 Spec=0.190 Gate=0.37/0.34 IIT=0.250 RefSel=0.472 | res=0.116 coll=0.375 (8.0s)
+step  150/300  | φ=+0.6705 | Gen=0.776 Disc=0.812 Spec=0.206 Gate=0.43/0.35 IIT=0.250 RefSel=0.405 | res=0.121 coll=0.331 (9.5s)
+step  175/300  | φ=+0.6835 | Gen=0.777 Disc=0.775 Spec=0.302 Gate=0.46/0.37 IIT=0.373 RefSel=0.439 | res=0.120 coll=0.221 (11.0s)
+step  200/300  | φ=+0.7097 | Gen=0.781 Disc=0.845 Spec=0.278 Gate=0.55/0.43 IIT=0.361 RefSel=0.304 | res=0.115 coll=0.159 (12.4s)
+step  225/300  | φ=+0.7494 | Gen=0.812 Disc=0.832 Spec=0.262 Gate=0.57/0.40 IIT=0.444 RefSel=0.378 | res=0.097 coll=0.321 (13.8s)
+step  250/300  | φ=+0.7341 | Gen=0.774 Disc=0.766 Spec=0.355 Gate=0.67/0.49 IIT=0.450 RefSel=0.472 | res=0.121 coll=0.206 (15.3s)
+step  275/300  | φ=+0.7225 | Gen=0.778 Disc=0.759 Spec=0.339 Gate=0.68/0.55 IIT=0.409 RefSel=0.446 | res=0.117 coll=0.261 (16.7s)
+step  300/300  | φ=+0.7526 | Gen=0.795 Disc=0.784 Spec=0.279 Gate=0.73/0.66 IIT=0.462 RefSel=0.510 | res=0.107 coll=0.186 (18.2s)
 
 --- Évaluation post-hoc 1 : Abstraction Méta-relationnelle (0 octet commun) ---
-  Même cause cachée : cos = +0.9581
-  Causes différentes: cos = +0.0286
-  Marge             : +0.9296
+  Même cause cachée : cos = +0.9217
+  Causes différentes: cos = +0.0057
+  Marge             : +0.9159
 
 --- Évaluation post-hoc 2 : Flux continu 1-saut auto-segmenté (4 moules, hasard = 25%) ---
-  Moules collés SANS séparateur (0 octet commun)     : 43/50 (86.0%)
-  Moules étiquetés, sép. aléatoire (0 octet commun)  : 36/50 (72.0%)  [référent exact=35/36]
+  Moules collés SANS séparateur (0 octet commun)     : 44/50 (88.0%)
+  Moules étiquetés, sép. aléatoire (0 octet commun)  : 46/50 (92.0%)  [référent exact=40/46]
 
 --- Évaluation post-hoc 3 : Multi-Sauts sur Définitions Composées (4 concepts, hasard = 25%) ---
-  Décomposition 2 causes (cible hybride)             : 47/50 (94.0%)
-  Concept composé exact (multiligne, 0 octet commun) : 28/50 (56.0%)  [marge Top1-Top2 = +0.1006]
-  Concept composé exact (flux plat, 0 octet commun)  : 33/50 (66.0%)
+  Décomposition 2 causes (cible hybride)             : 40/50 (80.0%)
+  Concept composé exact (multiligne, 0 octet commun) : 36/50 (72.0%)  [marge Top1-Top2 = +0.1171]
+  Concept composé exact (flux plat, 0 octet commun)  : 38/50 (76.0%)
 
 Modèle sauvegardé dans 'out/sharp.phis'.
