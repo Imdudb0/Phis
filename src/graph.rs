@@ -41,7 +41,7 @@ pub const NUM_PARAMS: usize = OFF_OUT + REL_DIM * DIM; // 1541
 const MAGIC: &[u8; 4] = b"PHIS";
 const VERSION: u32 = 5;
 
-/// Substrat relationnel brut extrait de la matrice d'auto-égalité M(a,b) = [a!=b & E[a]==E[b]].
+/// Substrat relationnel brut à échelle invariante (fenêtre fixe ±24, degré local ±12).
 #[derive(Clone, Debug)]
 pub struct RawSubstrate {
     pub len: usize,
@@ -54,9 +54,10 @@ pub struct RawSubstrate {
 impl RawSubstrate {
     pub fn from_bytes(bytes: &[u8]) -> Self {
         let n = bytes.len();
-        let win_cap = 36usize;
+        let win_cap = 24usize;
+        let deg_rad = 12usize;
         let max_edges = 12usize;
-        let log_cap = (n.min(win_cap).max(2) as f32).ln();
+        let log_cap = (win_cap as f32).ln();
 
         let m_nb = |a: isize, b: isize, ti: isize, ji: isize| -> f32 {
             if a >= 0 && b >= 0 && a != b && !(a == ji && b == ti) {
@@ -80,12 +81,19 @@ impl RawSubstrate {
             let b = bytes[t];
             let lo = t.saturating_sub(win_cap);
             let hi = (t + win_cap + 1).min(n);
-            let span_len = (hi - lo).saturating_sub(1).max(1);
+            let deg_lo = t.saturating_sub(deg_rad);
+            let deg_hi = (t + deg_rad + 1).min(n);
+            let deg_span = (deg_hi - deg_lo).saturating_sub(1).max(1);
             let ti = t as isize;
 
             candidates.clear();
+            let mut local_matches = 0usize;
             for j in lo..hi {
                 if j != t && bytes[j] == b {
+                    let dist = t.abs_diff(j);
+                    if dist <= deg_rad {
+                        local_matches += 1;
+                    }
                     let ji = j as isize;
                     let neigh = m_nb(ti - 1, ji - 1, ti, ji)
                         + m_nb(ti + 1, ji + 1, ti, ji)
@@ -95,13 +103,13 @@ impl RawSubstrate {
                         + m_nb(ti + 1, ji - 1, ti, ji)
                         + m_nb(ti - 2, ji + 2, ti, ji)
                         + m_nb(ti + 2, ji - 2, ti, ji);
-                    candidates.push((j, t.abs_diff(j), neigh));
+                    candidates.push((j, dist, neigh));
                 }
             }
 
-            let match_count = candidates.len();
-            deg.push(2.0 * (match_count as f32 / span_len as f32) - 1.0);
+            deg.push(2.0 * (local_matches as f32 / deg_span as f32) - 1.0);
 
+            let match_count = candidates.len();
             let mut selected: Vec<usize> = Vec::with_capacity(max_edges.min(match_count));
             if match_count <= max_edges {
                 for &(j, _, _) in &candidates {
@@ -278,7 +286,6 @@ impl PhiGraph {
             1.0 / (1.0 + (-logit.clamp(-12.0, 12.0)).exp())
         };
 
-        // Porte contextuelle (±2) pour détecter les îlots + porte ponctuelle pour caler les bords
         let mut gates_ctx = Vec::with_capacity(n);
         let mut gates_pt = Vec::with_capacity(n);
         for t in 0..n {
@@ -525,7 +532,7 @@ impl PhiGraph {
         if version != VERSION || count != NUM_PARAMS || data.len() != 12 + count * 4 {
             return Err(io::Error::new(
                 ErrorKind::InvalidData,
-                "Version ou taille du modèle .phis incompatible (ré-entraîne avec v0.5.1)",
+                "Version ou taille du modèle .phis incompatible (ré-entraîne avec v0.5.2)",
             ));
         }
         let mut weights = Vec::with_capacity(count);
