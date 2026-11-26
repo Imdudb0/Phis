@@ -28,10 +28,10 @@ jobs:
       - name: Run Phisharp
         run: |
           #cargo check
-          #cargo run --release -- train --out out/sharp.phis --steps 300 --seed 42 > out/out.txt 2>&1
-          cargo run --release -- calibrate --model out/sharp.phis --seed 101
-          cargo run --release -- eval-ood --model out/sharp.phis --seed 202
-          cargo run --release -- ask --model out/sharp.phis --file perceived.eff
+          cargo run --release -- train --out out/sharp.phis --steps 300 --seed 42 > out/out.txt 2>&1
+          #cargo run --release -- calibrate --model out/sharp.phis --seed 101
+          #cargo run --release -- eval-ood --model out/sharp.phis --seed 202
+          #cargo run --release -- ask --model out/sharp.phis --file perceived.eff
           #cargo run --release -- ask --model out/sharp.phis --file out/defs_hop3.eff
           #cargo run --release -- ask --model out/sharp.phis --file out/comp.eff
 
