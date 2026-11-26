@@ -28,7 +28,7 @@ const SCAN_BLOCK: usize =
     SCAN_CTRL * SCAN_IN + SCAN_CTRL * SCAN_CTRL + SCAN_CTRL + 3 * SCAN_CTRL + 3; // 83
 const WM_UPD_IN: usize = 5;
 const WM_UPD_HID: usize = 4;
-const READ_IN: usize = 7;
+const READ_IN: usize = 8;
 const READ_HID: usize = 6;
 
 // --- Paramètres Hop-1 (0..1541) ---
@@ -52,7 +52,7 @@ const OFF_CTX: usize = OFF_BH + DIM * (2 * DIM); // 1461, len 32
 const OFF_U: usize = OFF_CTX + DIM * REL_DIM; // 1493, len 16
 const OFF_OUT: usize = OFF_U + DIM * DIM; // 1509, len 32
 
-// --- Paramètres Mémoire de Travail (1541..1846, +305 params seulement) ---
+// --- Paramètres Mémoire de Travail (1541..1852, +311 params) ---
 pub const WM_PARAM_START: usize = OFF_OUT + REL_DIM * DIM; // 1541
 const OFF_ECHO_W1: usize = WM_PARAM_START; // 1541, len 42
 const OFF_ECHO_B1: usize = OFF_ECHO_W1 + ECHO_HID * ECHO_IN; // 1583, len 6
@@ -64,14 +64,14 @@ const OFF_WM_UPD_W1: usize = OFF_SCAN_FWD + SCAN_BLOCK; // 1762, len 20
 const OFF_WM_UPD_B1: usize = OFF_WM_UPD_W1 + WM_UPD_HID * WM_UPD_IN; // 1782, len 4
 const OFF_WM_UPD_W2: usize = OFF_WM_UPD_B1 + WM_UPD_HID; // 1786, len 4
 const OFF_WM_UPD_B2: usize = OFF_WM_UPD_W2 + WM_UPD_HID; // 1790, len 1
-const OFF_READ_W1: usize = OFF_WM_UPD_B2 + 1; // 1791, len 42
-const OFF_READ_B1: usize = OFF_READ_W1 + READ_HID * READ_IN; // 1833, len 6
-const OFF_READ_W2: usize = OFF_READ_B1 + READ_HID; // 1839, len 6
-const OFF_READ_B2: usize = OFF_READ_W2 + READ_HID; // 1845, len 1
-pub const NUM_PARAMS: usize = OFF_READ_B2 + 1; // 1846
+const OFF_READ_W1: usize = OFF_WM_UPD_B2 + 1; // 1791, len 48
+const OFF_READ_B1: usize = OFF_READ_W1 + READ_HID * READ_IN; // 1839, len 6
+const OFF_READ_W2: usize = OFF_READ_B1 + READ_HID; // 1845, len 6
+const OFF_READ_B2: usize = OFF_READ_W2 + READ_HID; // 1851, len 1
+pub const NUM_PARAMS: usize = OFF_READ_B2 + 1; // 1852
 
 const MAGIC: &[u8; 4] = b"PHIS";
-const VERSION: u32 = 8;
+const VERSION: u32 = 9;
 
 #[inline]
 fn sigmoid(x: f32) -> f32 {
@@ -116,8 +116,6 @@ pub fn wm_cosine(a: &[f32; WM_DIM], b: &[f32; WM_DIM]) -> f32 {
     }
 }
 
-/// Alignement à norme amortie : tue les fuites microscopiques (`||v|| ~ 0.01 -> ~0.04`)
-/// tout en distinguant composition exacte Hop-2 (`0.85`) > sur-ensemble (`0.71`) > Hop-1 (`0.57`).
 pub fn wm_align(v: &[f32; WM_DIM], q: &[f32; WM_DIM]) -> f32 {
     let mut dot = 0.0f32;
     let mut nv = 0.0f32;
@@ -135,11 +133,6 @@ pub fn wm_align(v: &[f32; WM_DIM], q: &[f32; WM_DIM]) -> f32 {
     (dot / denom).clamp(-1.0, 1.0)
 }
 
-/// Nouveauté orthogonale Gram-Schmidt exacte et idempotente :
-/// - `u1` reçu sur `u1` -> `0` (idempotent)
-/// - `u1` reçu sur `u1 + u2` -> `0` (n'efface jamais `u2`)
-/// - `u1 + u2` reçu sur `u1` -> `u2` (préserve 100% la composante nouvelle)
-/// - `u3` reçu sur `u1 + u2` -> `u3` (composition exacte `u1 + u2 + u3`).
 pub fn orth_novelty(msg: &[f32; WM_DIM], cur: &[f32; WM_DIM]) -> [f32; WM_DIM] {
     let mut dot = 0.0f32;
     let mut m2 = 0.0f32;
@@ -185,7 +178,6 @@ pub struct RawSubstrate {
     pub deg: Vec<f32>,
     pub global_freq: Vec<f32>,
     pub back_echo_len: Vec<f32>,
-    pub fwd_echo_len: Vec<f32>,
     pub echo_log_deg: Vec<f32>,
     pub echo_offsets: Vec<usize>,
     pub echo_edges: Vec<EchoEdge>,
@@ -310,9 +302,9 @@ impl RawSubstrate {
             offsets.push(edges.len());
         }
 
-        // Diagonales d'écho longue portée (|a - b| > 16, L >= 3)
+        // Diagonales d'écho longue portée strictement causales (src < dst, L >= 3) :
+        // empêche toute fuite arrière des définitions vers les étiquettes primitives.
         let mut back_echo_len = vec![0.0f32; n];
-        let mut fwd_echo_len = vec![0.0f32; n];
         let mut echo_deg_raw = vec![0u32; n];
         let mut raw_links: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n];
 
@@ -334,14 +326,10 @@ impl RawSubstrate {
                                 let b = a + d;
                                 echo_deg_raw[a] += 1;
                                 echo_deg_raw[b] += 1;
-                                if nl > fwd_echo_len[a] {
-                                    fwd_echo_len[a] = nl;
-                                }
                                 if nl > back_echo_len[b] {
                                     back_echo_len[b] = nl;
                                 }
                                 raw_links[b].push((a, run_len));
-                                raw_links[a].push((b, run_len));
                             }
                         }
                     } else {
@@ -397,7 +385,6 @@ impl RawSubstrate {
             deg,
             global_freq,
             back_echo_len,
-            fwd_echo_len,
             echo_log_deg,
             echo_offsets,
             echo_edges,
@@ -764,6 +751,7 @@ impl PhiGraph {
         off: usize,
         ctrl: &mut [f32; SCAN_CTRL],
         inp: &[f32; SCAN_IN],
+        init_bias: [f32; 3],
     ) -> (f32, f32, f32) {
         let w = &self.weights;
         let off_in = off;
@@ -786,8 +774,6 @@ impl PhiGraph {
         *ctrl = next_ctrl;
 
         let mut gates = [0.0f32; 3];
-        // Prior d'init non-évanescent sur `keep` (+1.5) pour franchir 10-15 octets dès l'étape 1
-        let init_bias = [1.5f32, 0.4f32, 0.4f32];
         for g in 0..3 {
             let mut acc = w[off_out_b + g] + init_bias[g];
             for h in 0..SCAN_CTRL {
@@ -799,9 +785,9 @@ impl PhiGraph {
     }
 
     /// Exécute `WM_STEPS` itérations de la mémoire de travail :
-    /// Sub-step A : transport par arêtes d'écho longue portée (appliqué immédiatement)
-    /// Sub-step B : balayages directionnels arrière (`←`) et avant (`→`) non-réciproques
-    /// Fusion par nouveauté orthogonale Gram-Schmidt exacte.
+    /// - Sub-step A : transport causal avant (`src < dst`) le long des échos longue portée
+    /// - Sub-step B : balayage arrière (`←`) prioritaire + balayage avant (`→`) fermé à l'init
+    /// - Sub-step C : fusion orthogonale Gram-Schmidt idempotente.
     pub fn propagate_working_memory(
         &self,
         sub: &RawSubstrate,
@@ -826,7 +812,7 @@ impl PhiGraph {
                 norms[t] = wm_norm(&z[t]);
             }
 
-            // Sub-step A : transport synchrone par échos longue portée de M(a,b), appliqué avant les scans
+            // Sub-step A : transport causal avant par échos longue portée de M(a,b)
             if !cut_echoes {
                 for dst in 0..n {
                     msg_echo[dst] = [0.0; WM_DIM];
@@ -877,21 +863,27 @@ impl PhiGraph {
                 }
             }
 
-            // Sub-step B1 : balayage directionnel arrière (t = n-1 -> 0)
+            // Sub-step B1 : balayage directionnel arrière (t = n-1 -> 0) avec transition d'écho
             let mut ctrl_b = [0.0f32; SCAN_CTRL];
             let mut carry_b = [0.0f32; WM_DIM];
             for t in (0..n).rev() {
                 let c_norm = (wm_norm(&carry_b) / 2.0).min(1.0);
+                let prev_be = if t + 1 < n {
+                    sub.back_echo_len[t + 1]
+                } else {
+                    0.0
+                };
                 let inp = [
                     gates_pt[t],
                     sub.back_echo_len[t],
-                    sub.fwd_echo_len[t],
+                    prev_be,
                     sub.echo_log_deg[t],
                     sub.global_freq[t],
                     (norms[t] / 2.0).min(1.0),
                     c_norm,
                 ];
-                let (keep, absorb, write) = self.eval_scanner_step(OFF_SCAN_BWD, &mut ctrl_b, &inp);
+                let (keep, absorb, write) =
+                    self.eval_scanner_step(OFF_SCAN_BWD, &mut ctrl_b, &inp, [1.4, 0.6, 0.6]);
 
                 for d in 0..WM_DIM {
                     carry_b[d] *= keep;
@@ -914,21 +906,23 @@ impl PhiGraph {
                 }
             }
 
-            // Sub-step B2 : balayage directionnel avant (t = 0 -> n-1)
+            // Sub-step B2 : balayage directionnel avant (fermé par défaut pour éviter les bavures inter-clauses)
             let mut ctrl_f = [0.0f32; SCAN_CTRL];
             let mut carry_f = [0.0f32; WM_DIM];
             for t in 0..n {
                 let c_norm = (wm_norm(&carry_f) / 2.0).min(1.0);
+                let prev_be = if t > 0 { sub.back_echo_len[t - 1] } else { 0.0 };
                 let inp = [
                     gates_pt[t],
                     sub.back_echo_len[t],
-                    sub.fwd_echo_len[t],
+                    prev_be,
                     sub.echo_log_deg[t],
                     sub.global_freq[t],
                     (norms[t] / 2.0).min(1.0),
                     c_norm,
                 ];
-                let (keep, absorb, write) = self.eval_scanner_step(OFF_SCAN_FWD, &mut ctrl_f, &inp);
+                let (keep, absorb, write) =
+                    self.eval_scanner_step(OFF_SCAN_FWD, &mut ctrl_f, &inp, [-1.5, -1.0, -1.5]);
 
                 for d in 0..WM_DIM {
                     carry_f[d] *= keep;
@@ -1000,8 +994,7 @@ impl PhiGraph {
         z
     }
 
-    /// Tête de lecture connexionniste inspirée IIT : compare l'alignement intact (`z_full`)
-    /// et l'alignement coupé (`z_cut`) pour unifier Hop-1 et Hop-2/Hop-3 en un seul champ `P(t)`.
+    /// Tête de lecture connexionniste unifiée (1-saut & multi-sauts) grâce à `max_delta_ctx`.
     pub fn readout_explanation(
         &self,
         sub: &RawSubstrate,
@@ -1009,6 +1002,7 @@ impl PhiGraph {
         z_full: &[[f32; WM_DIM]],
         z_cut: &[[f32; WM_DIM]],
         z_query: &[f32; WM_DIM],
+        max_delta_ctx: f32,
     ) -> Vec<f32> {
         let w = &self.weights;
         let n = sub.len;
@@ -1023,6 +1017,7 @@ impl PhiGraph {
                 align_full,
                 align_cut,
                 align_delta,
+                max_delta_ctx,
                 nrm,
                 gates_pt[t],
                 sub.back_echo_len[t],
@@ -1073,7 +1068,7 @@ impl PhiGraph {
         if version != VERSION || count != NUM_PARAMS || data.len() != 12 + count * 4 {
             return Err(io::Error::new(
                 ErrorKind::InvalidData,
-                "Version ou taille du modèle .phis incompatible (ré-entraîne avec v0.7.1)",
+                "Version ou taille du modèle .phis incompatible (ré-entraîne avec v0.7.2)",
             ));
         }
         let mut weights = Vec::with_capacity(count);
