@@ -33,43 +33,43 @@
 [1m[33mwarning[0m: `phisharp` (bin "phisharp") generated 2 warnings
 [1m[92m    Finished[0m `release` profile [optimized] target(s) in 0.01s
 [1m[92m     Running[0m `target/release/phisharp train --out out/sharp.phis --steps 450`
-Entraînement Phisharp v0.7.1 (1846 params = 1541 Hop-1 + 305 Mémoire de Travail, 450 étapes, 24 paires ES, 4 threads)...
-  Curriculum 1 séance : étapes 1..=247 (Hop-1) -> 248..=405 (Mémoire de Travail) -> 406..=450 (Joint)
-[H1] step    1/450  | φ=+0.0683 | Gen=0.325 Disc=0.040 Spec=0.001 Gate=0.25/0.25 IIT=0.077 RefSel=0.253 | res=0.511 coll=0.872 (0.1s)
-[H1] step   25/450  | φ=+0.4820 | Gen=0.635 Disc=0.599 Spec=0.018 Gate=0.25/0.24 IIT=0.098 RefSel=0.258 | res=0.215 coll=0.715 (1.7s)
-[H1] step   50/450  | φ=+0.5728 | Gen=0.755 Disc=0.691 Spec=0.030 Gate=0.27/0.26 IIT=0.132 RefSel=0.324 | res=0.134 coll=0.427 (3.3s)
-[H1] step   75/450  | φ=+0.6062 | Gen=0.807 Disc=0.712 Spec=0.110 Gate=0.29/0.27 IIT=0.152 RefSel=0.420 | res=0.103 coll=0.233 (4.9s)
-[H1] step  100/450  | φ=+0.6265 | Gen=0.800 Disc=0.781 Spec=0.160 Gate=0.33/0.29 IIT=0.168 RefSel=0.511 | res=0.107 coll=0.225 (6.5s)
-[H1] step  125/450  | φ=+0.6356 | Gen=0.762 Disc=0.790 Spec=0.187 Gate=0.41/0.33 IIT=0.227 RefSel=0.323 | res=0.129 coll=0.318 (8.0s)
-[H1] step  150/450  | φ=+0.6679 | Gen=0.788 Disc=0.798 Spec=0.271 Gate=0.44/0.31 IIT=0.220 RefSel=0.341 | res=0.112 coll=0.329 (9.4s)
-[H1] step  175/450  | φ=+0.6851 | Gen=0.788 Disc=0.780 Spec=0.309 Gate=0.57/0.37 IIT=0.197 RefSel=0.401 | res=0.112 coll=0.165 (10.9s)
-[H1] step  200/450  | φ=+0.6713 | Gen=0.761 Disc=0.815 Spec=0.315 Gate=0.67/0.55 IIT=0.206 RefSel=0.443 | res=0.130 coll=0.188 (12.4s)
-[H1] step  225/450  | φ=+0.6716 | Gen=0.797 Disc=0.786 Spec=0.411 Gate=0.67/0.38 IIT=0.164 RefSel=0.407 | res=0.107 coll=0.217 (13.9s)
-[H1] step  247/450  | φ=+0.7022 | Gen=0.759 Disc=0.796 Spec=0.331 Gate=0.79/0.65 IIT=0.273 RefSel=0.414 | res=0.131 coll=0.137 (15.2s)
-[WM] step  248/450  | φ_wm=+0.2739 | align=0.079 (cut=0.000, IIT_echo=+0.079) | HSel=0.060 RSel=0.135 RDisc=0.000 (15.4s)
-[WM] step  250/450  | φ_wm=+0.1534 | align=0.277 (cut=0.149, IIT_echo=+0.128) | HSel=0.092 RSel=0.135 RDisc=0.003 (15.7s)
-[WM] step  275/450  | φ_wm=+0.5353 | align=0.455 (cut=0.000, IIT_echo=+0.455) | HSel=0.218 RSel=0.134 RDisc=0.033 (19.1s)
-[WM] step  300/450  | φ_wm=+0.5090 | align=0.542 (cut=0.146, IIT_echo=+0.396) | HSel=0.196 RSel=0.217 RDisc=0.455 (22.5s)
-[WM] step  325/450  | φ_wm=+0.6107 | align=0.429 (cut=0.000, IIT_echo=+0.429) | HSel=0.202 RSel=0.645 RDisc=0.717 (25.8s)
-[WM] step  350/450  | φ_wm=+0.7879 | align=0.292 (cut=0.000, IIT_echo=+0.292) | HSel=0.161 RSel=0.081 RDisc=0.082 (29.2s)
-[WM] step  375/450  | φ_wm=+0.3915 | align=0.572 (cut=0.000, IIT_echo=+0.572) | HSel=0.248 RSel=0.624 RDisc=0.309 (32.5s)
-[WM] step  400/450  | φ_wm=+0.5771 | align=0.741 (cut=0.000, IIT_echo=+0.741) | HSel=0.338 RSel=0.434 RDisc=0.955 (36.0s)
-[WM] step  405/450  | φ_wm=+0.7667 | align=0.484 (cut=0.000, IIT_echo=+0.484) | HSel=0.210 RSel=0.441 RDisc=0.934 (36.7s)
-[JT] step  425/450  | φ_h1=+0.7195 | φ_wm=+0.9703 (40.6s)
-[JT] step  450/450  | φ_h1=+0.7031 | φ_wm=+0.8166 (45.5s)
+Entraînement Phisharp v0.7.2 (1852 params = 1541 Hop-1 + 311 Mémoire de Travail, 450 étapes, 24 paires ES, 4 threads)...
+  Curriculum 1 séance : étapes 1..=270 (Hop-1) -> 271..=405 (Mémoire de Travail) -> 406..=450 (Joint)
+[H1] step    1/450  | φ=+0.0581 | Gen=0.311 Disc=0.049 Spec=0.004 Gate=0.25/0.25 IIT=0.072 RefSel=0.271 | res=0.531 coll=0.820 (0.0s)
+[H1] step   25/450  | φ=+0.3201 | Gen=0.459 Disc=0.440 Spec=0.010 Gate=0.24/0.24 IIT=0.067 RefSel=0.312 | res=0.356 coll=0.498 (1.2s)
+[H1] step   50/450  | φ=+0.5470 | Gen=0.714 Disc=0.644 Spec=0.145 Gate=0.27/0.26 IIT=0.145 RefSel=0.365 | res=0.158 coll=0.388 (2.4s)
+[H1] step   75/450  | φ=+0.5754 | Gen=0.733 Disc=0.730 Spec=0.182 Gate=0.34/0.28 IIT=0.136 RefSel=0.414 | res=0.153 coll=0.426 (3.5s)
+[H1] step  100/450  | φ=+0.6006 | Gen=0.707 Disc=0.707 Spec=0.174 Gate=0.45/0.33 IIT=0.200 RefSel=0.372 | res=0.164 coll=0.433 (4.5s)
+[H1] step  125/450  | φ=+0.6262 | Gen=0.719 Disc=0.785 Spec=0.193 Gate=0.59/0.41 IIT=0.173 RefSel=0.422 | res=0.156 coll=0.246 (5.5s)
+[H1] step  150/450  | φ=+0.6823 | Gen=0.724 Disc=0.833 Spec=0.203 Gate=0.65/0.47 IIT=0.270 RefSel=0.327 | res=0.154 coll=0.255 (6.5s)
+[H1] step  175/450  | φ=+0.7165 | Gen=0.738 Disc=0.808 Spec=0.250 Gate=0.70/0.50 IIT=0.323 RefSel=0.336 | res=0.144 coll=0.276 (7.5s)
+[H1] step  200/450  | φ=+0.6682 | Gen=0.698 Disc=0.794 Spec=0.195 Gate=0.76/0.59 IIT=0.328 RefSel=0.405 | res=0.179 coll=0.348 (8.6s)
+[H1] step  225/450  | φ=+0.7151 | Gen=0.764 Disc=0.785 Spec=0.299 Gate=0.76/0.68 IIT=0.313 RefSel=0.336 | res=0.127 coll=0.149 (9.6s)
+[H1] step  250/450  | φ=+0.6863 | Gen=0.708 Disc=0.820 Spec=0.313 Gate=0.86/0.76 IIT=0.212 RefSel=0.367 | res=0.161 coll=0.198 (10.7s)
+[H1] step  270/450  | φ=+0.7077 | Gen=0.747 Disc=0.815 Spec=0.327 Gate=0.85/0.79 IIT=0.246 RefSel=0.460 | res=0.135 coll=0.177 (11.5s)
+[WM] step  271/450  | φ_wm=+0.1968 | align=0.078 (cut=0.000, IIT_echo=+0.078) | HSel=0.044 RSel=0.130 RDisc=0.000 (11.6s)
+[WM] step  275/450  | φ_wm=+0.1152 | align=0.104 (cut=0.000, IIT_echo=+0.104) | HSel=0.055 RSel=0.139 RDisc=0.000 (12.0s)
+[WM] step  300/450  | φ_wm=+0.3889 | align=0.525 (cut=0.165, IIT_echo=+0.360) | HSel=0.195 RSel=0.176 RDisc=0.000 (14.3s)
+[WM] step  325/450  | φ_wm=+0.5129 | align=0.366 (cut=0.000, IIT_echo=+0.366) | HSel=0.232 RSel=0.311 RDisc=0.000 (16.6s)
+[WM] step  350/450  | φ_wm=+0.6344 | align=0.202 (cut=0.000, IIT_echo=+0.202) | HSel=0.099 RSel=0.329 RDisc=0.000 (18.9s)
+[WM] step  375/450  | φ_wm=+0.7748 | align=0.563 (cut=0.000, IIT_echo=+0.563) | HSel=0.242 RSel=0.440 RDisc=0.000 (21.2s)
+[WM] step  400/450  | φ_wm=+0.6593 | align=0.692 (cut=0.000, IIT_echo=+0.692) | HSel=0.323 RSel=0.518 RDisc=0.027 (23.5s)
+[WM] step  405/450  | φ_wm=+0.6236 | align=0.552 (cut=0.000, IIT_echo=+0.552) | HSel=0.256 RSel=0.460 RDisc=0.178 (24.0s)
+[JT] step  425/450  | φ_h1=+0.7421 | φ_wm=+0.7179 (26.7s)
+[JT] step  450/450  | φ_h1=+0.7431 | φ_wm=+0.7179 (30.2s)
 
 --- Évaluation post-hoc 1 : Abstraction Méta-relationnelle (0 octet commun) ---
-  Même cause cachée : cos = +0.9646
-  Causes différentes: cos = +0.0372
-  Marge             : +0.9274
+  Même cause cachée : cos = +0.9511
+  Causes différentes: cos = +0.1120
+  Marge             : +0.8391
 
 --- Évaluation post-hoc 2 : Flux continu 1-saut auto-segmenté (4 moules, hasard = 25%) ---
-  Moules collés SANS séparateur (0 octet commun)     : 41/50 (82.0%)
-  Moules étiquetés, sép. aléatoire (0 octet commun)  : 42/50 (84.0%)  [référent exact=42/42]
+  Moules collés SANS séparateur (0 octet commun)     : 45/50 (90.0%)
+  Moules étiquetés, sép. aléatoire (0 octet commun)  : 48/50 (96.0%)  [référent exact=47/48]
 
 --- Évaluation post-hoc 3 : Mémoire de Travail 100% Connexionniste (0 parsing symbolique) ---
-  Hop-2 multiligne (4 déf., hasard = 25%) : P(t)=15/50 (30.0%) | Δ_IIT=24/50 (48.0%)  [marge P=+0.020, IIT_echo=+0.617]
-  Hop-2 flux plat  (4 déf., hasard = 25%) : P(t)=10/50 (20.0%)
-  Hop-3 récursif   (5 déf., 3 causes)     : P(t)=6/50 (12.0%) | Δ_IIT=5/50 (10.0%)  [IIT_echo=+0.589]
+  Hop-2 multiligne (4 déf., hasard = 25%) : P(t)=23/50 (46.0%) | Δ_IIT=18/50 (36.0%)  [marge P=+0.028, IIT_echo=+0.622]
+  Hop-2 flux plat  (4 déf., hasard = 25%) : P(t)=30/50 (60.0%)
+  Hop-3 récursif   (5 déf., 3 causes)     : P(t)=13/50 (26.0%) | Δ_IIT=6/50 (12.0%)  [IIT_echo=+0.628]
 
 Modèle sauvegardé dans 'out/sharp.phis'.
