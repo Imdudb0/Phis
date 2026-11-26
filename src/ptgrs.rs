@@ -67,14 +67,13 @@ pub struct CompositeEpisode {
     pub hidden_tag_spans: Vec<Option<(usize, usize)>>,
 }
 
-/// Scène multi-sauts (Hop-2 ou Hop-3) : moules primitifs + définitions purement symboliques
-/// + cible hybride à 0 octet commun. Les champs `hidden_*` ne servent qu'au diagnostic post-hoc.
+/// Scène multi-sauts : 4 moules primitifs étiquetés + 4 définitions composées (sans aucun
+/// exemple direct de ces concepts) + 1 cible hybride combinant 2 causes à 0 octet commun.
 #[derive(Clone, Debug)]
 pub struct MultiHopEpisode {
     pub effect: Vec<u8>,
     pub hidden_concept_name: Vec<u8>,
-    pub hidden_concept_span: (usize, usize),
-    pub hidden_causes: Vec<CauseFamily>,
+    pub hidden_cause_pair: (CauseFamily, CauseFamily),
     pub hidden_prim_names: Vec<Vec<u8>>,
 }
 
@@ -371,10 +370,14 @@ fn sample_unique_words(rng: &mut Rng, count: usize, readable: bool) -> Vec<Vec<u
     if readable {
         let mut pool: Vec<&'static [u8]> = vec![
             b"SOLAR", b"LUNAR", b"PRISM", b"HELIX", b"TORUS", b"QUARK", b"ORBIT", b"PULSE",
-            b"DRIFT", b"SHARD", b"FLARE", b"CHORD", b"WEAVE", b"SPARK", b"NEXUS", b"VORTX",
+            b"DRIFT", b"SHARD", b"FLARE", b"CHORD", b"WEAVE", b"SPARK",
         ];
         rng.shuffle(&mut pool);
-        return pool.into_iter().take(count).map(|w| w.to_vec()).collect();
+        return pool
+            .into_iter()
+            .take(count)
+            .map(|w| w.to_vec())
+            .collect();
     }
     let mut out: Vec<Vec<u8>> = Vec::with_capacity(count);
     while out.len() < count {
@@ -387,22 +390,33 @@ fn sample_unique_words(rng: &mut Rng, count: usize, readable: bool) -> Vec<Vec<u
 }
 
 /// Génère une scène multi-sauts :
-/// - `hops == 2` : 4 moules + 4 définitions composées (paires) + cible 2 causes
-/// - `hops == 3` : 4 moules + 3 déf. Hop-2 + 2 méta-déf. Hop-3 + cible 3 causes
-/// Alphabets strictement disjoints : moules `[33..63]`, noms `[A..Z]`, cible `[a..z]` ou `[140..220]`.
+/// - 4 moules primitifs étiquetés (corps dans `[33..63]`, noms dans `[A..Z]`)
+/// - 4 définitions composées (paires distinctes de moules, sans exemple direct)
+/// - 1 cible composite combinant 2 causes dans `[a..z]` (0% d'octets communs avec moules et définitions)
 pub fn sample_multihop_episode(
     rng: &mut Rng,
     flat: bool,
     readable: bool,
-    hops: usize,
 ) -> MultiHopEpisode {
     let mut fams = CauseFamily::ALL.to_vec();
     rng.shuffle(&mut fams);
     fams.truncate(4);
 
-    let is_hop3 = hops >= 3;
-    let words = sample_unique_words(rng, if is_hop3 { 9 } else { 8 }, readable);
+    let words = sample_unique_words(rng, 8, readable);
     let prim_names: Vec<Vec<u8>> = words[0..4].to_vec();
+    let comp_names: Vec<Vec<u8>> = words[4..8].to_vec();
+
+    // 4 paires distinctes parmi les 6 possibles ; la paire 0 est la cible cachée
+    let mut pairs: Vec<(usize, usize)> = vec![(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)];
+    let target_pair = pairs.remove(0);
+    rng.shuffle(&mut pairs);
+    let mut chosen_pairs: Vec<(usize, usize, Vec<u8>, bool)> = vec![
+        (target_pair.0, target_pair.1, comp_names[0].clone(), true),
+        (pairs[0].0, pairs[0].1, comp_names[1].clone(), false),
+        (pairs[1].0, pairs[1].1, comp_names[2].clone(), false),
+        (pairs[2].0, pairs[2].1, comp_names[3].clone(), false),
+    ];
+    rng.shuffle(&mut chosen_pairs);
 
     let line_sep: &[u8] = if flat { b" | " } else { b"\n" };
     let assign_op: &[u8] = match rng.next_usize(3) {
@@ -417,6 +431,7 @@ pub fn sample_multihop_episode(
     };
 
     let mut effect = Vec::new();
+    // 1. Moules primitifs (alphabet [33..63] disjoint de [A..Z] et de [a..z])
     for i in 0..4 {
         if i > 0 {
             effect.extend_from_slice(line_sep);
@@ -427,94 +442,31 @@ pub fn sample_multihop_episode(
         effect.extend_from_slice(&body);
     }
 
+    // 2. Définitions composées (purement symboliques, aucun exemple)
     let mut hidden_concept_name = Vec::new();
-    let mut hidden_concept_span = (0usize, 0usize);
-    let hidden_causes: Vec<CauseFamily>;
-
-    if is_hop3 {
-        let h2_names = &words[4..7];
-        let h3_names = &words[7..9];
-
-        // 3 définitions Hop-2
-        let mut h2_defs: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = vec![
-            (h2_names[0].clone(), prim_names[0].clone(), prim_names[1].clone()),
-            (h2_names[1].clone(), prim_names[1].clone(), prim_names[2].clone()),
-            (h2_names[2].clone(), prim_names[2].clone(), prim_names[3].clone()),
-        ];
-        rng.shuffle(&mut h2_defs);
-        for (cname, lhs, rhs) in h2_defs {
-            effect.extend_from_slice(line_sep);
-            effect.extend_from_slice(&cname);
-            effect.extend_from_slice(assign_op);
-            effect.extend_from_slice(&lhs);
-            effect.extend_from_slice(join_op);
-            effect.extend_from_slice(&rhs);
+    for (u, v, cname, is_target) in chosen_pairs {
+        effect.extend_from_slice(line_sep);
+        effect.extend_from_slice(&cname);
+        effect.extend_from_slice(assign_op);
+        effect.extend_from_slice(&prim_names[u]);
+        effect.extend_from_slice(join_op);
+        effect.extend_from_slice(&prim_names[v]);
+        if is_target {
+            hidden_concept_name = cname;
         }
-
-        // 2 méta-définitions Hop-3 : M0 = C0 + P2 (cible : {P0, P1, P2}) vs M1 = C1 + P3 ({P1, P2, P3})
-        let mut h3_defs: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, bool)> = vec![
-            (h3_names[0].clone(), h2_names[0].clone(), prim_names[2].clone(), true),
-            (h3_names[1].clone(), h2_names[1].clone(), prim_names[3].clone(), false),
-        ];
-        rng.shuffle(&mut h3_defs);
-        for (mname, lhs, rhs, is_target) in h3_defs {
-            effect.extend_from_slice(line_sep);
-            let s = effect.len();
-            effect.extend_from_slice(&mname);
-            let e = effect.len();
-            effect.extend_from_slice(assign_op);
-            effect.extend_from_slice(&lhs);
-            effect.extend_from_slice(join_op);
-            effect.extend_from_slice(&rhs);
-            if is_target {
-                hidden_concept_name = mname;
-                hidden_concept_span = (s, e);
-            }
-        }
-        hidden_causes = vec![fams[0], fams[1], fams[2]];
-    } else {
-        let comp_names = &words[4..8];
-        let mut pairs: Vec<(usize, usize)> = vec![(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)];
-        let target_pair = pairs.remove(0);
-        rng.shuffle(&mut pairs);
-        let mut chosen_pairs: Vec<(usize, usize, Vec<u8>, bool)> = vec![
-            (target_pair.0, target_pair.1, comp_names[0].clone(), true),
-            (pairs[0].0, pairs[0].1, comp_names[1].clone(), false),
-            (pairs[1].0, pairs[1].1, comp_names[2].clone(), false),
-            (pairs[2].0, pairs[2].1, comp_names[3].clone(), false),
-        ];
-        rng.shuffle(&mut chosen_pairs);
-
-        for (u, v, cname, is_target) in chosen_pairs {
-            effect.extend_from_slice(line_sep);
-            let s = effect.len();
-            effect.extend_from_slice(&cname);
-            let e = effect.len();
-            effect.extend_from_slice(assign_op);
-            effect.extend_from_slice(&prim_names[u]);
-            effect.extend_from_slice(join_op);
-            effect.extend_from_slice(&prim_names[v]);
-            if is_target {
-                hidden_concept_name = cname;
-                hidden_concept_span = (s, e);
-            }
-        }
-        hidden_causes = vec![fams[target_pair.0], fams[target_pair.1]];
     }
 
-    // Cible composite à 0% d'octets communs avec les moules et les définitions
-    let (q_lo, q_hi) = if readable { (b'a', b'z') } else { (140, 220) };
+    // 3. Cible composite combinant les 2 causes dans [a..z] (0 octet commun avec le reste)
     effect.extend_from_slice(line_sep);
-    for &fam in &hidden_causes {
-        let q = sample_episode_in_range(rng, fam, q_lo, q_hi).effect;
-        effect.extend_from_slice(&q);
-    }
+    let q1 = sample_episode_in_range(rng, fams[target_pair.0], b'a', b'z').effect;
+    let q2 = sample_episode_in_range(rng, fams[target_pair.1], b'a', b'z').effect;
+    effect.extend_from_slice(&q1);
+    effect.extend_from_slice(&q2);
 
     MultiHopEpisode {
         effect,
         hidden_concept_name,
-        hidden_concept_span,
-        hidden_causes,
+        hidden_cause_pair: (fams[target_pair.0], fams[target_pair.1]),
         hidden_prim_names: prim_names,
     }
 }
