@@ -475,152 +475,6 @@ fn tighten_regime_isolated(graph: &PhiGraph, bytes: &[u8], mut cs: usize, mut ce
     (cs, ce)
 }
 
-pub fn discover_causal_regimes_from_encoded(
-    graph: &PhiGraph,
-    sub: &RawSubstrate,
-    rels: &[[f32; REL_DIM]],
-    gates_ctx: &[f32],
-    gates_pt: &[f32],
-    exact: bool,
-) -> Vec<DiscoveredRegime> {
-    let n = rels.len();
-    if n < 12 {
-        let mg = if n == 0 {
-            0.0
-        } else {
-            gates_ctx.iter().sum::<f32>() / (n as f32)
-        };
-        return vec![DiscoveredRegime {
-            core_start: 0,
-            core_end: n,
-            referent: None,
-            mean_gate: mg,
-        }];
-    }
-
-    let mut raw_runs: Vec<(usize, usize)> = Vec::new();
-    let mut in_run = false;
-    let mut run_start = 0usize;
-    for t in 0..n {
-        if gates_ctx[t] >= 0.46 {
-            if !in_run {
-                in_run = true;
-                run_start = t;
-            }
-        } else if in_run {
-            raw_runs.push((run_start, t));
-            in_run = false;
-        }
-    }
-    if in_run {
-        raw_runs.push((run_start, n));
-    }
-
-    let mut merged: Vec<(usize, usize)> = Vec::new();
-    for (s, e) in raw_runs {
-        if let Some(last) = merged.last_mut() {
-            let gap = s.saturating_sub(last.1);
-            let both_solid = last.1.saturating_sub(last.0) >= 8 && e.saturating_sub(s) >= 8;
-            if gap <= 1 || (gap <= 3 && both_solid) {
-                last.1 = e;
-                continue;
-            }
-        }
-        merged.push((s, e));
-    }
-
-    let mut active_runs: Vec<(usize, usize)> = merged
-        .into_iter()
-        .filter(|&(s, e)| e.saturating_sub(s) >= 10)
-        .collect();
-
-    if active_runs.is_empty() {
-        let mg = gates_ctx.iter().sum::<f32>() / (n as f32);
-        return vec![DiscoveredRegime {
-            core_start: 0,
-            core_end: n,
-            referent: None,
-            mean_gate: mg,
-        }];
-    }
-
-    for i in 0..active_runs.len() {
-        let min_s = if i == 0 { 0 } else { active_runs[i - 1].1 };
-        let max_e = if i + 1 == active_runs.len() {
-            n
-        } else {
-            active_runs[i + 1].0
-        };
-        let (mut s, mut e) = active_runs[i];
-
-        let mut trim_l = 0usize;
-        while s + 10 < e && trim_l < 14 && gates_pt[s] < 0.44 {
-            s += 1;
-            trim_l += 1;
-        }
-        let mut trim_r = 0usize;
-        while s + 10 < e && trim_r < 14 && gates_pt[e - 1] < 0.44 {
-            e -= 1;
-            trim_r += 1;
-        }
-
-        if trim_l == 0 {
-            let mut ext_l = 0usize;
-            while s > min_s && ext_l < 2 && gates_pt[s - 1] >= 0.68 {
-                s -= 1;
-                ext_l += 1;
-            }
-        }
-        if trim_r == 0 {
-            let mut ext_r = 0usize;
-            while e < max_e && ext_r < 2 && gates_pt[e] >= 0.68 {
-                e += 1;
-                ext_r += 1;
-            }
-        }
-
-        active_runs[i] = (s, e);
-    }
-
-    let mut cores: Vec<(usize, usize)> = Vec::new();
-    for (s, e) in active_runs {
-        for (mut cs, mut ce) in split_run_by_abduction(graph, sub, rels, s, e, exact) {
-            let mut tl = 0usize;
-            while cs + 10 < ce && tl < 4 && gates_pt[cs] < 0.40 {
-                cs += 1;
-                tl += 1;
-            }
-            let mut tr = 0usize;
-            while cs + 10 < ce && tr < 4 && gates_pt[ce - 1] < 0.40 {
-                ce -= 1;
-                tr += 1;
-            }
-            cores.push((cs, ce));
-        }
-    }
-
-    let max_mg = cores
-        .iter()
-        .map(|&(cs, ce)| gates_ctx[cs..ce].iter().sum::<f32>() / ((ce - cs).max(1) as f32))
-        .fold(0.0f32, f32::max);
-    if max_mg >= 0.72 && cores.len() >= 2 {
-        let filtered: Vec<(usize, usize)> = cores
-            .iter()
-            .copied()
-            .filter(|&(cs, ce)| {
-                let mg = gates_ctx[cs..ce].iter().sum::<f32>() / ((ce - cs).max(1) as f32);
-                let len = ce.saturating_sub(cs);
-                mg >= 0.62 * max_mg && (len >= 14 || mg >= 0.68)
-            })
-            .collect();
-        if !filtered.is_empty() {
-            cores = filtered;
-        }
-    }
-
-    attach_passive_referents(&cores, gates_ctx, n)
-}
-
 pub fn discover_causal_regimes(
     graph: &PhiGraph,
     bytes: &[u8],
@@ -933,4 +787,176 @@ pub fn format_partition(mask: u8) -> String {
         }
     }
     format!("{{{}}} | {{{}}}", a.join(","), b.join(","))
+}
+
+fn has_supported_bridge(sub: &RawSubstrate, left: (usize, usize), right: (usize, usize)) -> bool {
+    let mut bridges = 0usize;
+    for t in left.0..left.1 {
+        for idx in sub.offsets[t]..sub.offsets[t + 1] {
+            let j = sub.edge_targets[idx] as usize;
+            if j >= right.0 && j < right.1 {
+                let f = &sub.edges[idx];
+                if f[0] + f[1] + f[4] + f[5] >= 1.0 {
+                    bridges += 1;
+                    if bridges >= 2 {
+                        return true;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    false
+}
+
+pub fn discover_causal_regimes_from_encoded(
+    graph: &PhiGraph,
+    sub: &RawSubstrate,
+    rels: &[[f32; REL_DIM]],
+    gates_ctx: &[f32],
+    gates_pt: &[f32],
+    exact: bool,
+) -> Vec<DiscoveredRegime> {
+    let n = rels.len();
+    if n < 12 {
+        let mg = if n == 0 {
+            0.0
+        } else {
+            gates_ctx.iter().sum::<f32>() / (n as f32)
+        };
+        return vec![DiscoveredRegime {
+            core_start: 0,
+            core_end: n,
+            referent: None,
+            mean_gate: mg,
+        }];
+    }
+
+    let mut raw_runs: Vec<(usize, usize)> = Vec::new();
+    let mut in_run = false;
+    let mut run_start = 0usize;
+    for t in 0..n {
+        if gates_ctx[t] >= 0.46 {
+            if !in_run {
+                in_run = true;
+                run_start = t;
+            }
+        } else if in_run {
+            raw_runs.push((run_start, t));
+            in_run = false;
+        }
+    }
+    if in_run {
+        raw_runs.push((run_start, n));
+    }
+
+    // Fusionne les micro-trous <= 3, ou jusqu'à 6 octets si des arêtes supportées
+    // de la matrice d'auto-égalité enjambent le trou (ex: mot unique interne dans Grammar).
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (s, e) in raw_runs {
+        if let Some(last) = merged.last_mut() {
+            let gap = s.saturating_sub(last.1);
+            let both_solid = last.1.saturating_sub(last.0) >= 8 && e.saturating_sub(s) >= 8;
+            let bridged = gap <= 6
+                && last.1.saturating_sub(last.0) >= 6
+                && e.saturating_sub(s) >= 6
+                && has_supported_bridge(sub, *last, (s, e));
+            if gap <= 1 || (gap <= 3 && both_solid) || bridged {
+                last.1 = e;
+                continue;
+            }
+        }
+        merged.push((s, e));
+    }
+
+    let mut active_runs: Vec<(usize, usize)> = merged
+        .into_iter()
+        .filter(|&(s, e)| e.saturating_sub(s) >= 10)
+        .collect();
+
+    if active_runs.is_empty() {
+        let mg = gates_ctx.iter().sum::<f32>() / (n as f32);
+        return vec![DiscoveredRegime {
+            core_start: 0,
+            core_end: n,
+            referent: None,
+            mean_gate: mg,
+        }];
+    }
+
+    for i in 0..active_runs.len() {
+        let min_s = if i == 0 { 0 } else { active_runs[i - 1].1 };
+        let max_e = if i + 1 == active_runs.len() {
+            n
+        } else {
+            active_runs[i + 1].0
+        };
+        let (mut s, mut e) = active_runs[i];
+
+        let mut trim_l = 0usize;
+        while s + 10 < e && trim_l < 14 && gates_pt[s] < 0.44 {
+            s += 1;
+            trim_l += 1;
+        }
+        let mut trim_r = 0usize;
+        while s + 10 < e && trim_r < 14 && gates_pt[e - 1] < 0.44 {
+            e -= 1;
+            trim_r += 1;
+        }
+
+        if trim_l == 0 {
+            let mut ext_l = 0usize;
+            while s > min_s && ext_l < 2 && gates_pt[s - 1] >= 0.68 {
+                s -= 1;
+                ext_l += 1;
+            }
+        }
+        if trim_r == 0 {
+            let mut ext_r = 0usize;
+            while e < max_e && ext_r < 2 && gates_pt[e] >= 0.68 {
+                e += 1;
+                ext_r += 1;
+            }
+        }
+
+        active_runs[i] = (s, e);
+    }
+
+    let mut cores: Vec<(usize, usize)> = Vec::new();
+    for (s, e) in active_runs {
+        for (mut cs, mut ce) in split_run_by_abduction(graph, sub, rels, s, e, exact) {
+            let mut tl = 0usize;
+            while cs + 10 < ce && tl < 4 && gates_pt[cs] < 0.40 {
+                cs += 1;
+                tl += 1;
+            }
+            let mut tr = 0usize;
+            while cs + 10 < ce && tr < 4 && gates_pt[ce - 1] < 0.40 {
+                ce -= 1;
+                tr += 1;
+            }
+            cores.push((cs, ce));
+        }
+    }
+
+    let max_mg = cores
+        .iter()
+        .map(|&(cs, ce)| gates_ctx[cs..ce].iter().sum::<f32>() / ((ce - cs).max(1) as f32))
+        .fold(0.0f32, f32::max);
+    if max_mg >= 0.72 && cores.len() >= 2 {
+        let filtered: Vec<(usize, usize)> = cores
+            .iter()
+            .copied()
+            .filter(|&(cs, ce)| {
+                let mg = gates_ctx[cs..ce].iter().sum::<f32>() / ((ce - cs).max(1) as f32);
+                let len = ce.saturating_sub(cs);
+                mg >= 0.62 * max_mg && (len >= 14 || mg >= 0.68)
+            })
+            .collect();
+        if !filtered.is_empty() {
+            cores = filtered;
+        }
+    }
+
+    attach_passive_referents(&cores, gates_ctx, n)
 }
