@@ -1139,8 +1139,8 @@ fn train_closed(out_path: &Path, steps: usize, seed: u64) {
     // Adam sur le gradient ES
     let mut m_adam = vec![0.0; PARAM_COUNT];
     let mut v_adam = vec![0.0; PARAM_COUNT];
-    let beta1 = 0.9;
-    let beta2 = 0.999;
+    let beta1: f64 = 0.9;
+    let beta2: f64 = 0.999;
 
     println!(
         "=== ENTRAÎNEMENT FERMÉ PHISHARP (PTGRS + φ_sharp uniquement, {} params) ===",
