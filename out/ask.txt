@@ -1,43 +1,16 @@
-[1m[33mwarning[0m[1m: fields `mean_residual` and `regimes_found` are never read[0m
-  [1m[94m--> [0msrc/phi.rs:70:9
+[1m[33mwarning[0m[1m: field `mean_gate` is never read[0m
+  [1m[94m--> [0msrc/phi.rs:13:9
    [1m[94m|[0m
-[1m[94m65[0m [1m[94m|[0m pub struct CompositePhi {
-   [1m[94m|[0m            [1m[94m------------[0m [1m[94mfields in this struct[0m
+[1m[94m 9[0m [1m[94m|[0m pub struct DiscoveredRegime {
+   [1m[94m|[0m            [1m[94m----------------[0m [1m[94mfield in this struct[0m
 [1m[94m...[0m
-[1m[94m70[0m [1m[94m|[0m     pub mean_residual: f32,
-   [1m[94m|[0m         [1m[33m^^^^^^^^^^^^^[0m
-[1m[94m71[0m [1m[94m|[0m     pub regimes_found: usize,
-   [1m[94m|[0m         [1m[33m^^^^^^^^^^^^^[0m
+[1m[94m13[0m [1m[94m|[0m     pub mean_gate: f32,
+   [1m[94m|[0m         [1m[33m^^^^^^^^^[0m
    [1m[94m|[0m
-   [1m[94m= [0m[1mnote[0m: `CompositePhi` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+   [1m[94m= [0m[1mnote[0m: `DiscoveredRegime` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
    [1m[94m= [0m[1mnote[0m: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
 
-[1m[33mwarning[0m[1m: variant `Pipe` is never constructed[0m
-  [1m[94m--> [0msrc/ptgrs.rs:51:5
-   [1m[94m|[0m
-[1m[94m48[0m [1m[94m|[0m pub enum SepMode {
-   [1m[94m|[0m          [1m[94m-------[0m [1m[94mvariant in this enum[0m
-[1m[94m...[0m
-[1m[94m51[0m [1m[94m|[0m     Pipe,
-   [1m[94m|[0m     [1m[33m^^^^[0m
-   [1m[94m|[0m
-   [1m[94m= [0m[1mnote[0m: `SepMode` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
-
-[1m[33mwarning[0m: `phisharp` (bin "phisharp") generated 2 warnings
-[1m[92m    Finished[0m `release` profile [optimized] target(s) in 0.03s
-[1m[92m     Running[0m `target/release/phisharp ask --model out/sharp.phis --file out/stream.eff`
-=== PHISHARP ABDUCTION REPORT (v0.5 — Flux Continu Auto-Segmenté) ===
-Effet (E)       : 'out/stream.eff' (239 octets, 2 régimes causaux découverts sans séparateur)
-Cohérence scène : sélectivité=0.6455 (R_top=0.646 vs R_rest=0.000, paire [0]<->[1])
-φ_sharp(cible)  : +0.5989  [Gen=0.710 Disc=0.807 Proj=0.746 Gate=0.734 IIT=0.110, res=0.1554]
-
-Régime cible [1] (octets 170..215, gate=0.774) :
-  "KTSFBKFBKTSFBKTSFBKFBKTSFBKFBKTSFBKTSFBKeyhyw"
-
-Projection référentielle vers les régimes découverts dans perceived.eff :
-  #1 régime [0] (105..146, gate=0.653) | résonance=0.4412 | err_croisée=0.3062 | cos=-0.237 | octets_communs=27%
-     noyau   : ";TUUT;07SS70;TUUT;07SS70;TUUT;07SS70;TUUT"
-     référent (0..105) : "MOLD_GRAMMAR: =,8-W(7UW=,8EW(7UWJ%+W=,8-W=,8MOLD_SHARED: ="?"E="?"N="?"F="?":="?"!="?"MOLD_SYMMETRIC: S70"
-
-Explication projetée (alphabet de E, marge=+0.4412) :
-  MOLD_GRAMMAR: =,8-W(7UW=,8EW(7UWJ%+W=,8-W=,8MOLD_SHARED: ="?"E="?"N="?"F="?":="?"!="?"MOLD_SYMMETRIC: S70
+[1m[33mwarning[0m: `phisharp` (bin "phisharp") generated 1 warning
+[1m[92m    Finished[0m `release` profile [optimized] target(s) in 0.02s
+[1m[92m     Running[0m `target/release/phisharp ask --model out/sharp.phis --file out/mh_flat.eff`
+Erreur lecture effet 'out/mh_flat.eff': No such file or directory (os error 2)
