@@ -1,449 +1,1770 @@
 ========================================
-File: ./src/canon.rs
+File: ./src/graph.rs
 ========================================
-use crate::util::Rng;
-pub const ABSENT: u16 = u16::MAX;
+use crate::rng::Rng;
+use std::fs;
+use std::io::{self, ErrorKind};
+use std::path::Path;
+pub const NODES: usize = 6;
+pub const DIM: usize = 4;
+pub const REL_DIM: usize = 8;
+pub const SEARCH_STEPS: usize = 6;
+pub const STATE_DIM: usize = NODES * DIM;
+pub const INPUT_DIM: usize = REL_DIM * 3;
+pub const EDGE_IN: usize = 12;
+pub const EDGE_HID: usize = 4;
+pub const NODE_IN: usize = EDGE_HID * 2 + 2;
+pub const GATE_IN: usize = EDGE_HID * 2 + 2;
+pub const GATE_HID: usize = 4;
+const OFF_REL_EDGE_W: usize = 0; 
+const OFF_REL_EDGE_B: usize = OFF_REL_EDGE_W + EDGE_HID * EDGE_IN; 
+const OFF_REL_NODE_W: usize = OFF_REL_EDGE_B + EDGE_HID; 
+const OFF_REL_NODE_B: usize = OFF_REL_NODE_W + REL_DIM * NODE_IN; 
+const OFF_GATE_W1: usize = OFF_REL_NODE_B + REL_DIM; 
+const OFF_GATE_B1: usize = OFF_GATE_W1 + GATE_HID * GATE_IN; 
+const OFF_GATE_W2: usize = OFF_GATE_B1 + GATE_HID; 
+const OFF_GATE_B2: usize = OFF_GATE_W2 + GATE_HID; 
+const OFF_EDGE: usize = OFF_GATE_B2 + 1; 
+const OFF_BIAS: usize = OFF_EDGE + NODES * NODES * DIM * DIM; 
+const OFF_IN: usize = OFF_BIAS + NODES * DIM; 
+const OFF_G1: usize = OFF_IN + NODES * DIM * INPUT_DIM; 
+const OFF_G2: usize = OFF_G1 + DIM * (2 * DIM); 
+const OFF_BH: usize = OFF_G2 + DIM * (2 * DIM); 
+const OFF_CTX: usize = OFF_BH + DIM * (2 * DIM); 
+const OFF_U: usize = OFF_CTX + DIM * REL_DIM; 
+const OFF_OUT: usize = OFF_U + DIM * DIM; 
+pub const NUM_PARAMS: usize = OFF_OUT + REL_DIM * DIM; 
+const MAGIC: &[u8; 4] = b"PHIS";
+const VERSION: u32 = 5;
 #[derive(Clone, Debug)]
-pub struct Canon {
-    pub syms: Vec<u16>,
-    pub byte_of: Vec<u8>,
-    pub sym_of: [u16; 256],
+pub struct RawSubstrate {
+    pub len: usize,
+    pub offsets: Vec<usize>,
+    pub edges: Vec<[f32; EDGE_IN]>,
+    pub edge_targets: Vec<u32>,
+    pub deg: Vec<f32>,
 }
-impl Canon {
-    pub fn new(bytes: &[u8]) -> Canon {
-        let mut sym_of = [ABSENT; 256];
-        let mut byte_of: Vec<u8> = Vec::new();
-        let mut syms: Vec<u16> = Vec::with_capacity(bytes.len());
-        for &b in bytes {
-            let slot = &mut sym_of[b as usize];
-            if *slot == ABSENT {
-                *slot = byte_of.len() as u16;
-                byte_of.push(b);
+impl RawSubstrate {
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        let n = bytes.len();
+        let win_cap = 30usize;
+        let deg_rad = 12usize;
+        let max_edges = 12usize;
+        let log_cap = (win_cap as f32).ln();
+        let m_nb = |a: isize, b: isize, ti: isize, ji: isize| -> f32 {
+            if a >= 0 && b >= 0 && a != b && !(a == ji && b == ti) {
+                let au = a as usize;
+                let bu = b as usize;
+                if au < n && bu < n && bytes[au] == bytes[bu] {
+                    return 1.0;
+                }
             }
-            syms.push(*slot);
+            0.0
+        };
+        let mut offsets = Vec::with_capacity(n + 1);
+        let mut edges = Vec::with_capacity(n * 6);
+        let mut edge_targets = Vec::with_capacity(n * 6);
+        let mut deg = Vec::with_capacity(n);
+        let mut candidates: Vec<(usize, usize, f32)> = Vec::with_capacity(32);
+        offsets.push(0);
+        for t in 0..n {
+            let b = bytes[t];
+            let lo = t.saturating_sub(win_cap);
+            let hi = (t + win_cap + 1).min(n);
+            let deg_lo = t.saturating_sub(deg_rad);
+            let deg_hi = (t + deg_rad + 1).min(n);
+            let deg_span = (deg_hi - deg_lo).saturating_sub(1).max(1);
+            let ti = t as isize;
+            candidates.clear();
+            let mut local_matches = 0usize;
+            for j in lo..hi {
+                if j != t && bytes[j] == b {
+                    let dist = t.abs_diff(j);
+                    if dist <= deg_rad {
+                        local_matches += 1;
+                    }
+                    let ji = j as isize;
+                    let neigh = m_nb(ti - 1, ji - 1, ti, ji)
+                        + m_nb(ti + 1, ji + 1, ti, ji)
+                        + m_nb(ti - 2, ji - 2, ti, ji)
+                        + m_nb(ti + 2, ji + 2, ti, ji)
+                        + m_nb(ti - 1, ji + 1, ti, ji)
+                        + m_nb(ti + 1, ji - 1, ti, ji)
+                        + m_nb(ti - 2, ji + 2, ti, ji)
+                        + m_nb(ti + 2, ji - 2, ti, ji);
+                    candidates.push((j, dist, neigh));
+                }
+            }
+            deg.push(2.0 * (local_matches as f32 / deg_span as f32) - 1.0);
+            let match_count = candidates.len();
+            let mut selected: Vec<usize> = Vec::with_capacity(max_edges.min(match_count));
+            if match_count <= max_edges {
+                for &(j, _, _) in &candidates {
+                    selected.push(j);
+                }
+            } else {
+                let mut by_dist = candidates.clone();
+                by_dist.sort_unstable_by_key(|c| c.1);
+                for &(j, _, _) in by_dist.iter().take(6) {
+                    selected.push(j);
+                }
+                candidates.sort_by(|a, b| b.2.total_cmp(&a.2).then_with(|| a.1.cmp(&b.1)));
+                for &(j, _, _) in &candidates {
+                    if selected.len() >= max_edges {
+                        break;
+                    }
+                    if !selected.contains(&j) {
+                        selected.push(j);
+                    }
+                }
+            }
+            for j in selected {
+                let ji = j as isize;
+                let dist = t.abs_diff(j) as f32;
+                let log_dist = (dist.ln() / log_cap).clamp(0.0, 1.0);
+                let dir = if j < t { -1.0 } else { 1.0 };
+                edges.push([
+                    m_nb(ti - 1, ji - 1, ti, ji),
+                    m_nb(ti + 1, ji + 1, ti, ji),
+                    m_nb(ti - 2, ji - 2, ti, ji),
+                    m_nb(ti + 2, ji + 2, ti, ji),
+                    m_nb(ti - 1, ji + 1, ti, ji),
+                    m_nb(ti + 1, ji - 1, ti, ji),
+                    m_nb(ti - 2, ji + 2, ti, ji),
+                    m_nb(ti + 2, ji - 2, ti, ji),
+                    m_nb(ti - 1, ji, ti, ji),
+                    m_nb(ti, ji - 1, ti, ji),
+                    log_dist,
+                    dir,
+                ]);
+                edge_targets.push(j as u32);
+            }
+            offsets.push(edges.len());
         }
-        Canon { syms, byte_of, sym_of }
-    }
-    pub fn n(&self) -> usize {
-        self.byte_of.len()
-    }
-    pub fn len(&self) -> usize {
-        self.syms.len()
-    }
-    pub fn is_empty(&self) -> bool {
-        self.syms.is_empty()
-    }
-    pub fn bytes_of(&self, syms: &[u16]) -> Vec<u8> {
-        syms.iter().filter_map(|&s| self.byte_of.get(s as usize).copied()).collect()
+        Self {
+            len: n,
+            offsets,
+            edges,
+            edge_targets,
+            deg,
+        }
     }
 }
-pub fn permute(bytes: &[u8], perm: &[u8; 256]) -> Vec<u8> {
-    bytes.iter().map(|&b| perm[b as usize]).collect()
+#[derive(Clone, Debug)]
+pub struct PhiGraph {
+    pub weights: Vec<f32>,
 }
-pub fn random_perm(rng: &mut Rng) -> [u8; 256] {
-    let mut v: Vec<u8> = (0..=255u8).collect();
-    rng.shuffle(&mut v);
-    let mut p = [0u8; 256];
-    p.copy_from_slice(&v);
-    p
+#[derive(Clone, Debug)]
+pub struct AbductionTrace {
+    pub final_state: [f32; STATE_DIM],
+    pub step_residuals: Vec<f32>,
+    pub final_pos_err: Vec<f32>,
+    pub final_mean_err: f32,
 }
-pub fn inverse(perm: &[u8; 256]) -> [u8; 256] {
-    let mut inv = [0u8; 256];
-    for (i, &p) in perm.iter().enumerate() {
-        inv[p as usize] = i as u8;
+impl PhiGraph {
+    pub fn random(rng: &mut Rng) -> Self {
+        let mut weights = Vec::with_capacity(NUM_PARAMS);
+        for _ in 0..NUM_PARAMS {
+            weights.push(rng.next_normal() * 0.22);
+        }
+        Self { weights }
     }
-    inv
+    pub fn from_weights(weights: Vec<f32>) -> Self {
+        assert_eq!(weights.len(), NUM_PARAMS);
+        Self { weights }
+    }
+    pub fn encode_with_gate(&self, sub: &RawSubstrate) -> (Vec<[f32; REL_DIM]>, Vec<f32>, Vec<f32>) {
+        let w = &self.weights;
+        let n = sub.len;
+        if n == 0 {
+            return (Vec::new(), Vec::new(), Vec::new());
+        }
+        let mut pre = Vec::with_capacity(n);
+        let mut e_max_all = Vec::with_capacity(n);
+        let mut has_all = Vec::with_capacity(n);
+        let mut energy = 0.0f32;
+        for t in 0..n {
+            let slice = &sub.edges[sub.offsets[t]..sub.offsets[t + 1]];
+            let mut e_max = [-1.0f32; EDGE_HID];
+            let mut e_mean = [-1.0f32; EDGE_HID];
+            let has_edge;
+            if !slice.is_empty() {
+                has_edge = 1.0f32;
+                e_max = [f32::NEG_INFINITY; EDGE_HID];
+                e_mean = [0.0f32; EDGE_HID];
+                let inv_c = 1.0 / (slice.len() as f32);
+                for feat in slice {
+                    for h in 0..EDGE_HID {
+                        let base = OFF_REL_EDGE_W + h * EDGE_IN;
+                        let mut acc = w[OFF_REL_EDGE_B + h];
+                        for k in 0..EDGE_IN {
+                            acc += w[base + k] * feat[k];
+                        }
+                        let val = acc.tanh();
+                        if val > e_max[h] {
+                            e_max[h] = val;
+                        }
+                        e_mean[h] += val * inv_c;
+                    }
+                }
+            } else {
+                has_edge = -1.0f32;
+            }
+            e_max_all.push(e_max);
+            has_all.push(has_edge);
+            let node_in = [
+                e_max[0],
+                e_max[1],
+                e_max[2],
+                e_max[3],
+                e_mean[0],
+                e_mean[1],
+                e_mean[2],
+                e_mean[3],
+                sub.deg[t],
+                has_edge,
+            ];
+            let mut row = [0.0f32; REL_DIM];
+            for r in 0..REL_DIM {
+                let base = OFF_REL_NODE_W + r * NODE_IN;
+                let mut acc = 0.25 * w[OFF_REL_NODE_B + r];
+                for k in 0..NODE_IN {
+                    acc += w[base + k] * node_in[k];
+                }
+                row[r] = acc;
+                energy += acc * acc;
+            }
+            pre.push(row);
+        }
+        let rms = (energy / ((n * REL_DIM) as f32) + 1e-4).sqrt();
+        let inv = 1.25 / rms;
+        for row in &mut pre {
+            for val in row.iter_mut() {
+                *val = (*val * inv).tanh();
+            }
+        }
+        let eval_gate = |g_in: &[f32; GATE_IN]| -> f32 {
+            let mut logit = w[OFF_GATE_B2];
+            for h in 0..GATE_HID {
+                let base = OFF_GATE_W1 + h * GATE_IN;
+                let mut acc = w[OFF_GATE_B1 + h];
+                for k in 0..GATE_IN {
+                    acc += w[base + k] * g_in[k];
+                }
+                logit += w[OFF_GATE_W2 + h] * acc.tanh();
+            }
+            1.0 / (1.0 + (-logit.clamp(-12.0, 12.0)).exp())
+        };
+        let mut gates_ctx = Vec::with_capacity(n);
+        let mut gates_pt = Vec::with_capacity(n);
+        for t in 0..n {
+            let lo = t.saturating_sub(2);
+            let hi = (t + 2).min(n - 1);
+            let inv_w = 1.0 / ((hi - lo + 1) as f32);
+            let mut loc_max = [0.0f32; EDGE_HID];
+            let mut loc_deg = 0.0f32;
+            let mut loc_has = 0.0f32;
+            for j in lo..=hi {
+                for h in 0..EDGE_HID {
+                    loc_max[h] += e_max_all[j][h] * inv_w;
+                }
+                loc_deg += sub.deg[j] * inv_w;
+                loc_has += has_all[j] * inv_w;
+            }
+            let g_in_ctx = [
+                loc_max[0],
+                loc_max[1],
+                loc_max[2],
+                loc_max[3],
+                e_max_all[t][0],
+                e_max_all[t][1],
+                e_max_all[t][2],
+                e_max_all[t][3],
+                loc_deg,
+                loc_has,
+            ];
+            let g_in_pt = [
+                e_max_all[t][0],
+                e_max_all[t][1],
+                e_max_all[t][2],
+                e_max_all[t][3],
+                e_max_all[t][0],
+                e_max_all[t][1],
+                e_max_all[t][2],
+                e_max_all[t][3],
+                sub.deg[t],
+                has_all[t],
+            ];
+            gates_ctx.push(eval_gate(&g_in_ctx));
+            gates_pt.push(eval_gate(&g_in_pt));
+        }
+        (pre, gates_ctx, gates_pt)
+    }
+    pub fn encode_relations(&self, sub: &RawSubstrate) -> Vec<[f32; REL_DIM]> {
+        self.encode_with_gate(sub).0
+    }
+    pub fn encode_bytes(&self, bytes: &[u8]) -> Vec<[f32; REL_DIM]> {
+        let sub = RawSubstrate::from_bytes(bytes);
+        self.encode_relations(&sub)
+    }
+    pub fn evaluate_hypothesis(
+        &self,
+        state: &[f32; STATE_DIM],
+        rels: &[[f32; REL_DIM]],
+    ) -> (Vec<[f32; REL_DIM]>, Vec<f32>, f32) {
+        let w = &self.weights;
+        let mut g1 = [0.0f32; DIM];
+        let mut g2 = [0.0f32; DIM];
+        let mut bh = [0.0f32; DIM];
+        for d in 0..DIM {
+            let mut s1 = 0.0f32;
+            let mut s2 = 0.0f32;
+            let mut s3 = 0.0f32;
+            for k in 0..(2 * DIM) {
+                s1 += w[OFF_G1 + d * (2 * DIM) + k] * state[k];
+                s2 += w[OFF_G2 + d * (2 * DIM) + k] * state[2 * DIM + k];
+                s3 += w[OFF_BH + d * (2 * DIM) + k] * state[4 * DIM + k];
+            }
+            g1[d] = s1.tanh();
+            g2[d] = s2.tanh();
+            bh[d] = s3.tanh();
+        }
+        let mut u = [0.0f32; DIM];
+        let mut preds = Vec::with_capacity(rels.len());
+        let mut pos_err = Vec::with_capacity(rels.len());
+        let mut total_err = 0.0f32;
+        for t in 0..rels.len() {
+            let prev = if t == 0 {
+                [0.0f32; REL_DIM]
+            } else {
+                rels[t - 1]
+            };
+            let mut u_next = [0.0f32; DIM];
+            for d in 0..DIM {
+                let mut ctx = 0.0f32;
+                for r in 0..REL_DIM {
+                    ctx += w[OFF_CTX + d * REL_DIM + r] * prev[r];
+                }
+                let mut rec = 0.0f32;
+                for k in 0..DIM {
+                    rec += w[OFF_U + d * DIM + k] * u[k];
+                }
+                u_next[d] = (g1[d] * ctx + g2[d] * rec + bh[d]).tanh();
+            }
+            u = u_next;
+            let mut pred = [0.0f32; REL_DIM];
+            let mut err_t = 0.0f32;
+            for r in 0..REL_DIM {
+                let mut acc = 0.0f32;
+                for d in 0..DIM {
+                    acc += w[OFF_OUT + r * DIM + d] * u[d];
+                }
+                pred[r] = acc.tanh();
+                let diff = rels[t][r] - pred[r];
+                err_t += diff * diff;
+            }
+            err_t /= REL_DIM as f32;
+            preds.push(pred);
+            pos_err.push(err_t);
+            total_err += err_t;
+        }
+        let mean_err = if rels.is_empty() {
+            0.0
+        } else {
+            total_err / (rels.len() as f32)
+        };
+        (preds, pos_err, mean_err)
+    }
+    pub fn abduce_with_steps(
+        &self,
+        rels: &[[f32; REL_DIM]],
+        cut_mask: Option<u8>,
+        steps: usize,
+    ) -> AbductionTrace {
+        let w = &self.weights;
+        let mut state = [0.0f32; STATE_DIM];
+        let mut step_residuals = Vec::with_capacity(steps + 1);
+        let mid = (rels.len() / 2).max(1);
+        let inv_a = 1.0 / (mid as f32);
+        let inv_b = 1.0 / (rels.len().saturating_sub(mid).max(1) as f32);
+        let len_inv = 1.0 / (rels.len().max(1) as f32);
+        for _ in 0..steps {
+            let (preds, _, mean_err) = self.evaluate_hypothesis(&state, rels);
+            step_residuals.push(mean_err);
+            let mut inp = [0.0f32; INPUT_DIM];
+            for t in 0..rels.len() {
+                let prev = if t == 0 {
+                    [0.0f32; REL_DIM]
+                } else {
+                    rels[t - 1]
+                };
+                for r in 0..REL_DIM {
+                    let err = rels[t][r] - preds[t][r];
+                    if t < mid {
+                        inp[r] += err * inv_a;
+                    } else {
+                        inp[REL_DIM + r] += err * inv_b;
+                    }
+                    inp[2 * REL_DIM + r] += (prev[r] * err) * len_inv;
+                }
+            }
+            let mut next_state = [0.0f32; STATE_DIM];
+            for i in 0..NODES {
+                let part_i = cut_mask.map(|m| (m >> i) & 1);
+                for d in 0..DIM {
+                    let mut acc = w[OFF_BIAS + i * DIM + d];
+                    for j in 0..NODES {
+                        if let Some(pi) = part_i {
+                            let pj = (cut_mask.unwrap() >> j) & 1;
+                            if i != j && pi != pj {
+                                continue;
+                            }
+                        }
+                        let base = OFF_EDGE + (i * NODES + j) * DIM * DIM + d * DIM;
+                        for k in 0..DIM {
+                            acc += w[base + k] * state[j * DIM + k];
+                        }
+                    }
+                    let in_base = OFF_IN + (i * DIM + d) * INPUT_DIM;
+                    for m in 0..INPUT_DIM {
+                        acc += w[in_base + m] * inp[m];
+                    }
+                    let idx = i * DIM + d;
+                    next_state[idx] = 0.35 * state[idx] + 0.65 * acc.tanh();
+                }
+            }
+            state = next_state;
+        }
+        let (_, final_pos_err, final_mean_err) = self.evaluate_hypothesis(&state, rels);
+        step_residuals.push(final_mean_err);
+        AbductionTrace {
+            final_state: state,
+            step_residuals,
+            final_pos_err,
+            final_mean_err,
+        }
+    }
+    pub fn abduce(&self, rels: &[[f32; REL_DIM]], cut_mask: Option<u8>) -> AbductionTrace {
+        self.abduce_with_steps(rels, cut_mask, SEARCH_STEPS)
+    }
+    pub fn save<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
+        if let Some(parent) = path.as_ref().parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)?;
+        }
+        let mut buf = Vec::with_capacity(12 + NUM_PARAMS * 4);
+        buf.extend_from_slice(MAGIC);
+        buf.extend_from_slice(&VERSION.to_le_bytes());
+        buf.extend_from_slice(&(NUM_PARAMS as u32).to_le_bytes());
+        for &val in &self.weights {
+            buf.extend_from_slice(&val.to_le_bytes());
+        }
+        fs::write(path, buf)
+    }
+    pub fn load<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        let data = fs::read(path)?;
+        if data.len() < 12 || &data[0..4] != MAGIC {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "Fichier .phis invalide (en-tête manquant)",
+            ));
+        }
+        let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
+        let count = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
+        if version != VERSION || count != NUM_PARAMS || data.len() != 12 + count * 4 {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "Version ou taille du modèle .phis incompatible (ré-entraîne avec v0.6.1)",
+            ));
+        }
+        let mut weights = Vec::with_capacity(count);
+        for chunk in data[12..].chunks_exact(4) {
+            weights.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+        }
+        Ok(Self { weights })
+    }
 }
-
-
-
-========================================
-File: ./src/lib.rs
-========================================
-#![forbid(unsafe_code)]
-pub mod util;
-pub mod canon;
-pub mod ptgrs;
 
 
 
 ========================================
 File: ./src/main.rs
 ========================================
-fn main() {}
-
-
-
-========================================
-File: ./src/model.rs
-========================================
+mod graph;
+mod multihop;
+mod phi;
+mod ptgrs;
+mod rng;
+mod train;
+use crate::graph::PhiGraph;
+use crate::multihop::{MultiHopAnalysis, analyze_monolithic_residual, analyze_multihop};
+use crate::phi::{
+    compute_composite_phi, compute_phi_sharp, extract_abductive_core, fnv_hash, format_partition,
+};
+use crate::ptgrs::{
+    CauseFamily, SepMode, sample_composite_episode, sample_episode, sample_multihop_episode,
+};
+use crate::rng::Rng;
+use crate::train::{TrainConfig, train_phisharp};
+use std::env;
 use std::fs;
-use std::io::{self, Read, Write};
-use std::path::Path;
-use crate::ad::Params;
-use crate::eff::ViewCfg;
-use crate::emit::EmitCfg;
-use crate::abduction::SearchCfg;
-use crate::phi::PhiCfg;
-use crate::rng::fnv1a;
-pub const MAGIC: &[u8; 8] = b"PHISharp";
-pub const FORMAT: u32 = 1;
-pub const CLOSED_EXPERIMENT: &str = "phisharp-closed-v1";
-#[derive(Clone, Copy, Debug)]
-pub struct Closure {
-    pub ptgrs: bool,
-    pub phi: bool,
-    pub nl_text: bool,
-    pub definitions: bool,
-    pub self_described_e: bool,
-    pub rendered_h: bool,
-    pub intentions: bool,
-    pub pretrained_prior: bool,
-    pub nl_head: bool,
+use std::process;
+fn usage() -> ! {
+    eprintln!("Usage:");
+    eprintln!("  phisharp train --out out/sharp.phis [--steps 300] [--seed 42]");
+    eprintln!(
+        "  phisharp sample --out perceived.eff [--family periodic|symmetric|nested|shared|substitution|grammar|composite|stream|multihop|multihop_flat] [--seed 7]"
+    );
+    eprintln!("  phisharp ask --model out/sharp.phis --file perceived.eff");
+    process::exit(1);
 }
-impl Closure {
-    pub fn closed() -> Self {
-        Closure {
-            ptgrs: true,
-            phi: true,
-            nl_text: false,
-            definitions: false,
-            self_described_e: false,
-            rendered_h: false,
-            intentions: false,
-            pretrained_prior: false,
-            nl_head: false,
+fn arg_val(args: &[String], flag: &str) -> Option<String> {
+    args.windows(2)
+        .find(|w| w[0] == flag)
+        .map(|w| w[1].clone())
+}
+fn printable_preview(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|&b| {
+            if (32..=126).contains(&b) {
+                b as char
+            } else {
+                '.'
+            }
+        })
+        .collect()
+}
+fn trim_ctrl(bytes: &[u8]) -> &[u8] {
+    let mut s = 0usize;
+    let mut e = bytes.len();
+    while s < e && bytes[s] < 32 {
+        s += 1;
+    }
+    while e > s && bytes[e - 1] < 32 {
+        e -= 1;
+    }
+    &bytes[s..e]
+}
+fn hex_preview(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+fn main() {
+    let args: Vec<String> = env::args().collect();
+    if args.len() < 2 {
+        usage();
+    }
+    match args[1].as_str() {
+        "train" => {
+            let out_path = arg_val(&args, "--out").unwrap_or_else(|| "out/sharp.phis".to_string());
+            let steps = arg_val(&args, "--steps")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(300);
+            let seed = arg_val(&args, "--seed")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(42);
+            let cfg = TrainConfig {
+                steps,
+                pop_pairs: 24,
+                sigma: 0.08,
+                lr: 0.03,
+                seed,
+            };
+            let model = train_phisharp(&cfg);
+            if let Err(e) = model.save(&out_path) {
+                eprintln!("Erreur écriture modèle '{}': {}", out_path, e);
+                process::exit(1);
+            }
+            println!("\nModèle sauvegardé dans '{}'.", out_path);
         }
-    }
-    pub fn is_closed(&self) -> bool {
-        self.ptgrs
-            && self.phi
-            && !self.nl_text
-            && !self.definitions
-            && !self.self_described_e
-            && !self.rendered_h
-            && !self.intentions
-            && !self.pretrained_prior
-            && !self.nl_head
-    }
-    pub fn bits(&self) -> u32 {
-        let f = [
-            self.ptgrs,
-            self.phi,
-            self.nl_text,
-            self.definitions,
-            self.self_described_e,
-            self.rendered_h,
-            self.intentions,
-            self.pretrained_prior,
-            self.nl_head,
-        ];
-        let mut x = 0u32;
-        for (i, b) in f.iter().enumerate() {
-            if *b {
-                x |= 1 << i;
+        "sample" => {
+            let out_path = arg_val(&args, "--out").unwrap_or_else(|| "perceived.eff".to_string());
+            let seed = arg_val(&args, "--seed")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(7);
+            let mut rng = Rng::new(seed);
+            match arg_val(&args, "--family").as_deref() {
+                Some("composite") => {
+                    let ep =
+                        sample_composite_episode(&mut rng, 4, true, true, true, SepMode::Newline);
+                    if let Err(e) = fs::write(&out_path, &ep.effect) {
+                        eprintln!("Erreur écriture '{}': {}", out_path, e);
+                        process::exit(1);
+                    }
+                    println!(
+                        "Scène composite générée dans '{}' ({} octets, moule caché = bloc {} [{}])",
+                        out_path,
+                        ep.effect.len(),
+                        ep.hidden_match_idx,
+                        ep.hidden_families[ep.hidden_match_idx].name()
+                    );
+                    println!("  FLUX : {}", printable_preview(&ep.effect));
+                    return;
+                }
+                Some("stream") => {
+                    let ep = sample_composite_episode(&mut rng, 4, true, true, true, SepMode::None);
+                    if let Err(e) = fs::write(&out_path, &ep.effect) {
+                        eprintln!("Erreur écriture '{}': {}", out_path, e);
+                        process::exit(1);
+                    }
+                    println!(
+                        "Flux continu SANS séparateur généré dans '{}' ({} octets, moule caché = {} [{}])",
+                        out_path,
+                        ep.effect.len(),
+                        ep.hidden_match_idx,
+                        ep.hidden_families[ep.hidden_match_idx].name()
+                    );
+                    println!("  FLUX : {}", printable_preview(&ep.effect));
+                    return;
+                }
+                Some("multihop") | Some("multihop_flat") => {
+                    let flat = arg_val(&args, "--family").as_deref() == Some("multihop_flat");
+                    let ep = sample_multihop_episode(&mut rng, flat, true);
+                    if let Err(e) = fs::write(&out_path, &ep.effect) {
+                        eprintln!("Erreur écriture '{}': {}", out_path, e);
+                        process::exit(1);
+                    }
+                    println!(
+                        "Scène multi-sauts{} générée dans '{}' ({} octets, concept caché = {} [{} + {}])",
+                        if flat { " (flux plat)" } else { "" },
+                        out_path,
+                        ep.effect.len(),
+                        printable_preview(&ep.hidden_concept_name),
+                        ep.hidden_cause_pair.0.name(),
+                        ep.hidden_cause_pair.1.name(),
+                    );
+                    println!("  Moules : {}", ep.hidden_prim_names.iter().map(|n| printable_preview(n)).collect::<Vec<_>>().join(", "));
+                    println!("\n{}", String::from_utf8_lossy(&ep.effect));
+                    return;
+                }
+                _ => {}
+            }
+            let family = match arg_val(&args, "--family") {
+                Some(name) => CauseFamily::from_name(&name).unwrap_or_else(|| {
+                    eprintln!(
+                        "Famille inconnue '{}'. Choix: periodic, symmetric, nested, shared, substitution, grammar, composite, stream, multihop, multihop_flat.",
+                        name
+                    );
+                    process::exit(1);
+                }),
+                None => CauseFamily::ALL[rng.next_usize(CauseFamily::ALL.len())],
+            };
+            let ep = sample_episode(&mut rng, family);
+            if let Err(e) = fs::write(&out_path, &ep.effect) {
+                eprintln!("Erreur écriture '{}': {}", out_path, e);
+                process::exit(1);
+            }
+            println!(
+                "Effet généré dans '{}' ({} octets, cause cachée = {})",
+                out_path,
+                ep.effect.len(),
+                ep.hidden_cause.name()
+            );
+            println!("  ASCII : {}", printable_preview(&ep.effect));
+        }
+        "ask" => {
+            let model_path = arg_val(&args, "--model").unwrap_or_else(|| usage());
+            let file_path = arg_val(&args, "--file").unwrap_or_else(|| usage());
+            let model = PhiGraph::load(&model_path).unwrap_or_else(|e| {
+                eprintln!("Erreur chargement modèle '{}': {}", model_path, e);
+                process::exit(1);
+            });
+            let bytes = fs::read(&file_path).unwrap_or_else(|e| {
+                eprintln!("Erreur lecture effet '{}': {}", file_path, e);
+                process::exit(1);
+            });
+            if bytes.len() < 4 {
+                eprintln!("'{}' doit contenir au moins 4 octets.", file_path);
+                process::exit(1);
+            }
+            if let Some(ana) = analyze_multihop(&model, &bytes) {
+                run_ask_continuous(&model, &file_path, &bytes, &ana);
+            } else {
+                run_ask_monolithic(&model, &file_path, &bytes);
             }
         }
-        x
+        _ => usage(),
     }
-    pub fn from_bits(x: u32) -> Self {
-        let g = |i: usize| (x >> i) & 1 == 1;
-        Closure {
-            ptgrs: g(0),
-            phi: g(1),
-            nl_text: g(2),
-            definitions: g(3),
-            self_described_e: g(4),
-            rendered_h: g(5),
-            intentions: g(6),
-            pretrained_prior: g(7),
-            nl_head: g(8),
+}
+fn run_ask_monolithic(model: &PhiGraph, file_path: &str, bytes: &[u8]) {
+    let mut rng = Rng::new(fnv_hash(bytes));
+    let rep = compute_phi_sharp(model, bytes, &mut rng, true);
+    let rels = model.encode_bytes(bytes);
+    let res_split = analyze_monolithic_residual(model, bytes);
+    println!("=== PHISHARP ABDUCTION REPORT (v0.6 — Monolithique) ===");
+    println!("Effet (E)       : '{}' ({} octets)", file_path, bytes.len());
+    println!("φ_sharp         : {:+.4}", rep.phi_sharp);
+    println!(
+        "  Générativité  : {:.4}  (résidu moyen = {:.4})",
+        rep.generativity, rep.residual
+    );
+    println!("  Discrimination: {:.4}", rep.discrimination);
+    println!(
+        "  Projection    : {:.4}  [réfut={:.3} | dépl={:.3} | abst={:.3}]",
+        rep.projection, rep.refutation_stab, rep.displacement_stab, rep.abstraction_stab
+    );
+    println!(
+        "  Porte causale : {:.4}  (contraste={:.3})",
+        rep.mean_gate, rep.gate_contrast
+    );
+    println!(
+        "  Intégration   : {:.4}  (MIP exacte sur 31 coupes : perte={:.4}, coupe {})",
+        rep.integration,
+        rep.mip_loss,
+        format_partition(rep.mip_mask)
+    );
+    let traj_str = rep
+        .trace
+        .step_residuals
+        .iter()
+        .enumerate()
+        .map(|(t, r)| format!("t{}={:.3}", t, r))
+        .collect::<Vec<_>>()
+        .join(" -> ");
+    println!("\nTrajectoire abductive (résidu) :");
+    println!(
+        "  {}  (gain/t0={:+.3}, rebond={:.4})",
+        traj_str, rep.traj_gain, rep.bounce_pen
+    );
+    if res_split.parts.len() >= 2 {
+        println!(
+            "\nDécomposition multi-causes induite par le résidu (res {:.4} -> {:.4}, cos={:+.3}) :",
+            res_split.single_err, res_split.split_err, res_split.cross_cos
+        );
+        for (i, &(a, b)) in res_split.parts.iter().enumerate() {
+            println!("  cause #{} ({}..{}) : \"{}\"", i + 1, a, b, printable_preview(&bytes[a..b]));
         }
     }
-}
-#[derive(Clone)]
-pub struct Model {
-    pub params: Params,
-    pub view: ViewCfg,
-    pub search: SearchCfg,
-    pub emit: EmitCfg,
-    pub seed: u64,
-    pub episodes: u64,
-    pub steps: u64,
-    pub closure: Closure,
-    pub experiment: String,
-    pub fingerprint: u64,
-}
-fn pu64(b: &mut Vec<u8>, x: u64) {
-    b.extend_from_slice(&x.to_le_bytes());
-}
-fn pu32(b: &mut Vec<u8>, x: u32) {
-    b.extend_from_slice(&x.to_le_bytes());
-}
-fn pf32(b: &mut Vec<u8>, x: f32) {
-    b.extend_from_slice(&x.to_le_bytes());
-}
-fn pu8(b: &mut Vec<u8>, x: u8) {
-    b.push(x);
-}
-fn pstr(b: &mut Vec<u8>, s: &str) {
-    pu64(b, s.len() as u64);
-    b.extend_from_slice(s.as_bytes());
-}
-struct Rd<'a> {
-    b: &'a [u8],
-    i: usize,
-}
-impl<'a> Rd<'a> {
-    fn take(&mut self, n: usize) -> io::Result<&'a [u8]> {
-        if self.i.checked_add(n).map(|e| e > self.b.len()).unwrap_or(true) {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "artefact tronque"));
-        }
-        let s = &self.b[self.i..self.i + n];
-        self.i += n;
-        Ok(s)
-    }
-    fn u64(&mut self) -> io::Result<u64> {
-        let s = self.take(8)?;
-        let mut a = [0u8; 8];
-        a.copy_from_slice(s);
-        Ok(u64::from_le_bytes(a))
-    }
-    fn u32(&mut self) -> io::Result<u32> {
-        let s = self.take(4)?;
-        let mut a = [0u8; 4];
-        a.copy_from_slice(s);
-        Ok(u32::from_le_bytes(a))
-    }
-    fn f32(&mut self) -> io::Result<f32> {
-        let s = self.take(4)?;
-        let mut a = [0u8; 4];
-        a.copy_from_slice(s);
-        Ok(f32::from_le_bytes(a))
-    }
-    fn u8(&mut self) -> io::Result<u8> {
-        Ok(self.take(1)?[0])
-    }
-    fn boolean(&mut self) -> io::Result<bool> {
-        Ok(self.u8()? != 0)
-    }
-    fn string(&mut self) -> io::Result<String> {
-        let n = self.u64()? as usize;
-        if n > 4096 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "etiquette trop longue"));
-        }
-        let s = self.take(n)?;
-        String::from_utf8(s.to_vec())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "etiquette non utf8"))
+    let (start, motif, err_all) =
+        extract_abductive_core(model, bytes, &rels, &rep.trace.final_state);
+    println!(
+        "\nNoyau abductif auto-projeté (offset {}, régénère tout E avec résidu {:.4}) :",
+        start, err_all
+    );
+    println!("  ASCII : \"{}\"", printable_preview(&motif));
+    println!("  HEX   : {}", hex_preview(&motif));
+    let mut ranked: Vec<(usize, f32)> = rep
+        .trace
+        .final_pos_err
+        .iter()
+        .copied()
+        .enumerate()
+        .collect();
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+    println!("\nZones de tension (résidu maximal dans perceived.eff) :");
+    for (pos, err) in ranked.into_iter().take(5) {
+        let b = bytes[pos];
+        let ch = if (32..=126).contains(&b) {
+            b as char
+        } else {
+            '.'
+        };
+        println!(
+            "  offset {:>3} | 0x{:02x} '{}' | résidu = {:.4}",
+            pos, b, ch, err
+        );
     }
 }
-pub fn params_fingerprint(p: &Params) -> u64 {
-    let mut b = Vec::new();
-    pu64(&mut b, p.nblocks() as u64);
-    for (i, d) in p.data.iter().enumerate() {
-        pu64(&mut b, p.shapes[i].r as u64);
-        pu64(&mut b, p.shapes[i].c as u64);
-        for x in d.iter() {
-            pf32(&mut b, *x);
-        }
+fn run_ask_continuous(
+    model: &PhiGraph,
+    file_path: &str,
+    bytes: &[u8],
+    ana: &MultiHopAnalysis,
+) {
+    let comp = compute_composite_phi(model, bytes);
+    let mode = if ana.definitions_found > 0 {
+        "Multi-Sauts & Définitions Composées"
+    } else {
+        "Flux Continu Auto-Segmenté"
+    };
+    println!("=== PHISHARP ABDUCTION REPORT (v0.6 — {}) ===", mode);
+    println!(
+        "Effet (E)       : '{}' ({} octets, {} moules + {} cause(s) cible, {} déf. composées, {} méta-bloc(s) démote)",
+        file_path,
+        bytes.len(),
+        ana.mold_regimes.len(),
+        ana.target_spans.len(),
+        ana.definitions_found,
+        ana.demoted_meta_count
+    );
+    println!(
+        "Cohérence scène : sélectivité={:.4} (R_top={:.3} vs R_rest={:.3}, paire [{}]<->[{}])",
+        comp.selectivity, comp.r_top, comp.r_rest, comp.top_pair.0, comp.top_pair.1
+    );
+    if let Some((e_single, e_split, c_lr)) = ana.residual_info {
+        println!(
+            "Résidu cible    : décomposition multi-causes validée (res {:.4} -> {:.4}, cos inter-causes={:+.3})",
+            e_single, e_split, c_lr
+        );
     }
-    fnv1a(&b)
-}
-impl Model {
-    fn payload(&self) -> Vec<u8> {
-        let mut b = Vec::new();
-        b.extend_from_slice(MAGIC);
-        pu32(&mut b, FORMAT);
-        pu32(&mut b, self.closure.bits());
-        pstr(&mut b, &self.experiment);
-        pu64(&mut b, self.seed);
-        pu64(&mut b, self.episodes);
-        pu64(&mut b, self.steps);
-        pu64(&mut b, self.view.max_atoms as u64);
-        for x in self.view.fanout.iter() {
-            pu64(&mut b, *x as u64);
-        }
-        pu64(&mut b, self.view.topk as u64);
-        pu64(&mut b, self.view.eq_cap as u64);
-        for x in self.view.ord_dists.iter() {
-            pu64(&mut b, *x as u64);
-        }
-        pu64(&mut b, self.search.max_ops as u64);
-        pu64(&mut b, self.search.max_rel);
-        pu64(&mut b, self.search.rounds as u64);
-        pu8(&mut b, self.search.allow_refutation as u8);
-        pu8(&mut b, self.search.explore as u8);
-        pf32(&mut b, self.search.lambda_cov);
-        pf32(&mut b, self.search.mu_res);
-        pu64(&mut b, self.search.phi.mech as u64);
-        pu64(&mut b, self.search.phi.purview as u64);
-        pu64(&mut b, self.search.phi.mip as u64);
-        pu8(&mut b, self.search.phi.perturb as u8);
-        pf32(&mut b, self.emit.phi_min);
-        pf32(&mut b, self.emit.stab_min);
-        pf32(&mut b, self.emit.flow_rho);
-        pu64(&mut b, self.emit.depth as u64);
-        pu8(&mut b, self.emit.delim);
-        pu64(&mut b, self.emit.max_atoms as u64);
-        pu64(&mut b, self.params.nblocks() as u64);
-        for (i, d) in self.params.data.iter().enumerate() {
-            pu64(&mut b, self.params.shapes[i].r as u64);
-            pu64(&mut b, self.params.shapes[i].c as u64);
-            for x in d.iter() {
-                pf32(&mut b, *x);
+    for (ci, &(ts, te)) in ana.target_spans.iter().enumerate() {
+        let q_bytes = &bytes[ts..te];
+        let mut rng = Rng::new(fnv_hash(q_bytes));
+        let q_rep = compute_phi_sharp(model, q_bytes, &mut rng, true);
+        println!(
+            "\nCause cible #{} (octets {}..{}) | φ={:+.4} [Gen={:.3} Disc={:.3} Proj={:.3} IIT={:.3} res={:.4}] :",
+            ci + 1,
+            ts,
+            te,
+            q_rep.phi_sharp,
+            q_rep.generativity,
+            q_rep.discrimination,
+            q_rep.projection,
+            q_rep.integration,
+            q_rep.residual
+        );
+        println!("  \"{}\"", printable_preview(q_bytes));
+        let matches = &ana.hop1_per_part[ci];
+        let show_n = if ana.definitions_found > 0 {
+            2.min(matches.len())
+        } else {
+            matches.len()
+        };
+        for (rank, m) in matches.iter().take(show_n).enumerate() {
+            let key_label = ana.mold_keys[m.dst_idx]
+                .as_ref()
+                .map(|k| format!("clé=\"{}\"", printable_preview(k)))
+                .unwrap_or_else(|| "sans clé".to_string());
+            println!(
+                "    Hop-1 #{} moule [{}] ({}) | résonance={:.4} | err={:.4} | cos={:+.3} | octets_communs={:.0}%",
+                rank + 1,
+                m.dst_idx,
+                key_label,
+                m.score,
+                m.cross_err,
+                m.cos_sim,
+                m.byte_overlap * 100.0
+            );
+            println!(
+                "       noyau : \"{}\"",
+                printable_preview(&bytes[m.core_start..m.core_end])
+            );
+            if let Some((rs, re)) = m.referent {
+                println!(
+                    "       réf.  : \"{}\"",
+                    printable_preview(trim_ctrl(&bytes[rs..re]))
+                );
             }
         }
-        b
     }
-    pub fn save(&self, path: &str) -> io::Result<u64> {
-        if self.experiment == CLOSED_EXPERIMENT {
-            assert!(
-                self.closure.is_closed(),
-                "fermeture violee : cet ajout est une NOUVELLE experience, pas un correctif"
+    if !ana.hop2_matches.is_empty() {
+        println!("\nProjection Référentielle Multi-Sauts (définitions composées découvertes) :");
+        for (rank, hm) in ana.hop2_matches.iter().enumerate() {
+            let refs = hm
+                .concept
+                .ref_labels
+                .iter()
+                .map(|r| printable_preview(r))
+                .collect::<Vec<_>>()
+                .join(" + ");
+            println!(
+                "  #{} [Hop-{}] \"{}\"  | score={:.4} (couv={:.3}, préc={:.3})  <-  {}",
+                rank + 1,
+                hm.concept.hop_depth,
+                printable_preview(&hm.concept.name_bytes),
+                hm.score,
+                hm.coverage,
+                hm.precision,
+                refs
+            );
+            println!(
+                "     clause ({}..{}) : \"{}\"",
+                hm.concept.clause_span.0,
+                hm.concept.clause_span.1,
+                printable_preview(trim_ctrl(
+                    &bytes[hm.concept.clause_span.0..hm.concept.clause_span.1]
+                ))
             );
         }
-        let mut b = self.payload();
-        let fp = fnv1a(&b);
-        pu64(&mut b, fp);
-        if let Some(par) = Path::new(path).parent() {
-            if !par.as_os_str().is_empty() {
-                fs::create_dir_all(par)?;
-            }
-        }
-        let mut f = fs::File::create(path)?;
-        f.write_all(&b)?;
-        f.flush()?;
-        Ok(fp)
     }
-    pub fn load(path: &str) -> io::Result<Model> {
-        let buf = fs::read(path)?;
-        if buf.len() < 20 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "artefact trop court"));
-        }
-        let (payload, tail) = buf.split_at(buf.len() - 8);
-        let mut a = [0u8; 8];
-        a.copy_from_slice(tail);
-        let stored = u64::from_le_bytes(a);
-        if fnv1a(payload) != stored {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "empreinte de version invalide : artefact altere",
-            ));
-        }
-        let mut r = Rd { b: payload, i: 0 };
-        if r.take(8)? != MAGIC {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "magic"));
-        }
-        if r.u32()? != FORMAT {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "format"));
-        }
-        let closure = Closure::from_bits(r.u32()?);
-        let experiment = r.string()?;
-        let seed = r.u64()?;
-        let episodes = r.u64()?;
-        let steps = r.u64()?;
-        let max_atoms = r.u64()? as usize;
-        let fanout = [r.u64()? as usize, r.u64()? as usize, r.u64()? as usize];
-        let topk = r.u64()? as usize;
-        let eq_cap = r.u64()? as usize;
-        let ord_dists = [r.u64()? as usize, r.u64()? as usize, r.u64()? as usize];
-        let view = ViewCfg { max_atoms, fanout, topk, eq_cap, ord_dists };
-        let max_ops = r.u64()? as usize;
-        let max_rel = r.u64()?;
-        let rounds = r.u64()? as usize;
-        let allow_refutation = r.boolean()?;
-        let explore = r.boolean()?;
-        let lambda_cov = r.f32()?;
-        let mu_res = r.f32()?;
-        let mech = r.u64()? as usize;
-        let purview = r.u64()? as usize;
-        let mip = r.u64()? as usize;
-        let perturb = r.boolean()?;
-        let search = SearchCfg {
-            max_ops,
-            max_rel,
-            rounds,
-            allow_refutation,
-            explore,
-            phi: PhiCfg { mech, purview, mip, perturb },
-            lambda_cov,
-            mu_res,
+    let best_hop1 = ana
+        .hop1_per_part
+        .first()
+        .and_then(|v| v.first());
+    let best_hop2 = ana.hop2_matches.first();
+    let use_multihop = match (best_hop2, best_hop1) {
+        (Some(h2), Some(h1)) => ana.target_spans.len() >= 2 || h2.score > h1.score,
+        (Some(_), None) => true,
+        _ => false,
+    };
+    if use_multihop && let Some(h2) = best_hop2 {
+        let margin = ana
+            .hop2_matches
+            .get(1)
+            .map(|s| h2.score - s.score)
+            .unwrap_or(h2.score);
+        println!(
+            "\nExplication projetée (multi-sauts Hop-{}, alphabet de E, marge={:+.4}) :",
+            h2.concept.hop_depth, margin
+        );
+        println!("  {}", printable_preview(&h2.concept.name_bytes));
+    } else if let Some(best) = best_hop1 {
+        let margin = ana.hop1_per_part[0]
+            .get(1)
+            .map(|s| best.score - s.score)
+            .unwrap_or(best.score);
+        let out_slice = match best.referent {
+            Some((rs, re)) => trim_ctrl(&bytes[rs..re]),
+            None => &bytes[best.core_start..best.core_end],
         };
-        let phi_min = r.f32()?;
-        let stab_min = r.f32()?;
-        let flow_rho = r.f32()?;
-        let depth = r.u64()? as usize;
-        let delim = r.u8()?;
-        let emax = r.u64()? as usize;
-        let emit = EmitCfg { phi_min, stab_min, flow_rho, depth, delim, max_atoms: emax };
-        let nb = r.u64()? as usize;
-        if nb > 4096 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "trop de blocs"));
-        }
-        let mut params = Params::default();
-        for _ in 0..nb {
-            let rr = r.u64()? as usize;
-            let cc = r.u64()? as usize;
-            let n = rr.saturating_mul(cc);
-            if n > 4_000_000 {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "bloc trop grand"));
-            }
-            let mut d = Vec::with_capacity(n);
-            for _ in 0..n {
-                d.push(r.f32()?);
-            }
-            params.block(rr, cc, &d);
-        }
-        Ok(Model {
-            params,
-            view,
-            search,
-            emit,
-            seed,
-            episodes,
-            steps,
-            closure,
-            experiment,
-            fingerprint: stored,
-        })
+        println!(
+            "\nExplication projetée (Hop-1, alphabet de E, marge={:+.4}) :",
+            margin
+        );
+        println!("  {}", printable_preview(out_slice));
     }
 }
-pub struct Ledger {
-    pub path: String,
-    pub rows: Vec<(u64, String)>,
+
+
+
+========================================
+File: ./src/multihop.rs
+========================================
+use crate::graph::{PhiGraph, RawSubstrate, SEARCH_STEPS};
+use crate::phi::{
+    DiscoveredRegime, ProjectionMatch, abductive_discontinuity, byte_overlap_ratio, cosine_sim,
+    cut_discontinuity, discover_causal_regimes,
+};
+#[derive(Clone, Debug)]
+pub struct ResidualSplit {
+    pub parts: Vec<(usize, usize)>,
+    pub single_err: f32,
+    pub split_err: f32,
+    pub cross_cos: f32,
 }
-impl Ledger {
-    pub fn load(path: &str) -> Ledger {
-        let mut rows = Vec::new();
-        if let Ok(s) = fs::read_to_string(path) {
-            for line in s.lines() {
-                let mut it = line.split('\t');
-                if let (Some(a), Some(b)) = (it.next(), it.next()) {
-                    if let Ok(fp) = u64::from_str_radix(a, 16) {
-                        rows.push((fp, b.to_string()));
+#[derive(Clone, Debug)]
+pub struct ComposedConcept {
+    pub name_bytes: Vec<u8>,
+    pub clause_span: (usize, usize),
+    pub mold_set: Vec<usize>,
+    pub hop_depth: usize,
+    pub ref_labels: Vec<Vec<u8>>,
+}
+#[derive(Clone, Debug)]
+pub struct MultiHopMatch {
+    pub concept: ComposedConcept,
+    pub score: f32,
+    pub coverage: f32,
+    pub precision: f32,
+}
+#[derive(Clone, Debug)]
+pub struct MultiHopAnalysis {
+    pub mold_regimes: Vec<DiscoveredRegime>,
+    pub mold_keys: Vec<Option<Vec<u8>>>,
+    pub target_spans: Vec<(usize, usize)>,
+    pub residual_info: Option<(f32, f32, f32)>,
+    pub hop1_per_part: Vec<Vec<ProjectionMatch>>,
+    pub hop2_matches: Vec<MultiHopMatch>,
+    pub definitions_found: usize,
+    pub demoted_meta_count: usize,
+}
+fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+fn trim_edge_ws(bytes: &[u8]) -> &[u8] {
+    let mut s = 0usize;
+    let mut e = bytes.len();
+    while s < e && bytes[s] <= b' ' {
+        s += 1;
+    }
+    while e > s && bytes[e - 1] <= b' ' {
+        e -= 1;
+    }
+    &bytes[s..e]
+}
+fn contains_slice(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return false;
+    }
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+fn find_standalone_positions(haystack: &[u8], needle: &[u8]) -> Vec<usize> {
+    let mut out = Vec::new();
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return out;
+    }
+    let word_like = needle.iter().all(|&b| is_word_byte(b));
+    let mut i = 0usize;
+    while i + needle.len() <= haystack.len() {
+        if &haystack[i..i + needle.len()] == needle {
+            let left_ok = !word_like || i == 0 || !is_word_byte(haystack[i - 1]);
+            let right_ok = !word_like
+                || (i + needle.len() == haystack.len())
+                || !is_word_byte(haystack[i + needle.len()]);
+            if left_ok && right_ok {
+                out.push(i);
+                i += needle.len();
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+pub fn decompose_by_residual(graph: &PhiGraph, bytes: &[u8]) -> ResidualSplit {
+    let n = bytes.len();
+    let sub = RawSubstrate::from_bytes(bytes);
+    let rels = graph.encode_relations(&sub);
+    let tr0 = graph.abduce(&rels, None);
+    let single_err = tr0.final_mean_err;
+    if n < 30 {
+        return ResidualSplit {
+            parts: vec![(0, n)],
+            single_err,
+            split_err: single_err,
+            cross_cos: 1.0,
+        };
+    }
+    let mut pref_err = vec![0.0f32; n + 1];
+    for t in 0..n {
+        pref_err[t + 1] = pref_err[t] + tr0.final_pos_err[t];
+    }
+    let mut proposals: Vec<(usize, f32)> = Vec::new();
+    let mut p = 14usize;
+    while p + 14 <= n {
+        let ml = pref_err[p] / (p as f32);
+        let mr = (pref_err[n] - pref_err[p]) / ((n - p) as f32);
+        let res_jump = (ml - mr).abs();
+        let cut_d = cut_discontinuity(&sub, 0, n, p);
+        let abd_d = if p % 4 == 0 {
+            let l0 = p.saturating_sub(16);
+            let r1 = (p + 16).min(n);
+            abductive_discontinuity(graph, &rels, (l0, p), (p, r1), 4)
+        } else {
+            0.0
+        };
+        proposals.push((p, res_jump + 0.45 * cut_d + 0.55 * abd_d));
+        p += 2;
+    }
+    proposals.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let mut cands: Vec<usize> = Vec::new();
+    for (cp, _) in proposals {
+        if cands.iter().all(|&x| x.abs_diff(cp) >= 6) {
+            cands.push(cp);
+            if cands.len() >= 4 {
+                break;
+            }
+        }
+    }
+    if cands.iter().all(|&x| x.abs_diff(n / 2) >= 6) {
+        cands.push(n / 2);
+    }
+    let eval_cut = |cp: usize| -> (f32, f32, f32, f32) {
+        let rl = graph.encode_bytes(&bytes[0..cp]);
+        let rr = graph.encode_bytes(&bytes[cp..n]);
+        let tl = graph.abduce(&rl, None);
+        let tr = graph.abduce(&rr, None);
+        let split_e =
+            ((cp as f32) * tl.final_mean_err + ((n - cp) as f32) * tr.final_mean_err) / (n as f32);
+        let cos_lr = cosine_sim(&tl.final_state, &tr.final_state);
+        let (_, _, e_lr) = graph.evaluate_hypothesis(&tl.final_state, &rr);
+        let (_, _, e_rl) = graph.evaluate_hypothesis(&tr.final_state, &rl);
+        let cross_e = 0.5 * (e_lr + e_rl);
+        let cross_gap = ((cross_e - split_e) / (cross_e + 0.08)).clamp(0.0, 1.0);
+        let obj = (single_err - split_e) + 0.30 * cross_gap * (1.0 - cos_lr.max(0.0));
+        (obj, split_e, cos_lr, cross_gap)
+    };
+    let mut best_p = n / 2;
+    let mut best_obj = f32::NEG_INFINITY;
+    let mut best_res = (single_err, 1.0f32, 0.0f32);
+    for cp in cands {
+        let (obj, se, cos_lr, cg) = eval_cut(cp);
+        if obj > best_obj {
+            best_obj = obj;
+            best_p = cp;
+            best_res = (se, cos_lr, cg);
+        }
+    }
+    let lo = best_p.saturating_sub(2).max(12);
+    let hi = (best_p + 2).min(n.saturating_sub(12));
+    for cp in lo..=hi {
+        if cp == best_p {
+            continue;
+        }
+        let (obj, se, cos_lr, cg) = eval_cut(cp);
+        if obj > best_obj {
+            best_obj = obj;
+            best_p = cp;
+            best_res = (se, cos_lr, cg);
+        }
+    }
+    let (split_err, cross_cos, cross_gap) = best_res;
+    let significant_drop = (single_err - split_err) > 0.025 || split_err < 0.88 * single_err;
+    if cross_cos < 0.55 && cross_gap > 0.22 && significant_drop {
+        ResidualSplit {
+            parts: vec![(0, best_p), (best_p, n)],
+            single_err,
+            split_err,
+            cross_cos,
+        }
+    } else {
+        ResidualSplit {
+            parts: vec![(0, n)],
+            single_err,
+            split_err: single_err,
+            cross_cos: 1.0,
+        }
+    }
+}
+fn extract_word_tokens(slice: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < slice.len() {
+        while i < slice.len() && !is_word_byte(slice[i]) {
+            i += 1;
+        }
+        let start = i;
+        while i < slice.len() && is_word_byte(slice[i]) {
+            i += 1;
+        }
+        if i - start >= 3 {
+            let tok = slice[start..i].to_vec();
+            if !out.contains(&tok) {
+                out.push(tok);
+            }
+        }
+    }
+    out
+}
+fn demote_metalanguage_regimes(
+    bytes: &[u8],
+    raw: &[DiscoveredRegime],
+) -> (Vec<DiscoveredRegime>, usize) {
+    if raw.len() < 3 {
+        return (raw.to_vec(), 0);
+    }
+    let mut kept: Vec<DiscoveredRegime> = Vec::with_capacity(raw.len());
+    let mut kept_tag_tokens: Vec<Vec<Vec<u8>>> = Vec::with_capacity(raw.len());
+    let mut demoted = 0usize;
+    for (idx, &reg) in raw.iter().enumerate() {
+        let prev_end = if kept.is_empty() {
+            0
+        } else {
+            kept.last().unwrap().core_end
+        };
+        let core_slice = &bytes[reg.core_start..reg.core_end];
+        let mut echoed_molds = 0usize;
+        let mut echoed_bytes = 0usize;
+        if kept.len() >= 2 && idx + 1 < raw.len() {
+            for m_i in 0..kept.len() {
+                let mut hit_len = 0usize;
+                for tok in &kept_tag_tokens[m_i] {
+                    let unique_to_mi = (0..kept.len())
+                        .all(|m_j| m_j == m_i || !kept_tag_tokens[m_j].contains(tok));
+                    if unique_to_mi {
+                        let cnt = find_standalone_positions(core_slice, tok).len();
+                        if cnt > 0 {
+                            hit_len += cnt * tok.len();
+                        }
+                    }
+                }
+                if hit_len > 0 {
+                    echoed_molds += 1;
+                    echoed_bytes += hit_len;
+                }
+            }
+        }
+        if echoed_molds >= 2 || (echoed_molds >= 1 && echoed_bytes * 4 >= core_slice.len()) {
+            demoted += 1;
+            continue;
+        }
+        let tag_start = prev_end.max(reg.core_start.saturating_sub(28));
+        let tag_slice = &bytes[tag_start..reg.core_start];
+        kept_tag_tokens.push(extract_word_tokens(tag_slice));
+        kept.push(reg);
+    }
+    let k = kept.len();
+    if k == 0 {
+        return (raw.to_vec(), 0);
+    }
+    let lead_gap = kept[0].core_start;
+    let trail_gap = bytes.len().saturating_sub(kept[k - 1].core_end);
+    let suffix_mode = trail_gap >= 3 && lead_gap < 3;
+    for i in 0..k {
+        let prev_end = if i == 0 { 0 } else { kept[i - 1].core_end };
+        let next_start = if i + 1 == k {
+            bytes.len()
+        } else {
+            kept[i + 1].core_start
+        };
+        kept[i].referent = if suffix_mode {
+            if next_start.saturating_sub(kept[i].core_end) >= 3 {
+                Some((kept[i].core_end, next_start))
+            } else {
+                None
+            }
+        } else if kept[i].core_start.saturating_sub(prev_end) >= 3 {
+            Some((prev_end, kept[i].core_start))
+        } else {
+            None
+        };
+    }
+    (kept, demoted)
+}
+fn project_span_to_molds(
+    graph: &PhiGraph,
+    bytes: &[u8],
+    q_span: (usize, usize),
+    molds: &[DiscoveredRegime],
+) -> Vec<ProjectionMatch> {
+    let q_bytes = &bytes[q_span.0..q_span.1];
+    let q_rels = graph.encode_bytes(q_bytes);
+    let q_trace = graph.abduce(&q_rels, None);
+    let mut matches = Vec::with_capacity(molds.len());
+    for (idx, reg) in molds.iter().enumerate() {
+        let core_bytes = &bytes[reg.core_start..reg.core_end];
+        let core_rels = graph.encode_bytes(core_bytes);
+        let core_trace = graph.abduce(&core_rels, None);
+        let (_, _, fwd_err) = graph.evaluate_hypothesis(&q_trace.final_state, &core_rels);
+        let (_, _, bwd_err) = graph.evaluate_hypothesis(&core_trace.final_state, &q_rels);
+        let cross_err = 0.5 * (fwd_err + bwd_err);
+        let cross_gen = (-2.2 * cross_err).exp().clamp(0.0, 1.0);
+        let cos_sim = cosine_sim(&q_trace.final_state, &core_trace.final_state);
+        let cos_pos = 0.5 * (1.0 + cos_sim);
+        let score = (cross_gen * cos_pos).sqrt();
+        let byte_overlap = byte_overlap_ratio(q_bytes, core_bytes);
+        matches.push(ProjectionMatch {
+            dst_idx: idx,
+            score,
+            cross_err,
+            cos_sim,
+            core_start: reg.core_start,
+            core_end: reg.core_end,
+            referent: reg.referent,
+            byte_overlap,
+        });
+    }
+    matches.sort_by(|a, b| b.score.total_cmp(&a.score));
+    matches
+}
+fn find_discriminative_key(
+    bytes: &[u8],
+    tag_spans: &[(usize, usize)],
+    mold_idx: usize,
+    def_zones: &[(usize, usize)],
+) -> Option<Vec<u8>> {
+    let (ts, te) = tag_spans[mold_idx];
+    let tag = &bytes[ts..te];
+    if tag.len() < 3 || def_zones.is_empty() {
+        return None;
+    }
+    let mut best: Option<(usize, usize, Vec<u8>)> = None;
+    for s in 0..tag.len() {
+        if tag[s] <= b' ' {
+            continue;
+        }
+        for e in (s + 3)..=tag.len() {
+            if tag[e - 1] <= b' ' {
+                continue;
+            }
+            let cand = &tag[s..e];
+            if cand.iter().any(|&b| b < 32) {
+                continue;
+            }
+            let unique = tag_spans.iter().enumerate().all(|(j, &(os, oe))| {
+                j == mold_idx || !contains_slice(&bytes[os..oe], cand)
+            });
+            if !unique {
+                continue;
+            }
+            let mut hits = 0usize;
+            for &(ds, de) in def_zones {
+                hits += find_standalone_positions(&bytes[ds..de], cand).len();
+            }
+            if hits == 0 {
+                continue;
+            }
+            let better = match &best {
+                None => true,
+                Some((blen, bhits, _)) => {
+                    cand.len() > *blen || (cand.len() == *blen && hits > *bhits)
+                }
+            };
+            if better {
+                best = Some((cand.len(), hits, cand.to_vec()));
+            }
+        }
+    }
+    best.map(|(_, _, k)| k)
+}
+#[derive(Clone, Debug)]
+struct KeyEntry {
+    key: Vec<u8>,
+    molds: Vec<usize>,
+    hop: usize,
+    defined_in: Option<(usize, usize)>,
+}
+#[derive(Clone, Debug)]
+struct KeyHit {
+    pos: usize,
+    end: usize,
+    entry_idx: usize,
+}
+fn strip_common_head_affixes(raw_heads: &[&[u8]]) -> Vec<Vec<u8>> {
+    let mut cleaned: Vec<Vec<u8>> = raw_heads
+        .iter()
+        .map(|h| {
+            let slice = match h.iter().rposition(|&b| b == b'\n') {
+                Some(nl) if trim_edge_ws(&h[nl + 1..]).len() >= 2 => &h[nl + 1..],
+                _ => *h,
+            };
+            trim_edge_ws(slice).to_vec()
+        })
+        .collect();
+    if cleaned.len() == 1 {
+        let h = &mut cleaned[0];
+        while h.len() > 2 && !is_word_byte(*h.last().unwrap()) {
+            h.pop();
+        }
+        *h = trim_edge_ws(h).to_vec();
+        return cleaned;
+    }
+    let min_len = cleaned.iter().map(|h| h.len()).min().unwrap_or(0);
+    let mut suf = 0usize;
+    while suf + 2 < min_len {
+        let b = cleaned[0][cleaned[0].len() - 1 - suf];
+        if !is_word_byte(b) && cleaned.iter().all(|h| h[h.len() - 1 - suf] == b) {
+            suf += 1;
+        } else {
+            break;
+        }
+    }
+    if suf > 0 {
+        for h in &mut cleaned {
+            let new_len = h.len().saturating_sub(suf);
+            h.truncate(new_len);
+            *h = trim_edge_ws(h).to_vec();
+        }
+    }
+    let tail_min = cleaned[1..].iter().map(|h| h.len()).min().unwrap_or(0);
+    let mut pre = 0usize;
+    while pre + 2 < tail_min {
+        let b = cleaned[1][pre];
+        if !is_word_byte(b) && cleaned[1..].iter().all(|h| h[pre] == b) {
+            pre += 1;
+        } else {
+            break;
+        }
+    }
+    if pre > 0 {
+        let sep_pre = cleaned[1][0..pre].to_vec();
+        if let Some(pos) = cleaned[0]
+            .windows(sep_pre.len())
+            .rposition(|w| w == sep_pre.as_slice())
+        {
+            let tail = trim_edge_ws(&cleaned[0][pos + sep_pre.len()..]);
+            if tail.len() >= 2 {
+                cleaned[0] = tail.to_vec();
+            }
+        }
+        for h in &mut cleaned[1..] {
+            *h = trim_edge_ws(&h[pre..]).to_vec();
+        }
+    }
+    let all_min = cleaned.iter().map(|h| h.len()).min().unwrap_or(0);
+    let mut ap = 0usize;
+    while ap + 2 < all_min {
+        let b = cleaned[0][ap];
+        if !is_word_byte(b) && cleaned.iter().all(|h| h[ap] == b) {
+            ap += 1;
+        } else {
+            break;
+        }
+    }
+    if ap > 0 {
+        for h in &mut cleaned {
+            *h = trim_edge_ws(&h[ap..]).to_vec();
+        }
+    }
+    cleaned
+}
+fn extract_definitions_in_zone(
+    zone_bytes: &[u8],
+    zone_offset: usize,
+    entries: &[KeyEntry],
+) -> Vec<ComposedConcept> {
+    let mut order: Vec<usize> = (0..entries.len()).collect();
+    order.sort_by(|&a, &b| entries[b].key.len().cmp(&entries[a].key.len()));
+    let mut used = vec![false; zone_bytes.len()];
+    let mut hits: Vec<KeyHit> = Vec::new();
+    for ei in order {
+        let key = &entries[ei].key;
+        let def_in = entries[ei].defined_in;
+        for pos in find_standalone_positions(zone_bytes, key) {
+            let end = pos + key.len();
+            let abs_pos = zone_offset + pos;
+            let abs_end = zone_offset + end;
+            if let Some((ds, de)) = def_in
+                && abs_pos >= ds
+                && abs_end <= de
+            {
+                continue;
+            }
+            if used[pos..end].iter().any(|&u| u) {
+                continue;
+            }
+            for u in &mut used[pos..end] {
+                *u = true;
+            }
+            hits.push(KeyHit {
+                pos,
+                end,
+                entry_idx: ei,
+            });
+        }
+    }
+    hits.sort_by_key(|h| h.pos);
+    if hits.len() < 2 {
+        return Vec::new();
+    }
+    let mut gaps: Vec<&[u8]> = Vec::with_capacity(hits.len() - 1);
+    for w in hits.windows(2) {
+        gaps.push(&zone_bytes[w[0].end..w[1].pos]);
+    }
+    let min_gap = gaps.iter().map(|g| g.len()).min().unwrap_or(0);
+    let mut dom_conn: Option<&[u8]> = None;
+    let mut dom_count = 1usize;
+    for &g in &gaps {
+        if g.len() <= 8 && !g.contains(&b'\n') {
+            let cnt = gaps.iter().filter(|&&other| other == g).count();
+            if cnt > dom_count
+                || (cnt == dom_count && cnt >= 2 && dom_conn.is_some_and(|d| g.len() < d.len()))
+            {
+                dom_count = cnt;
+                dom_conn = Some(g);
+            }
+        }
+    }
+    let mut clusters: Vec<Vec<usize>> = Vec::new();
+    let mut cur = vec![0usize];
+    for g_idx in 0..gaps.len() {
+        let gap = gaps[g_idx];
+        let h_prev = &hits[g_idx];
+        let h_next = &hits[g_idx + 1];
+        let same_ref = h_prev.entry_idx == h_next.entry_idx;
+        let is_break = if same_ref || gap.contains(&b'\n') {
+            true
+        } else if let Some(dc) = dom_conn {
+            gap != dc && gap.len() > dc.len() + 1
+        } else {
+            gap.len() > min_gap + 3
+        };
+        if is_break {
+            clusters.push(cur);
+            cur = vec![g_idx + 1];
+        } else {
+            cur.push(g_idx + 1);
+        }
+    }
+    clusters.push(cur);
+    let first_pos = hits[clusters[0][0]].pos;
+    let last_end = hits[*clusters.last().unwrap().last().unwrap()].end;
+    let lead_len = trim_edge_ws(&zone_bytes[0..first_pos]).len();
+    let trail_len = trim_edge_ws(&zone_bytes[last_end..]).len();
+    let suffix_mode = trail_len >= 3 && lead_len < 3;
+    struct ValidCluster<'a> {
+        raw_head: &'a [u8],
+        clause_span: (usize, usize),
+        mold_set: Vec<usize>,
+        hop_depth: usize,
+        ref_labels: Vec<Vec<u8>>,
+    }
+    let mut valid: Vec<ValidCluster<'_>> = Vec::new();
+    for (ci, cl) in clusters.iter().enumerate() {
+        let mut mold_set: Vec<usize> = Vec::new();
+        let mut max_child_hop = 1usize;
+        let mut ref_labels: Vec<Vec<u8>> = Vec::new();
+        for &hi in cl {
+            let entry = &entries[hits[hi].entry_idx];
+            if entry.hop > max_child_hop {
+                max_child_hop = entry.hop;
+            }
+            ref_labels.push(entry.key.clone());
+            for &m in &entry.molds {
+                if !mold_set.contains(&m) {
+                    mold_set.push(m);
+                }
+            }
+        }
+        mold_set.sort_unstable();
+        if mold_set.len() < 2 {
+            continue;
+        }
+        let c_start = hits[cl[0]].pos;
+        let c_end = hits[*cl.last().unwrap()].end;
+        let prev_end = if ci == 0 {
+            0
+        } else {
+            hits[*clusters[ci - 1].last().unwrap()].end
+        };
+        let next_start = if ci + 1 == clusters.len() {
+            zone_bytes.len()
+        } else {
+            hits[clusters[ci + 1][0]].pos
+        };
+        let (raw_head, clause_span) = if suffix_mode {
+            (
+                &zone_bytes[c_end..next_start],
+                (zone_offset + c_start, zone_offset + next_start),
+            )
+        } else {
+            (
+                &zone_bytes[prev_end..c_start],
+                (zone_offset + prev_end, zone_offset + c_end),
+            )
+        };
+        if trim_edge_ws(raw_head).len() >= 2 {
+            valid.push(ValidCluster {
+                raw_head,
+                clause_span,
+                mold_set,
+                hop_depth: max_child_hop + 1,
+                ref_labels,
+            });
+        }
+    }
+    if valid.is_empty() {
+        return Vec::new();
+    }
+    let raw_heads: Vec<&[u8]> = valid.iter().map(|v| v.raw_head).collect();
+    let clean_heads = strip_common_head_affixes(&raw_heads);
+    let mut out = Vec::with_capacity(valid.len());
+    for (vc, name_bytes) in valid.into_iter().zip(clean_heads.into_iter()) {
+        if name_bytes.len() >= 2 {
+            out.push(ComposedConcept {
+                name_bytes,
+                clause_span: vc.clause_span,
+                mold_set: vc.mold_set,
+                hop_depth: vc.hop_depth,
+                ref_labels: vc.ref_labels,
+            });
+        }
+    }
+    out
+}
+pub fn analyze_multihop(graph: &PhiGraph, bytes: &[u8]) -> Option<MultiHopAnalysis> {
+    let raw_regimes = discover_causal_regimes(graph, bytes, true);
+    if raw_regimes.len() < 2 {
+        return None;
+    }
+    let (regimes, demoted_meta_count) = demote_metalanguage_regimes(bytes, &raw_regimes);
+    if regimes.len() < 2 {
+        return None;
+    }
+    let k = regimes.len();
+    let mut split_t = k - 1;
+    while split_t >= 3 && (k - split_t) < 4 {
+        let cand_idx = split_t - 1;
+        let gap_to_next = regimes[split_t]
+            .core_start
+            .saturating_sub(regimes[cand_idx].core_end);
+        if gap_to_next > 8 {
+            break;
+        }
+        let prev_end = regimes[cand_idx - 1].core_end;
+        let gap_before = regimes[cand_idx].core_start.saturating_sub(prev_end);
+        if gap_before > 8 && gap_before < 20 {
+            break;
+        }
+        let earlier = &regimes[0..cand_idx];
+        let proj = project_span_to_molds(
+            graph,
+            bytes,
+            (regimes[cand_idx].core_start, regimes[cand_idx].core_end),
+            earlier,
+        );
+        let strong_match = proj
+            .first()
+            .is_some_and(|m| m.score >= 0.62 && m.cos_sim >= 0.40);
+        if strong_match {
+            split_t = cand_idx;
+        } else {
+            break;
+        }
+    }
+    let mold_regimes = regimes[0..split_t].to_vec();
+    let mut target_spans: Vec<(usize, usize)> = regimes[split_t..]
+        .iter()
+        .map(|r| (r.core_start, r.core_end))
+        .collect();
+    if target_spans.len() >= 2 {
+        let mut merged_t: Vec<(usize, usize)> = vec![target_spans[0]];
+        for &(s, e) in &target_spans[1..] {
+            let prev = *merged_t.last().unwrap();
+            let h_prev = graph
+                .abduce(&graph.encode_bytes(&bytes[prev.0..prev.1]), None)
+                .final_state;
+            let h_cur = graph
+                .abduce(&graph.encode_bytes(&bytes[s..e]), None)
+                .final_state;
+            let ov = byte_overlap_ratio(&bytes[prev.0..prev.1], &bytes[s..e]);
+            if cosine_sim(&h_prev, &h_cur) > 0.72 && ov > 0.50 {
+                merged_t.last_mut().unwrap().1 = e;
+            } else {
+                merged_t.push((s, e));
+            }
+        }
+        target_spans = merged_t;
+    }
+    let mut residual_info: Option<(f32, f32, f32)> = None;
+    if target_spans.len() == 1 {
+        let (ts, te) = target_spans[0];
+        let dec = decompose_by_residual(graph, &bytes[ts..te]);
+        if dec.parts.len() >= 2 {
+            target_spans = dec
+                .parts
+                .into_iter()
+                .map(|(a, b)| (ts + a, ts + b))
+                .collect();
+            residual_info = Some((dec.single_err, dec.split_err, dec.cross_cos));
+        }
+    } else if target_spans.len() >= 2 {
+        let (s0, e0) = target_spans[0];
+        let (s1, e1) = target_spans[1];
+        let full_err = graph
+            .abduce(&graph.encode_bytes(&bytes[s0..e1]), None)
+            .final_mean_err;
+        let t0 = graph.abduce(&graph.encode_bytes(&bytes[s0..e0]), None);
+        let t1 = graph.abduce(&graph.encode_bytes(&bytes[s1..e1]), None);
+        let l0 = (e0 - s0) as f32;
+        let l1 = (e1 - s1) as f32;
+        let split_err = (l0 * t0.final_mean_err + l1 * t1.final_mean_err) / (l0 + l1).max(1.0);
+        let cos_lr = cosine_sim(&t0.final_state, &t1.final_state);
+        residual_info = Some((full_err, split_err, cos_lr));
+    }
+    let mut hop1_per_part: Vec<Vec<ProjectionMatch>> = Vec::with_capacity(target_spans.len());
+    for &span in &target_spans {
+        hop1_per_part.push(project_span_to_molds(graph, bytes, span, &mold_regimes));
+    }
+    let mut tag_spans: Vec<(usize, usize)> = Vec::with_capacity(mold_regimes.len());
+    let mut def_zones: Vec<(usize, usize)> = Vec::new();
+    for i in 0..mold_regimes.len() {
+        let prev_end = if i == 0 {
+            0
+        } else {
+            mold_regimes[i - 1].core_end
+        };
+        let cs = mold_regimes[i].core_start;
+        if cs.saturating_sub(prev_end) > 28 {
+            def_zones.push((prev_end, cs - 24));
+            tag_spans.push((cs - 24, cs));
+        } else {
+            tag_spans.push((prev_end, cs));
+        }
+    }
+    let after_molds = mold_regimes.last().unwrap().core_end;
+    let before_target = target_spans[0].0;
+    if before_target.saturating_sub(after_molds) >= 10 {
+        def_zones.push((after_molds, before_target));
+    }
+    let after_target = target_spans.last().unwrap().1;
+    if bytes.len().saturating_sub(after_target) >= 10 {
+        def_zones.push((after_target, bytes.len()));
+    }
+    let mut mold_keys: Vec<Option<Vec<u8>>> = Vec::with_capacity(mold_regimes.len());
+    let mut entries: Vec<KeyEntry> = Vec::new();
+    for i in 0..mold_regimes.len() {
+        let key_opt = find_discriminative_key(bytes, &tag_spans, i, &def_zones);
+        if let Some(ref k) = key_opt {
+            entries.push(KeyEntry {
+                key: k.clone(),
+                molds: vec![i],
+                hop: 1,
+                defined_in: None,
+            });
+        }
+        mold_keys.push(key_opt);
+    }
+    let mut all_concepts: Vec<ComposedConcept> = Vec::new();
+    if entries.len() >= 2 {
+        for &(ds, de) in &def_zones {
+            let found = extract_definitions_in_zone(&bytes[ds..de], ds, &entries);
+            all_concepts.extend(found);
+        }
+        if !all_concepts.is_empty() {
+            let mut ext_entries = entries.clone();
+            for c in &all_concepts {
+                if c.name_bytes.len() >= 3
+                    && ext_entries.iter().all(|e| e.key != c.name_bytes)
+                {
+                    ext_entries.push(KeyEntry {
+                        key: c.name_bytes.clone(),
+                        molds: c.mold_set.clone(),
+                        hop: c.hop_depth,
+                        defined_in: Some(c.clause_span),
+                    });
+                }
+            }
+            if ext_entries.len() > entries.len() {
+                for &(ds, de) in &def_zones {
+                    let found3 = extract_definitions_in_zone(&bytes[ds..de], ds, &ext_entries);
+                    for c3 in found3 {
+                        if c3.hop_depth >= 3
+                            && all_concepts
+                                .iter()
+                                .all(|old| old.name_bytes != c3.name_bytes)
+                        {
+                            all_concepts.push(c3);
+                        }
                     }
                 }
             }
         }
-        Ledger { path: path.to_string(), rows }
     }
-    pub fn seen(&self, fp: u64, set: &str) -> bool {
-        self.rows.iter().any(|&(f, ref s)| f == fp && s == set)
-    }
-    pub fn record(&mut self, fp: u64, set: &str) -> io::Result<()> {
-        if self.seen(fp, set) {
-            return Ok(());
+    let m_count = mold_regimes.len();
+    let mut res_mat: Vec<Vec<f32>> = vec![vec![0.0f32; m_count]; target_spans.len()];
+    for (c_idx, matches) in hop1_per_part.iter().enumerate() {
+        for m in matches {
+            res_mat[c_idx][m.dst_idx] = m.score;
         }
-        if let Some(par) = Path::new(&self.path).parent() {
-            if !par.as_os_str().is_empty() {
-                fs::create_dir_all(par)?;
-            }
-        }
-        let mut f = fs::OpenOptions::new().create(true).append(true).open(&self.path)?;
-        writeln!(f, "{:016x}\t{}", fp, set)?;
-        self.rows.push((fp, set.to_string()));
-        Ok(())
     }
+    let mut hop2_matches: Vec<MultiHopMatch> = Vec::with_capacity(all_concepts.len());
+    for concept in all_concepts {
+        let mut cov_sum = 0.0f32;
+        for row in &res_mat {
+            let best_m = concept
+                .mold_set
+                .iter()
+                .map(|&mi| row[mi])
+                .fold(0.0f32, f32::max);
+            cov_sum += best_m;
+        }
+        let coverage = cov_sum / (res_mat.len().max(1) as f32);
+        let mut prec_sum = 0.0f32;
+        for &mi in &concept.mold_set {
+            let best_c = res_mat.iter().map(|row| row[mi]).fold(0.0f32, f32::max);
+            prec_sum += best_c;
+        }
+        let precision = prec_sum / (concept.mold_set.len().max(1) as f32);
+        let score = (coverage * precision).sqrt();
+        hop2_matches.push(MultiHopMatch {
+            concept,
+            score,
+            coverage,
+            precision,
+        });
+    }
+    hop2_matches.sort_by(|a, b| b.score.total_cmp(&a.score));
+    let definitions_found = hop2_matches.len();
+    Some(MultiHopAnalysis {
+        mold_regimes,
+        mold_keys,
+        target_spans,
+        residual_info,
+        hop1_per_part,
+        hop2_matches,
+        definitions_found,
+        demoted_meta_count,
+    })
+}
+pub fn analyze_monolithic_residual(graph: &PhiGraph, bytes: &[u8]) -> ResidualSplit {
+    let _ = SEARCH_STEPS;
+    decompose_by_residual(graph, bytes)
 }
 
 
@@ -451,401 +1772,864 @@ impl Ledger {
 ========================================
 File: ./src/phi.rs
 ========================================
-use crate::ad::{Params, Tape};
-use crate::eff::{EffView, REL_ADJ, REL_CONTAIN};
-use crate::substrate::{self, Fwd, Itv, Wiring, P, Q};
+use crate::graph::{AbductionTrace, NODES, PhiGraph, REL_DIM, RawSubstrate, SEARCH_STEPS, STATE_DIM};
+use crate::rng::Rng;
+const SINGLETON_MASKS: [u8; 6] = [
+    0b000001, 0b000010, 0b000100, 0b001000, 0b010000, 0b011111,
+];
 #[derive(Clone, Copy, Debug)]
-pub struct PhiCfg {
-    pub mech: usize,
-    pub purview: usize,
-    pub mip: usize,
-    pub perturb: bool,
+pub struct DiscoveredRegime {
+    pub core_start: usize,
+    pub core_end: usize,
+    pub referent: Option<(usize, usize)>,
+    pub mean_gate: f32,
 }
-impl Default for PhiCfg {
-    fn default() -> Self {
-        PhiCfg { mech: 5, purview: 4, mip: 6, perturb: true }
+#[derive(Clone, Debug)]
+pub struct PreparedEpisode {
+    pub orig: RawSubstrate,
+    pub neg: RawSubstrate,
+    pub passive: RawSubstrate,
+    pub refut: RawSubstrate,
+    pub shift: RawSubstrate,
+    pub abs: RawSubstrate,
+    pub cuts: [u8; 6],
+}
+#[derive(Clone, Debug)]
+pub struct PreparedComposite {
+    pub stream: RawSubstrate,
+}
+#[derive(Clone, Debug)]
+pub struct PhiReport {
+    pub phi_sharp: f32,
+    pub generativity: f32,
+    pub discrimination: f32,
+    pub projection: f32,
+    pub integration: f32,
+    pub gate_contrast: f32,
+    pub mean_gate: f32,
+    pub mip_loss: f32,
+    pub mip_mask: u8,
+    pub residual: f32,
+    pub traj_gain: f32,
+    pub bounce_pen: f32,
+    pub refutation_stab: f32,
+    pub displacement_stab: f32,
+    pub abstraction_stab: f32,
+    pub trace: AbductionTrace,
+}
+#[derive(Clone, Debug)]
+pub struct ProjectionMatch {
+    pub dst_idx: usize,
+    pub score: f32,
+    pub cross_err: f32,
+    pub cos_sim: f32,
+    pub core_start: usize,
+    pub core_end: usize,
+    pub referent: Option<(usize, usize)>,
+    pub byte_overlap: f32,
+}
+#[derive(Clone, Debug)]
+pub struct CompositePhi {
+    pub score: f32,
+    pub r_top: f32,
+    pub r_rest: f32,
+    pub selectivity: f32,
+    pub top_pair: (usize, usize),
+}
+pub fn fnv_hash(bytes: &[u8]) -> u64 {
+    let mut hash = 0xCBF2_9CE4_8422_2325u64;
+    for &b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100_0000_01B3);
+    }
+    hash
+}
+pub fn cosine_sim(a: &[f32; STATE_DIM], b: &[f32; STATE_DIM]) -> f32 {
+    let mut dot = 0.0f32;
+    let mut na = 0.0f32;
+    let mut nb = 0.0f32;
+    for i in 0..STATE_DIM {
+        dot += a[i] * b[i];
+        na += a[i] * a[i];
+        nb += b[i] * b[i];
+    }
+    let denom = (na * nb).sqrt();
+    if denom < 1e-8 {
+        0.0
+    } else {
+        (dot / denom).clamp(-1.0, 1.0)
     }
 }
-#[derive(Clone)]
-pub struct Mech {
-    pub m: Vec<usize>,
-    pub pe: Vec<usize>,
-    pub pc: Vec<usize>,
-    pub gain: Vec<f32>,
-    pub in_m: Vec<bool>,
-}
-#[inline]
-fn mask(n: usize, s: &[usize]) -> Vec<bool> {
-    let mut m = vec![false; n];
-    for &i in s {
-        if i < n {
-            m[i] = true;
+fn sample_training_cuts(rng: &mut Rng) -> [u8; 6] {
+    let mut sing = SINGLETON_MASKS;
+    rng.shuffle(&mut sing);
+    let mut balanced = [0u8; 25];
+    let mut idx = 0;
+    for m in 1u8..(1u8 << (NODES - 1)) {
+        if !SINGLETON_MASKS.contains(&m) {
+            balanced[idx] = m;
+            idx += 1;
         }
     }
-    m
+    rng.shuffle(&mut balanced);
+    [
+        sing[0],
+        sing[1],
+        sing[2],
+        balanced[0],
+        balanced[1],
+        balanced[2],
+    ]
 }
-fn topk(s: &[f32], k: usize) -> Vec<usize> {
-    let mut idx: Vec<usize> = (0..s.len()).filter(|&i| s[i] > 0.0).collect();
-    idx.sort_unstable_by(|&a, &b| {
-        s[b].partial_cmp(&s[a]).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b))
-    });
-    idx.truncate(k);
-    idx
-}
-pub fn build_mech(t: &Tape, f: &Fwd, v: &EffView, w: &Wiring, cfg: &PhiCfg) -> Mech {
-    let n = v.n();
-    let mut gain = vec![0.0f32; v.edges.len()];
-    let mut score = vec![0.0f32; w.na];
-    for a in 0..w.na {
-        let gate = t.at(f.mech, a);
-        let mut s = 0.0f32;
-        for k in 0..P {
-            let eid = w.ptr_eid[a * P + k];
-            if eid == usize::MAX {
-                continue;
-            }
-            let pr = t.at(f.ptr, a * (P + 1) + k + 1);
-            let m = pr * gate;
-            gain[eid] += m;
-            s += m;
-        }
-        score[a] = s;
-    }
-    let m = topk(&score, cfg.mech);
-    let in_m = mask(n, &m);
-    let mut we = vec![0.0f32; n];
-    let mut wc = vec![0.0f32; n];
-    for (ei, e) in v.edges.iter().enumerate() {
-        let g = gain[ei];
-        if g <= 0.0 {
-            continue;
-        }
-        if in_m[e.src as usize] {
-            we[e.dst as usize] += g;
-        }
-        if in_m[e.dst as usize] {
-            wc[e.src as usize] += g;
-        }
-    }
-    let pe = topk(&we, cfg.purview);
-    let pc = topk(&wc, cfg.purview);
-    Mech { m, pe, pc, gain, in_m }
-}
-fn mask_itv(v: &EffView, gain: &[f32], keep: impl Fn(usize, usize) -> bool) -> Itv {
-    let mut g = vec![0.0f32; v.edges.len()];
-    for (ei, e) in v.edges.iter().enumerate() {
-        if keep(e.src as usize, e.dst as usize) {
-            g[ei] = gain[ei];
-        }
-    }
-    Itv { edge_gain: Some(g), group_gain: [1.0; substrate::NW], rounds: 1 }
-}
-fn emd_norm(t: &mut Tape, a: usize, b: usize, k: usize) -> usize {
-    let d = t.emd(a, b);
-    t.scale(d, 1.0 / ((k.max(1) * (Q - 1)) as f32))
-}
-#[inline]
-fn rep_rel(w: &Wiring, k: usize) -> u64 {
-    (k * w.rel_count.max(1)) as u64
-}
-fn candidates(v: &EffView, srcs: &[usize], tgts: &[usize], mip: usize) -> Vec<Vec<bool>> {
-    let n = v.n();
-    let mut out: Vec<Vec<bool>> = Vec::new();
-    let mut lab = vec![false; n];
-    for i in 0..n {
-        lab[i] = i % 2 == 1;
-    }
-    out.push(lab);
-    let mut lab = vec![false; n];
-    for i in 0..n {
-        lab[i] = v.nodes[i].scale > 0;
-    }
-    out.push(lab);
-    let mut uni: Vec<usize> = srcs.to_vec();
-    uni.extend_from_slice(tgts);
-    uni.sort_unstable();
-    uni.dedup();
-    let mut lab = vec![false; n];
-    for (r, &i) in uni.iter().enumerate() {
-        lab[i] = r >= uni.len() / 2;
-    }
-    out.push(lab);
-    for &s in srcs.iter().take(3) {
-        if let Some(&tt) = tgts.iter().find(|&&x| x != s) {
-            let mut lab = vec![false; n];
-            lab[s] = true;
-            lab[tt] = true;
-            out.push(lab);
-        }
-    }
-    out.truncate(mip.max(1));
-    out
-}
-fn side_phi(
-    t: &mut Tape,
-    p: &Params,
-    h: usize,
-    v: &EffView,
-    w: &Wiring,
-    srcs: &[usize],
-    tgts: &[usize],
-    gain: &[f32],
-    effect: bool,
-    cfg: &PhiCfg,
-) -> (usize, usize, usize, u64) {
-    let zero = t.scalar(0.0);
-    let k = tgts.len();
-    if srcs.len() < 2 || k < 2 {
-        return (zero, zero, zero, 0);
-    }
-    let in_s = mask(v.n(), srcs);
-    let in_t = mask(v.n(), tgts);
-    let whole_itv = mask_itv(v, gain, |s, d| in_s[s] && in_t[d]);
-    let whole = substrate::local_rep(t, p, h, w, tgts, &whole_itv, effect);
-    let mut rel = rep_rel(w, k);
-    let u = t.input(k, Q, &vec![1.0 / Q as f32; k * Q]);
-    let info = emd_norm(t, whole, u, k);
-    let mut best: Option<usize> = None;
-    for lab in candidates(v, srcs, tgts, cfg.mip) {
-        let s1: Vec<usize> = srcs.iter().cloned().filter(|&i| !lab[i]).collect();
-        let s2: Vec<usize> = srcs.iter().cloned().filter(|&i| lab[i]).collect();
-        let t1: Vec<usize> = tgts.iter().cloned().filter(|&i| !lab[i]).collect();
-        let t2: Vec<usize> = tgts.iter().cloned().filter(|&i| lab[i]).collect();
-        if s1.is_empty() || s2.is_empty() || t1.is_empty() || t2.is_empty() {
-            continue;
-        }
-        let i1 = mask_itv(v, gain, |s, d| !lab[s] && !lab[d] && in_s[s] && in_t[d]);
-        let i2 = mask_itv(v, gain, |s, d| lab[s] && lab[d] && in_s[s] && in_t[d]);
-        let ra = substrate::local_rep(t, p, h, w, &t1, &i1, effect);
-        let rb = substrate::local_rep(t, p, h, w, &t2, &i2, effect);
-        rel += rep_rel(w, t1.len()) + rep_rel(w, t2.len());
-        let cat = t.concat_rows(ra, rb);
-        let mut pos = vec![0usize; k];
-        let (mut c1, mut c2) = (0usize, 0usize);
-        for (i, &nd) in tgts.iter().enumerate() {
-            if !lab[nd] {
-                pos[i] = c1;
-                c1 += 1;
+impl PreparedEpisode {
+    pub fn from_bytes(bytes: &[u8], rng: &mut Rng) -> Self {
+        let orig = RawSubstrate::from_bytes(bytes);
+        let mut neg_bytes = bytes.to_vec();
+        rng.shuffle(&mut neg_bytes);
+        let neg = RawSubstrate::from_bytes(&neg_bytes);
+        let mut pool: [u8; 256] = std::array::from_fn(|i| i as u8);
+        rng.shuffle(&mut pool);
+        let mut passive_bytes = Vec::with_capacity(bytes.len());
+        let mut cursor = 0usize;
+        for _ in 0..bytes.len() {
+            if cursor >= 6 && rng.next_usize(100) < 15 {
+                passive_bytes.push(pool[rng.next_usize(cursor.min(14))]);
             } else {
-                pos[i] = t1.len() + c2;
-                c2 += 1;
+                passive_bytes.push(pool[cursor % 256]);
+                cursor += 1;
             }
         }
-        let rp = t.gather_rows(cat, &pos);
-        let d = emd_norm(t, whole, rp, k);
-        best = Some(match best {
-            None => d,
-            Some(b) => t.min2(b, d),
+        let passive = RawSubstrate::from_bytes(&passive_bytes);
+        let mut ref_bytes = bytes.to_vec();
+        let corrupt_n = (bytes.len() / 6).max(1);
+        for _ in 0..corrupt_n {
+            let pos = rng.next_usize(ref_bytes.len());
+            ref_bytes[pos] = ref_bytes[pos].wrapping_add(1 + rng.next_u8() % 250);
+        }
+        let refut = RawSubstrate::from_bytes(&ref_bytes);
+        let mut shift_bytes = bytes.to_vec();
+        let shift = (bytes.len() / 3).max(1) % bytes.len();
+        shift_bytes.rotate_left(shift);
+        let shift_sub = RawSubstrate::from_bytes(&shift_bytes);
+        let mut perm: [u8; 256] = std::array::from_fn(|i| i as u8);
+        rng.shuffle(&mut perm);
+        let sub_len = ((bytes.len() * 3) / 4).max(8).min(bytes.len());
+        let start_off = rng.next_usize(bytes.len() - sub_len + 1);
+        let abs_bytes: Vec<u8> = bytes[start_off..start_off + sub_len]
+            .iter()
+            .map(|&b| perm[b as usize])
+            .collect();
+        let abs = RawSubstrate::from_bytes(&abs_bytes);
+        let cuts = sample_training_cuts(rng);
+        Self {
+            orig,
+            neg,
+            passive,
+            refut,
+            shift: shift_sub,
+            abs,
+            cuts,
+        }
+    }
+}
+impl PreparedComposite {
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        Self {
+            stream: RawSubstrate::from_bytes(bytes),
+        }
+    }
+}
+pub fn byte_overlap_ratio(a: &[u8], b: &[u8]) -> f32 {
+    if a.is_empty() {
+        return 0.0;
+    }
+    let mut seen = [false; 256];
+    for &x in b {
+        seen[x as usize] = true;
+    }
+    let shared = a.iter().filter(|&&x| seen[x as usize]).count();
+    (shared as f32) / (a.len() as f32)
+}
+pub fn cut_discontinuity(sub: &RawSubstrate, s: usize, e: usize, p: usize) -> f32 {
+    let l_lo = p.saturating_sub(10).max(s);
+    let r_hi = (p + 10).min(e);
+    if p <= l_lo || r_hi <= p {
+        return 0.0;
+    }
+    let mut l_cross = 0usize;
+    for t in l_lo..p {
+        let mut has_cross = false;
+        for idx in sub.offsets[t]..sub.offsets[t + 1] {
+            let j = sub.edge_targets[idx] as usize;
+            if j >= p && j < e {
+                let f = &sub.edges[idx];
+                if f[0] + f[1] + f[4] + f[5] >= 1.0 {
+                    has_cross = true;
+                    break;
+                }
+            }
+        }
+        if has_cross {
+            l_cross += 1;
+        }
+    }
+    let mut r_cross = 0usize;
+    for t in p..r_hi {
+        let mut has_cross = false;
+        for idx in sub.offsets[t]..sub.offsets[t + 1] {
+            let j = sub.edge_targets[idx] as usize;
+            if j >= s && j < p {
+                let f = &sub.edges[idx];
+                if f[0] + f[1] + f[4] + f[5] >= 1.0 {
+                    has_cross = true;
+                    break;
+                }
+            }
+        }
+        if has_cross {
+            r_cross += 1;
+        }
+    }
+    let f_left = (l_cross as f32) / ((p - l_lo) as f32);
+    let f_right = (r_cross as f32) / ((r_hi - p) as f32);
+    (1.0 - 0.5 * (f_left + f_right)).clamp(0.0, 1.0)
+}
+pub fn abductive_discontinuity(
+    graph: &PhiGraph,
+    rels: &[[f32; REL_DIM]],
+    left: (usize, usize),
+    right: (usize, usize),
+    steps: usize,
+) -> f32 {
+    let l_rels = &rels[left.0..left.1];
+    let r_rels = &rels[right.0..right.1];
+    let hl = graph.abduce_with_steps(l_rels, None, steps);
+    let hr = graph.abduce_with_steps(r_rels, None, steps);
+    let cos_lr = cosine_sim(&hl.final_state, &hr.final_state);
+    let state_disc = 0.5 * (1.0 - cos_lr);
+    let (_, _, e_lr) = graph.evaluate_hypothesis(&hl.final_state, r_rels);
+    let (_, _, e_rl) = graph.evaluate_hypothesis(&hr.final_state, l_rels);
+    let self_e = 0.5 * (hl.final_mean_err + hr.final_mean_err);
+    let cross_e = 0.5 * (e_lr + e_rl);
+    let err_disc = ((cross_e - self_e) / (cross_e + 0.08)).clamp(0.0, 1.0);
+    0.55 * state_disc + 0.45 * err_disc
+}
+fn split_run_by_abduction(
+    graph: &PhiGraph,
+    sub: &RawSubstrate,
+    rels: &[[f32; REL_DIM]],
+    s: usize,
+    e: usize,
+    exact: bool,
+) -> Vec<(usize, usize)> {
+    let len = e.saturating_sub(s);
+    if len < 32 {
+        return vec![(s, e)];
+    }
+    let step = if exact { 4 } else { 6 };
+    let win = if exact { 16 } else { 18 };
+    let steps = if exact { SEARCH_STEPS } else { 4 };
+    let offset = win / step;
+    let mut anchors = Vec::new();
+    let mut pos = s;
+    while pos + win <= e {
+        anchors.push(pos);
+        pos += step;
+    }
+    if anchors.len() <= offset {
+        return vec![(s, e)];
+    }
+    let traces: Vec<AbductionTrace> = anchors
+        .iter()
+        .map(|&a| graph.abduce_with_steps(&rels[a..a + win], None, steps))
+        .collect();
+    let mut candidates: Vec<(usize, f32)> = Vec::new();
+    for k in 0..(anchors.len() - offset) {
+        let grid_p = anchors[k] + win;
+        if grid_p < s + 12 || e.saturating_sub(grid_p) < 12 {
+            continue;
+        }
+        let hl = &traces[k];
+        let hr = &traces[k + offset];
+        let l_rels = &rels[anchors[k]..anchors[k] + win];
+        let r_rels = &rels[anchors[k + offset]..anchors[k + offset] + win];
+        let state_disc = 0.5 * (1.0 - cosine_sim(&hl.final_state, &hr.final_state));
+        let (_, _, e_lr) = graph.evaluate_hypothesis(&hl.final_state, r_rels);
+        let (_, _, e_rl) = graph.evaluate_hypothesis(&hr.final_state, l_rels);
+        let self_e = 0.5 * (hl.final_mean_err + hr.final_mean_err);
+        let cross_e = 0.5 * (e_lr + e_rl);
+        let err_disc = ((cross_e - self_e) / (cross_e + 0.08)).clamp(0.0, 1.0);
+        let d_abd = 0.55 * state_disc + 0.45 * err_disc;
+        let p_lo = grid_p.saturating_sub(step / 2).max(s + 12);
+        let p_hi = (grid_p + step / 2).min(e.saturating_sub(12));
+        let mut best_p = grid_p;
+        let mut best_cut = -1.0f32;
+        for cp in p_lo..=p_hi {
+            let c = cut_discontinuity(sub, s, e, cp);
+            if c > best_cut {
+                best_cut = c;
+                best_p = cp;
+            }
+        }
+        let mut score = 0.45 * d_abd + 0.55 * best_cut;
+        if best_cut >= 0.85 {
+            score = score.max(0.75 * best_cut);
+        }
+        candidates.push((best_p, score));
+    }
+    let mut peaks: Vec<(usize, f32)> = Vec::new();
+    for i in 0..candidates.len() {
+        let (p, sc) = candidates[i];
+        if sc <= 0.52 {
+            continue;
+        }
+        let left_ok = i == 0 || sc >= candidates[i - 1].1;
+        let right_ok = i + 1 == candidates.len() || sc >= candidates[i + 1].1;
+        if left_ok && right_ok {
+            peaks.push((p, sc));
+        }
+    }
+    peaks.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let mut chosen: Vec<usize> = Vec::new();
+    for (p, _) in peaks {
+        if chosen.iter().all(|&c| c.abs_diff(p) >= 16) {
+            chosen.push(p);
+        }
+    }
+    if chosen.is_empty() {
+        return vec![(s, e)];
+    }
+    chosen.sort_unstable();
+    if exact {
+        for p in &mut chosen {
+            let mut best_p = *p;
+            let mut best_sc = f32::NEG_INFINITY;
+            let lo = (*p).saturating_sub(3).max(s + 12);
+            let hi = (*p + 3).min(e.saturating_sub(12));
+            for cand in lo..=hi {
+                let l_start = cand.saturating_sub(16).max(s);
+                let r_end = (cand + 16).min(e);
+                let d_abd = abductive_discontinuity(
+                    graph,
+                    rels,
+                    (l_start, cand),
+                    (cand, r_end),
+                    SEARCH_STEPS,
+                );
+                let d_cut = cut_discontinuity(sub, s, e, cand);
+                let sc = 0.35 * d_abd + 0.65 * d_cut;
+                if sc > best_sc {
+                    best_sc = sc;
+                    best_p = cand;
+                }
+            }
+            *p = best_p;
+        }
+    }
+    let mut segs = Vec::with_capacity(chosen.len() + 1);
+    let mut cur = s;
+    for p in chosen {
+        if p >= cur + 12 && e >= p + 12 {
+            segs.push((cur, p));
+            cur = p;
+        }
+    }
+    segs.push((cur, e));
+    segs
+}
+fn attach_passive_referents(cores: &[(usize, usize)], gates_ctx: &[f32], n: usize) -> Vec<DiscoveredRegime> {
+    let k = cores.len();
+    if k == 0 {
+        return Vec::new();
+    }
+    let lead_gap = cores[0].0;
+    let trail_gap = n.saturating_sub(cores[k - 1].1);
+    let suffix_mode = trail_gap >= 3 && lead_gap < 3;
+    let mut out = Vec::with_capacity(k);
+    for i in 0..k {
+        let (cs, ce) = cores[i];
+        let mg = gates_ctx[cs..ce].iter().sum::<f32>() / ((ce - cs).max(1) as f32);
+        let prev_end = if i == 0 { 0 } else { cores[i - 1].1 };
+        let next_start = if i + 1 == k { n } else { cores[i + 1].0 };
+        let referent = if suffix_mode {
+            if next_start.saturating_sub(ce) >= 3 {
+                Some((ce, next_start))
+            } else {
+                None
+            }
+        } else if cs.saturating_sub(prev_end) >= 3 {
+            Some((prev_end, cs))
+        } else {
+            None
+        };
+        out.push(DiscoveredRegime {
+            core_start: cs,
+            core_end: ce,
+            referent,
+            mean_gate: mg,
         });
     }
-    let integ = best.unwrap_or_else(|| t.scalar(0.0));
-    let ph = t.min2(info, integ);
-    (ph, info, integ, rel)
+    out
 }
-fn shift_srcs(v: &EffView, w: &Wiring, m: &[usize], kind: u8, fallback_adj: bool) -> Vec<usize> {
-    let mut out = Vec::with_capacity(m.len());
-    for &a in m {
-        let mut found = None;
-        for &ei in w.inc[a].iter() {
-            let e = v.edges[ei];
-            if e.kind == kind && e.src as usize != a {
-                found = Some(e.src as usize);
-                break;
-            }
+fn tighten_regime_isolated(graph: &PhiGraph, bytes: &[u8], mut cs: usize, mut ce: usize) -> (usize, usize) {
+    for _ in 0..2 {
+        if ce.saturating_sub(cs) < 12 {
+            break;
         }
-        match found {
-            Some(x) => out.push(x),
-            None => {
-                if fallback_adj && w.na > 1 {
-                    out.push(if a + 1 < w.na { a + 1 } else { a - 1 });
-                } else {
-                    out.push(a);
+        let iso_sub = RawSubstrate::from_bytes(&bytes[cs..ce]);
+        let (_, _, iso_pt) = graph.encode_with_gate(&iso_sub);
+        let len = iso_pt.len();
+        let mut l = 0usize;
+        while l + 10 < len && iso_pt[l] < 0.44 {
+            l += 1;
+        }
+        let mut r = len;
+        while l + 10 < r && iso_pt[r - 1] < 0.44 {
+            r -= 1;
+        }
+        if l == 0 && r == len {
+            break;
+        }
+        cs += l;
+        ce = cs + (r - l);
+    }
+    (cs, ce)
+}
+pub fn discover_causal_regimes(
+    graph: &PhiGraph,
+    bytes: &[u8],
+    exact: bool,
+) -> Vec<DiscoveredRegime> {
+    let sub = RawSubstrate::from_bytes(bytes);
+    let (rels, gates_ctx, gates_pt) = graph.encode_with_gate(&sub);
+    let raw = discover_causal_regimes_from_encoded(graph, &sub, &rels, &gates_ctx, &gates_pt, exact);
+    if !exact || raw.is_empty() {
+        return raw;
+    }
+    let mut tightened: Vec<(usize, usize)> = Vec::with_capacity(raw.len());
+    for reg in raw {
+        let (cs, ce) = tighten_regime_isolated(graph, bytes, reg.core_start, reg.core_end);
+        if ce.saturating_sub(cs) >= 10 {
+            tightened.push((cs, ce));
+        }
+    }
+    if tightened.is_empty() {
+        return vec![DiscoveredRegime {
+            core_start: 0,
+            core_end: bytes.len(),
+            referent: None,
+            mean_gate: gates_ctx.iter().sum::<f32>() / (bytes.len().max(1) as f32),
+        }];
+    }
+    attach_passive_referents(&tightened, &gates_ctx, bytes.len())
+}
+pub fn compute_phi_sharp_prepared(
+    graph: &PhiGraph,
+    prep: &PreparedEpisode,
+    exact_mip: bool,
+) -> PhiReport {
+    let (rels, gates_orig_ctx, gates_orig_pt) = graph.encode_with_gate(&prep.orig);
+    let trace = graph.abduce(&rels, None);
+    let residual = trace.final_mean_err;
+    let r0 = trace.step_residuals[0].max(1e-4);
+    let traj_gain = ((r0 - residual) / r0).clamp(0.0, 1.0);
+    let mut bounce_pen = 0.0f32;
+    for pair in trace.step_residuals.windows(2) {
+        if pair[1] > pair[0] {
+            bounce_pen += pair[1] - pair[0];
+        }
+    }
+    let generativity = (-2.2 * residual).exp().clamp(1e-4, 1.0);
+    let (neg_rels, gates_neg_ctx, gates_neg_pt) = graph.encode_with_gate(&prep.neg);
+    let (_, gates_pass_ctx, gates_pass_pt) = graph.encode_with_gate(&prep.passive);
+    let (_, _, cross_err) = graph.evaluate_hypothesis(&trace.final_state, &neg_rels);
+    let neg_trace = graph.abduce(&neg_rels, None);
+    let err_gap = ((cross_err - residual) / (cross_err + 0.05)).clamp(0.0, 1.0);
+    let state_gap = (1.0 - cosine_sim(&trace.final_state, &neg_trace.final_state)).clamp(0.0, 1.0);
+    let discrimination = (0.65 * err_gap + 0.35 * state_gap).clamp(1e-4, 1.0);
+    let inv_orig = 1.0 / (gates_orig_ctx.len().max(1) as f32);
+    let inv_neg = 1.0 / (gates_neg_ctx.len().max(1) as f32);
+    let inv_pass = 1.0 / (gates_pass_ctx.len().max(1) as f32);
+    let mean_g_orig = 0.5
+        * (gates_orig_ctx.iter().sum::<f32>() * inv_orig
+            + gates_orig_pt.iter().sum::<f32>() * inv_orig);
+    let mean_g_neg = 0.5
+        * (gates_neg_ctx.iter().sum::<f32>() * inv_neg
+            + gates_neg_pt.iter().sum::<f32>() * inv_neg);
+    let mean_g_pass = 0.5
+        * (gates_pass_ctx.iter().sum::<f32>() * inv_pass
+            + gates_pass_pt.iter().sum::<f32>() * inv_pass);
+    let worst_bad_g = mean_g_neg.max(mean_g_pass);
+    let gate_contrast = (mean_g_orig * (1.0 - worst_bad_g)).clamp(0.0, 1.0);
+    let ref_rels = graph.encode_relations(&prep.refut);
+    let ref_trace = graph.abduce(&ref_rels, None);
+    let (_, _, ref_on_orig) = graph.evaluate_hypothesis(&ref_trace.final_state, &rels);
+    let ref_cos = 0.5 * (1.0 + cosine_sim(&trace.final_state, &ref_trace.final_state));
+    let refutation_stab = (ref_cos * (-1.5 * ref_on_orig).exp()).clamp(0.0, 1.0);
+    let shift_rels = graph.encode_relations(&prep.shift);
+    let shift_trace = graph.abduce(&shift_rels, None);
+    let displacement_stab =
+        (0.5 * (1.0 + cosine_sim(&trace.final_state, &shift_trace.final_state))).clamp(0.0, 1.0);
+    let abs_rels = graph.encode_relations(&prep.abs);
+    let abs_trace = graph.abduce(&abs_rels, None);
+    let abstraction_stab =
+        (0.5 * (1.0 + cosine_sim(&trace.final_state, &abs_trace.final_state))).clamp(0.0, 1.0);
+    let projection =
+        ((refutation_stab + displacement_stab + abstraction_stab) / 3.0).clamp(1e-4, 1.0);
+    let masks: Vec<u8> = if exact_mip {
+        (1u8..(1u8 << (NODES - 1))).collect()
+    } else {
+        prep.cuts.to_vec()
+    };
+    let mut mip_loss = f32::INFINITY;
+    let mut mip_mask = masks[0];
+    for mask in masks {
+        let cut_trace = graph.abduce(&rels, Some(mask));
+        let err_drop = (cut_trace.final_mean_err - residual).max(0.0);
+        let state_drop = (1.0 - cosine_sim(&trace.final_state, &cut_trace.final_state)).max(0.0);
+        let loss = err_drop + 0.25 * state_drop;
+        if loss < mip_loss {
+            mip_loss = loss;
+            mip_mask = mask;
+        }
+    }
+    let integration = (1.0 - (-3.5 * mip_loss).exp()).clamp(0.0, 1.0);
+    let conj = (generativity * discrimination * projection * (0.2 + 0.8 * integration)).powf(0.25);
+    let phi_sharp =
+        0.85 * conj + 0.10 * traj_gain + 0.15 * gate_contrast - 0.30 * residual - 0.30 * bounce_pen;
+    PhiReport {
+        phi_sharp,
+        generativity,
+        discrimination,
+        projection,
+        integration,
+        gate_contrast,
+        mean_gate: mean_g_orig,
+        mip_loss,
+        mip_mask,
+        residual,
+        traj_gain,
+        bounce_pen,
+        refutation_stab,
+        displacement_stab,
+        abstraction_stab,
+        trace,
+    }
+}
+pub fn compute_phi_sharp(
+    graph: &PhiGraph,
+    bytes: &[u8],
+    rng: &mut Rng,
+    exact_mip: bool,
+) -> PhiReport {
+    let prep = PreparedEpisode::from_bytes(bytes, rng);
+    compute_phi_sharp_prepared(graph, &prep, exact_mip)
+}
+pub fn compute_composite_phi_prepared(
+    graph: &PhiGraph,
+    prep: &PreparedComposite,
+) -> CompositePhi {
+    let (rels, gates_ctx, gates_pt) = graph.encode_with_gate(&prep.stream);
+    let regimes = discover_causal_regimes_from_encoded(
+        graph,
+        &prep.stream,
+        &rels,
+        &gates_ctx,
+        &gates_pt,
+        false,
+    );
+    let m = regimes.len();
+    if m < 2 {
+        return CompositePhi {
+            score: -0.25,
+            r_top: 0.0,
+            r_rest: 0.0,
+            selectivity: 0.0,
+            top_pair: (0, 0),
+        };
+    }
+    let mut traces = Vec::with_capacity(m);
+    let mut sum_res = 0.0f32;
+    for reg in &regimes {
+        let tr = graph.abduce(&rels[reg.core_start..reg.core_end], None);
+        sum_res += tr.final_mean_err;
+        traces.push(tr);
+    }
+    let mean_residual = sum_res / (m as f32);
+    let mut pairs: Vec<(f32, usize, usize)> = Vec::with_capacity(m * (m - 1) / 2);
+    for i in 0..m {
+        let ri = &rels[regimes[i].core_start..regimes[i].core_end];
+        for j in (i + 1)..m {
+            let rj = &rels[regimes[j].core_start..regimes[j].core_end];
+            let (_, _, e_ij) = graph.evaluate_hypothesis(&traces[i].final_state, rj);
+            let (_, _, e_ji) = graph.evaluate_hypothesis(&traces[j].final_state, ri);
+            let cross_gen = (-2.2 * 0.5 * (e_ij + e_ji)).exp().clamp(0.0, 1.0);
+            let cos_res = 0.5 * (1.0 + cosine_sim(&traces[i].final_state, &traces[j].final_state));
+            let r_ij = (cross_gen * cos_res).sqrt();
+            pairs.push((r_ij, i, j));
+        }
+    }
+    pairs.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let (r_top, top_i, top_j) = pairs[0];
+    let r_rest = if pairs.len() > 1 {
+        pairs[1..].iter().map(|p| p.0).sum::<f32>() / ((pairs.len() - 1) as f32)
+    } else {
+        0.0
+    };
+    let selectivity = r_top * (1.0 - r_rest);
+    let score = selectivity - 0.18 * mean_residual;
+    CompositePhi {
+        score,
+        r_top,
+        r_rest,
+        selectivity,
+        top_pair: (top_i, top_j),
+    }
+}
+pub fn compute_composite_phi(graph: &PhiGraph, bytes: &[u8]) -> CompositePhi {
+    let prep = PreparedComposite::from_bytes(bytes);
+    compute_composite_phi_prepared(graph, &prep)
+}
+pub fn project_query_to_regimes(
+    graph: &PhiGraph,
+    bytes: &[u8],
+    regimes: &[DiscoveredRegime],
+    query_idx: usize,
+) -> Vec<ProjectionMatch> {
+    let q_reg = regimes[query_idx];
+    let q_bytes = &bytes[q_reg.core_start..q_reg.core_end];
+    let q_rels = graph.encode_bytes(q_bytes);
+    let q_trace = graph.abduce(&q_rels, None);
+    let mut matches = Vec::with_capacity(regimes.len().saturating_sub(1));
+    for (idx, reg) in regimes.iter().enumerate() {
+        if idx == query_idx {
+            continue;
+        }
+        let core_bytes = &bytes[reg.core_start..reg.core_end];
+        let core_rels = graph.encode_bytes(core_bytes);
+        let core_trace = graph.abduce(&core_rels, None);
+        let (_, _, fwd_err) = graph.evaluate_hypothesis(&q_trace.final_state, &core_rels);
+        let (_, _, bwd_err) = graph.evaluate_hypothesis(&core_trace.final_state, &q_rels);
+        let cross_err = 0.5 * (fwd_err + bwd_err);
+        let cross_gen = (-2.2 * cross_err).exp().clamp(0.0, 1.0);
+        let cos_sim = cosine_sim(&q_trace.final_state, &core_trace.final_state);
+        let cos_pos = 0.5 * (1.0 + cos_sim);
+        let score = (cross_gen * cos_pos).sqrt();
+        let byte_overlap = byte_overlap_ratio(q_bytes, core_bytes);
+        matches.push(ProjectionMatch {
+            dst_idx: idx,
+            score,
+            cross_err,
+            cos_sim,
+            core_start: reg.core_start,
+            core_end: reg.core_end,
+            referent: reg.referent,
+            byte_overlap,
+        });
+    }
+    matches.sort_by(|a, b| b.score.total_cmp(&a.score));
+    matches
+}
+pub fn extract_abductive_core(
+    graph: &PhiGraph,
+    bytes: &[u8],
+    rels: &[[f32; REL_DIM]],
+    global_state: &[f32; STATE_DIM],
+) -> (usize, Vec<u8>, f32) {
+    let n = bytes.len();
+    let win = (n / 4).clamp(10, 24).min(n);
+    if n <= win {
+        let (_, _, err) = graph.evaluate_hypothesis(global_state, rels);
+        return (0, bytes.to_vec(), err);
+    }
+    let stride = (win / 4).max(1);
+    let mut best_start = 0usize;
+    let mut best_score = f32::NEG_INFINITY;
+    let mut best_err = f32::INFINITY;
+    let mut s = 0usize;
+    while s + win <= n {
+        let sub_rels = graph.encode_bytes(&bytes[s..s + win]);
+        let sub_trace = graph.abduce(&sub_rels, None);
+        let (_, _, err_on_all) = graph.evaluate_hypothesis(&sub_trace.final_state, rels);
+        let sim = 0.5 * (1.0 + cosine_sim(&sub_trace.final_state, global_state));
+        let score = (-2.2 * err_on_all).exp() * sim;
+        if score > best_score {
+            best_score = score;
+            best_start = s;
+            best_err = err_on_all;
+        }
+        s += stride;
+    }
+    (best_start, bytes[best_start..best_start + win].to_vec(), best_err)
+}
+pub fn format_partition(mask: u8) -> String {
+    let mut a = Vec::new();
+    let mut b = Vec::new();
+    for i in 0..NODES {
+        if ((mask >> i) & 1) == 0 {
+            a.push(i.to_string());
+        } else {
+            b.push(i.to_string());
+        }
+    }
+    format!("{{{}}} | {{{}}}", a.join(","), b.join(","))
+}
+fn has_supported_bridge(sub: &RawSubstrate, left: (usize, usize), right: (usize, usize)) -> bool {
+    let mut bridges = 0usize;
+    for t in left.0..left.1 {
+        for idx in sub.offsets[t]..sub.offsets[t + 1] {
+            let j = sub.edge_targets[idx] as usize;
+            if j >= right.0 && j < right.1 {
+                let f = &sub.edges[idx];
+                if f[0] + f[1] + f[4] + f[5] >= 1.0 {
+                    bridges += 1;
+                    if bridges >= 2 {
+                        return true;
+                    }
+                    break;
                 }
             }
         }
     }
-    out.sort_unstable();
-    out.dedup();
-    out
+    false
 }
-fn stability(
-    t: &mut Tape,
-    p: &Params,
-    h: usize,
-    v: &EffView,
-    w: &Wiring,
-    mech: &Mech,
-    whole: usize,
-) -> (usize, u64) {
-    let k = mech.pe.len();
-    if k == 0 || mech.m.is_empty() {
-        return (t.scalar(1.0), 0);
+pub fn discover_causal_regimes_from_encoded(
+    graph: &PhiGraph,
+    sub: &RawSubstrate,
+    rels: &[[f32; REL_DIM]],
+    gates_ctx: &[f32],
+    gates_pt: &[f32],
+    exact: bool,
+) -> Vec<DiscoveredRegime> {
+    let n = rels.len();
+    if n < 12 {
+        let mg = if n == 0 {
+            0.0
+        } else {
+            gates_ctx.iter().sum::<f32>() / (n as f32)
+        };
+        return vec![DiscoveredRegime {
+            core_start: 0,
+            core_end: n,
+            referent: None,
+            mean_gate: mg,
+        }];
     }
-    let in_pe = mask(v.n(), &mech.pe);
-    let in_m = mask(v.n(), &mech.m);
-    let mut rel = 0u64;
-    let zero = t.scalar(0.0);
-    let one = t.scalar(1.0);
-    let mut best = one;
-    let mut g2 = mech.gain.clone();
-    let mut bi = usize::MAX;
-    let mut bv = 0.0f32;
-    for (ei, e) in v.edges.iter().enumerate() {
-        if in_m[e.src as usize] && in_pe[e.dst as usize] && mech.gain[ei] > bv {
-            bv = mech.gain[ei];
-            bi = ei;
+    let mut raw_runs: Vec<(usize, usize)> = Vec::new();
+    let mut in_run = false;
+    let mut run_start = 0usize;
+    for t in 0..n {
+        if gates_ctx[t] >= 0.46 {
+            if !in_run {
+                in_run = true;
+                run_start = t;
+            }
+        } else if in_run {
+            raw_runs.push((run_start, t));
+            in_run = false;
         }
     }
-    if bi != usize::MAX {
-        g2[bi] = 0.0;
+    if in_run {
+        raw_runs.push((run_start, n));
     }
-    let i_ref = mask_itv(v, &g2, |s, d| in_m[s] && in_pe[d]);
-    let r_ref = substrate::local_rep(t, p, h, w, &mech.pe, &i_ref, true);
-    rel += rep_rel(w, k);
-    let d = emd_norm(t, whole, r_ref, k);
-    let nd = t.neg(d);
-    let s1 = t.add_const(nd, 1.0);
-    let s1 = t.max2(zero, s1);
-    best = t.min2(best, s1);
-    let md = shift_srcs(v, w, &mech.m, REL_ADJ, true);
-    let in_md = mask(v.n(), &md);
-    let i_dis = mask_itv(v, &mech.gain, |s, d| in_md[s] && in_pe[d]);
-    let r_dis = substrate::local_rep(t, p, h, w, &mech.pe, &i_dis, true);
-    rel += rep_rel(w, k);
-    let d = emd_norm(t, whole, r_dis, k);
-    let nd = t.neg(d);
-    let s2 = t.add_const(nd, 1.0);
-    let s2 = t.max2(zero, s2);
-    best = t.min2(best, s2);
-    let ma = shift_srcs(v, w, &mech.m, REL_CONTAIN, false);
-    let in_ma = mask(v.n(), &ma);
-    let i_abs = mask_itv(v, &mech.gain, |s, d| in_ma[s] && in_pe[d]);
-    let r_abs = substrate::local_rep(t, p, h, w, &mech.pe, &i_abs, true);
-    rel += rep_rel(w, k);
-    let d = emd_norm(t, whole, r_abs, k);
-    let nd = t.neg(d);
-    let s3 = t.add_const(nd, 1.0);
-    let s3 = t.max2(zero, s3);
-    best = t.min2(best, s3);
-    (best, rel)
-}
-pub struct PhiVal {
-    pub sharp: usize,
-    pub bigphi: usize,
-    pub stab: usize,
-    pub cov: usize,
-    pub res_vec: usize,
-    pub info_e: usize,
-    pub integ_e: usize,
-    pub info_c: usize,
-    pub integ_c: usize,
-    pub sharp_f: f32,
-    pub bigphi_f: f32,
-    pub stab_f: f32,
-    pub cov_f: f32,
-    pub res_node: usize,
-    pub rel: u64,
-}
-pub fn evaluate(
-    t: &mut Tape,
-    p: &Params,
-    v: &EffView,
-    w: &Wiring,
-    f: &Fwd,
-    mech: &Mech,
-    cfg: &PhiCfg,
-) -> PhiVal {
-    let (ph_e, info_e, integ_e, rel_e) =
-        side_phi(t, p, f.h, v, w, &mech.m, &mech.pe, &mech.gain, true, cfg);
-    let (ph_c, info_c, integ_c, rel_c) =
-        side_phi(t, p, f.h, v, w, &mech.pc, &mech.m, &mech.gain, false, cfg);
-    let bigphi = t.min2(ph_e, ph_c);
-    let in_m = mask(v.n(), &mech.m);
-    let in_pe = mask(v.n(), &mech.pe);
-    let witv = mask_itv(v, &mech.gain, |s, d| in_m[s] && in_pe[d]);
-    let whole = substrate::local_rep(t, p, f.h, w, &mech.pe, &witv, true);
-    let (stab, rel_s) = if cfg.perturb {
-        stability(t, p, f.h, v, w, mech, whole)
-    } else {
-        (t.scalar(1.0), 0)
-    };
-    let sharp = t.mul(bigphi, stab);
-    let mut sel = vec![0.0f32; P + 1];
-    sel[0] = 1.0;
-    let selv = t.input(P + 1, 1, &sel);
-    let nullcol = t.matmul(f.ptr, selv);
-    let one = t.input(w.na, 1, &vec![1.0; w.na]);
-    let hit = t.sub(one, nullcol);
-    let cov = t.mean_all(hit);
-    let atoms: Vec<usize> = (0..w.na).collect();
-    let res_a = t.gather_rows(f.res, &atoms);
-    let res_vec = t.mul(nullcol, res_a);
-    let mut res_node = 0usize;
-    let mut rv = f32::NEG_INFINITY;
-    for a in 0..w.na {
-        let x = t.at(res_vec, a);
-        if x > rv {
-            rv = x;
-            res_node = a;
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (s, e) in raw_runs {
+        if let Some(last) = merged.last_mut() {
+            let gap = s.saturating_sub(last.1);
+            let both_solid = last.1.saturating_sub(last.0) >= 8 && e.saturating_sub(s) >= 8;
+            let bridged = gap <= 6
+                && last.1.saturating_sub(last.0) >= 6
+                && e.saturating_sub(s) >= 6
+                && has_supported_bridge(sub, *last, (s, e));
+            if gap <= 1 || (gap <= 3 && both_solid) || bridged {
+                last.1 = e;
+                continue;
+            }
+        }
+        merged.push((s, e));
+    }
+    let mut active_runs: Vec<(usize, usize)> = merged
+        .into_iter()
+        .filter(|&(s, e)| e.saturating_sub(s) >= 10)
+        .collect();
+    if active_runs.is_empty() {
+        let mg = gates_ctx.iter().sum::<f32>() / (n as f32);
+        return vec![DiscoveredRegime {
+            core_start: 0,
+            core_end: n,
+            referent: None,
+            mean_gate: mg,
+        }];
+    }
+    for i in 0..active_runs.len() {
+        let min_s = if i == 0 { 0 } else { active_runs[i - 1].1 };
+        let max_e = if i + 1 == active_runs.len() {
+            n
+        } else {
+            active_runs[i + 1].0
+        };
+        let (mut s, mut e) = active_runs[i];
+        let mut trim_l = 0usize;
+        while s + 10 < e && trim_l < 14 && gates_pt[s] < 0.44 {
+            s += 1;
+            trim_l += 1;
+        }
+        let mut trim_r = 0usize;
+        while s + 10 < e && trim_r < 14 && gates_pt[e - 1] < 0.44 {
+            e -= 1;
+            trim_r += 1;
+        }
+        if trim_l == 0 {
+            let mut ext_l = 0usize;
+            while s > min_s && ext_l < 2 && gates_pt[s - 1] >= 0.68 {
+                s -= 1;
+                ext_l += 1;
+            }
+        }
+        if trim_r == 0 {
+            let mut ext_r = 0usize;
+            while e < max_e && ext_r < 2 && gates_pt[e] >= 0.68 {
+                e += 1;
+                ext_r += 1;
+            }
+        }
+        active_runs[i] = (s, e);
+    }
+    let mut cores: Vec<(usize, usize)> = Vec::new();
+    for (s, e) in active_runs {
+        for (mut cs, mut ce) in split_run_by_abduction(graph, sub, rels, s, e, exact) {
+            let mut tl = 0usize;
+            while cs + 10 < ce && tl < 4 && gates_pt[cs] < 0.40 {
+                cs += 1;
+                tl += 1;
+            }
+            let mut tr = 0usize;
+            while cs + 10 < ce && tr < 4 && gates_pt[ce - 1] < 0.40 {
+                ce -= 1;
+                tr += 1;
+            }
+            cores.push((cs, ce));
         }
     }
-    PhiVal {
-        sharp,
-        bigphi,
-        stab,
-        cov,
-        res_vec,
-        info_e,
-        integ_e,
-        info_c,
-        integ_c,
-        sharp_f: t.scalar_of(sharp),
-        bigphi_f: t.scalar_of(bigphi),
-        stab_f: t.scalar_of(stab),
-        cov_f: t.scalar_of(cov),
-        res_node,
-        rel: rel_e + rel_c + rel_s + rep_rel(w, mech.pe.len()) + (w.na * (P + 1)) as u64,
-    }
-}
-pub fn residual_gain(
-    t: &mut Tape,
-    p: &Params,
-    v: &EffView,
-    w: &Wiring,
-    f: &Fwd,
-    mech: &Mech,
-    cfg: &PhiCfg,
-    extra: usize,
-    base: usize,
-) -> usize {
-    if extra >= w.na || mech.in_m[extra] {
-        return t.scalar(0.0);
-    }
-    let mut k0 = 0usize;
-    let mut bw = f32::NEG_INFINITY;
-    for k in 0..P {
-        let x = w.ptr_w[extra * P + k];
-        if x > bw {
-            bw = x;
-            k0 = k;
+    let max_mg = cores
+        .iter()
+        .map(|&(cs, ce)| gates_ctx[cs..ce].iter().sum::<f32>() / ((ce - cs).max(1) as f32))
+        .fold(0.0f32, f32::max);
+    if max_mg >= 0.72 && cores.len() >= 2 {
+        let filtered: Vec<(usize, usize)> = cores
+            .iter()
+            .copied()
+            .filter(|&(cs, ce)| {
+                let mg = gates_ctx[cs..ce].iter().sum::<f32>() / ((ce - cs).max(1) as f32);
+                let len = ce.saturating_sub(cs);
+                mg >= 0.62 * max_mg && (len >= 14 || mg >= 0.68)
+            })
+            .collect();
+        if !filtered.is_empty() {
+            cores = filtered;
         }
     }
-    let eid = w.ptr_eid[extra * P + k0];
-    if eid == usize::MAX {
-        return t.scalar(0.0);
-    }
-    let nz = mech.gain.iter().filter(|&&x| x > 0.0).count().max(1);
-    let mean = mech.gain.iter().sum::<f32>() / nz as f32;
-    let mut g2 = mech.gain.clone();
-    if g2[eid] < mean {
-        g2[eid] = mean;
-    }
-    let mut m2 = mech.m.clone();
-    m2.push(extra);
-    let (a, _, _, _) = side_phi(t, p, f.h, v, w, &m2, &mech.pe, &g2, true, cfg);
-    let (b, _, _, _) = side_phi(t, p, f.h, v, w, &mech.pc, &m2, &g2, false, cfg);
-    let with = t.min2(a, b);
-    t.sub(with, base)
+    attach_passive_referents(&cores, gates_ctx, n)
 }
 
 
@@ -853,608 +2637,480 @@ pub fn residual_gain(
 ========================================
 File: ./src/ptgrs.rs
 ========================================
-use crate::canon::{Canon, ABSENT};
-use crate::util::Rng;
-use std::collections::BTreeMap;
-pub type Sym = u16;
-pub type OpId = u16;
-#[derive(Clone, Debug, PartialEq)]
-pub enum RNode {
-    Atom(Sym),
-    Call(OpId),
-    Cat(Vec<usize>),
+use crate::rng::Rng;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CauseFamily {
+    Periodic,
+    Symmetric,
+    Nested,
+    SharedMotif,
+    Substitution,
+    Grammar,
 }
-#[derive(Clone, Debug)]
-pub struct Rule {
-    pub nodes: Vec<RNode>,
-    pub root: usize,
-    pub weight: f64,
-    pub tag: u16,
-}
-impl Rule {
-    pub fn has_call(&self) -> bool {
-        self.nodes.iter().any(|n| matches!(n, RNode::Call(_)))
-    }
-}
-#[derive(Clone, Debug, Default)]
-pub struct Ptgrs {
-    pub n_atoms: usize,
-    pub ops: Vec<Vec<Rule>>,
-    pub start: OpId,
-}
-#[derive(Clone, Debug)]
-pub struct Limits {
-    pub max_steps: usize,
-    pub max_len: usize,
-    pub max_depth: usize,
-}
-impl Default for Limits {
-    fn default() -> Limits {
-        Limits { max_steps: 20_000, max_len: 4096, max_depth: 64 }
-    }
-}
-#[derive(Clone, Debug)]
-pub struct Sample {
-    pub syms: Vec<Sym>,
-    pub spans: Vec<(u16, usize, usize)>,
-    pub steps: usize,
-}
-#[derive(Clone, Copy, Debug)]
-enum Kind {
-    Atom(Sym),
-    Cat,
-    Call(OpId),
-}
-struct Gn {
-    kind: Kind,
-    kids: Vec<u32>,
-    tag: u16,
-    done: bool,
-}
-impl Ptgrs {
-    pub fn new(n_atoms: usize) -> Ptgrs {
-        Ptgrs { n_atoms, ops: Vec::new(), start: 0 }
-    }
-    pub fn add_op(&mut self) -> OpId {
-        self.ops.push(Vec::new());
-        (self.ops.len() - 1) as OpId
-    }
-    pub fn add_rule(&mut self, op: OpId, rule: Rule) {
-        self.ops[op as usize].push(rule);
-    }
-    pub fn validate(&self) -> Result<(), String> {
-        if self.ops.is_empty() {
-            return Err("aucun op".to_string());
+impl CauseFamily {
+    pub const ALL: [CauseFamily; 6] = [
+        CauseFamily::Periodic,
+        CauseFamily::Symmetric,
+        CauseFamily::Nested,
+        CauseFamily::SharedMotif,
+        CauseFamily::Substitution,
+        CauseFamily::Grammar,
+    ];
+    pub fn name(self) -> &'static str {
+        match self {
+            CauseFamily::Periodic => "periodic",
+            CauseFamily::Symmetric => "symmetric",
+            CauseFamily::Nested => "nested",
+            CauseFamily::SharedMotif => "shared",
+            CauseFamily::Substitution => "substitution",
+            CauseFamily::Grammar => "grammar",
         }
-        if (self.start as usize) >= self.ops.len() {
-            return Err("start hors bornes".to_string());
+    }
+    pub fn from_name(s: &str) -> Option<Self> {
+        match s {
+            "periodic" => Some(CauseFamily::Periodic),
+            "symmetric" => Some(CauseFamily::Symmetric),
+            "nested" => Some(CauseFamily::Nested),
+            "shared" => Some(CauseFamily::SharedMotif),
+            "substitution" => Some(CauseFamily::Substitution),
+            "grammar" => Some(CauseFamily::Grammar),
+            _ => None,
         }
-        for (o, alts) in self.ops.iter().enumerate() {
-            for (r, rule) in alts.iter().enumerate() {
-                if rule.root >= rule.nodes.len() {
-                    return Err(format!("op {o} règle {r}: racine hors bornes"));
-                }
-                if !(rule.weight >= 0.0) {
-                    return Err(format!("op {o} règle {r}: poids invalide"));
-                }
-                for (i, nd) in rule.nodes.iter().enumerate() {
-                    match nd {
-                        RNode::Atom(a) => {
-                            if (*a as usize) >= self.n_atoms {
-                                return Err(format!("op {o} règle {r}: atome hors bornes"));
-                            }
-                        }
-                        RNode::Call(c) => {
-                            if (*c as usize) >= self.ops.len() {
-                                return Err(format!("op {o} règle {r}: appel hors bornes"));
-                            }
-                        }
-                        RNode::Cat(ks) => {
-                            for &k in ks {
-                                if k >= i {
-                                    return Err(format!("op {o} règle {r}: cycle ou ordre"));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-    pub fn relabel(&self, map: &[Sym], n_new: usize) -> Ptgrs {
-        let mut g = self.clone();
-        g.n_atoms = n_new;
-        for alts in g.ops.iter_mut() {
-            for r in alts.iter_mut() {
-                for nd in r.nodes.iter_mut() {
-                    if let RNode::Atom(a) = nd {
-                        *a = map[*a as usize];
-                    }
-                }
-            }
-        }
-        g
-    }
-    pub fn generate(&self, rng: &mut Rng, lim: &Limits) -> Option<Sample> {
-        let mut g: Vec<Gn> = vec![Gn { kind: Kind::Call(self.start), kids: Vec::new(), tag: 0, done: false }];
-        let mut steps = 0usize;
-        if !self.reduce(&mut g, 0, rng, lim, &mut steps, 0) {
-            return None;
-        }
-        let mut syms: Vec<Sym> = Vec::new();
-        let mut spans: Vec<(u16, usize, usize)> = Vec::new();
-        if !Self::flatten(&g, 0, &mut syms, &mut spans, lim.max_len) {
-            return None;
-        }
-        Some(Sample { syms, spans, steps })
-    }
-    fn choose_rule(&self, op: usize, rng: &mut Rng, depth: usize, lim: &Limits) -> usize {
-        let alts = &self.ops[op];
-        if alts.len() == 1 {
-            return 0;
-        }
-        let mut w: Vec<f64> = alts.iter().map(|r| r.weight.max(0.0)).collect();
-        if depth * 2 >= lim.max_depth && alts.iter().any(|r| !r.has_call()) {
-            for (i, r) in alts.iter().enumerate() {
-                if r.has_call() {
-                    w[i] = 0.0;
-                }
-            }
-        }
-        rng.weighted(&w)
-    }
-    fn reduce(&self, g: &mut Vec<Gn>, n: usize, rng: &mut Rng, lim: &Limits, steps: &mut usize, depth: usize) -> bool {
-        if g[n].done {
-            return true;
-        }
-        if depth > lim.max_depth {
-            return false;
-        }
-        loop {
-            let op = match g[n].kind {
-                Kind::Call(op) => op as usize,
-                _ => break,
-            };
-            if *steps >= lim.max_steps || self.ops[op].is_empty() {
-                return false;
-            }
-            *steps += 1;
-            let ri = self.choose_rule(op, rng, depth, lim);
-            let rule = &self.ops[op][ri];
-            let base = g.len();
-            for nd in &rule.nodes {
-                let (kind, kids) = match nd {
-                    RNode::Atom(a) => (Kind::Atom(*a), Vec::new()),
-                    RNode::Call(o) => (Kind::Call(*o), Vec::new()),
-                    RNode::Cat(ix) => (Kind::Cat, ix.iter().map(|&i| (base + i) as u32).collect()),
-                };
-                g.push(Gn { kind, kids, tag: 0, done: false });
-            }
-            let r = base + rule.root;
-            let (k, ks) = (g[r].kind, g[r].kids.clone());
-            g[n].kind = k;
-            g[n].kids = ks;
-            if rule.tag != 0 {
-                g[n].tag = rule.tag;
-            }
-        }
-        g[n].done = true;
-        let kids = g[n].kids.clone();
-        for k in kids {
-            if !self.reduce(g, k as usize, rng, lim, steps, depth + 1) {
-                return false;
-            }
-        }
-        true
-    }
-    fn flatten(g: &[Gn], n: usize, out: &mut Vec<Sym>, spans: &mut Vec<(u16, usize, usize)>, max_len: usize) -> bool {
-        let start = out.len();
-        match g[n].kind {
-            Kind::Atom(a) => {
-                if out.len() >= max_len {
-                    return false;
-                }
-                out.push(a);
-            }
-            Kind::Cat => {
-                for &k in &g[n].kids {
-                    if !Self::flatten(g, k as usize, out, spans, max_len) {
-                        return false;
-                    }
-                }
-            }
-            Kind::Call(_) => return false,
-        }
-        if g[n].tag != 0 {
-            spans.push((g[n].tag, start, out.len()));
-        }
-        true
-    }
-    pub fn dump(&self) -> String {
-        let mut s = String::new();
-        for (o, alts) in self.ops.iter().enumerate() {
-            for r in alts {
-                let body: Vec<String> = r
-                    .nodes
-                    .iter()
-                    .enumerate()
-                    .map(|(i, n)| match n {
-                        RNode::Atom(a) => format!("n{i}=a{a}"),
-                        RNode::Call(c) => format!("n{i}=@{c}"),
-                        RNode::Cat(k) => format!("n{i}=cat{k:?}"),
-                    })
-                    .collect();
-                s.push_str(&format!("op{o} w={:.3} tag={} root=n{} : {}\n", r.weight, r.tag, r.root, body.join(" ")));
-            }
-        }
-        s
-    }
-}
-#[derive(Clone, Copy, Debug)]
-pub enum Part {
-    A(Sym),
-    C(OpId),
-    S(usize),
-}
-pub struct Builder {
-    pub g: Ptgrs,
-}
-impl Builder {
-    pub fn new(n_atoms: usize) -> Builder {
-        let mut g = Ptgrs::new(n_atoms);
-        g.add_op();
-        Builder { g }
-    }
-    pub fn op(&mut self) -> OpId {
-        self.g.add_op()
-    }
-    pub fn word(rng: &mut Rng, n_atoms: usize, lo: usize, hi: usize) -> Vec<Sym> {
-        let len = rng.range(lo, hi);
-        (0..len).map(|_| rng.below(n_atoms) as Sym).collect()
-    }
-    pub fn atoms(w: &[Sym]) -> Vec<Part> {
-        w.iter().map(|&a| Part::A(a)).collect()
-    }
-    pub fn rule(&mut self, op: OpId, weight: f64, shared: &[OpId], parts: &[Part]) {
-        let mut nodes: Vec<RNode> = shared.iter().map(|&o| RNode::Call(o)).collect();
-        let mut kids: Vec<usize> = Vec::new();
-        for p in parts {
-            match p {
-                Part::S(k) => kids.push(*k),
-                Part::A(a) => {
-                    nodes.push(RNode::Atom(*a));
-                    kids.push(nodes.len() - 1);
-                }
-                Part::C(o) => {
-                    nodes.push(RNode::Call(*o));
-                    kids.push(nodes.len() - 1);
-                }
-            }
-        }
-        nodes.push(RNode::Cat(kids));
-        let root = nodes.len() - 1;
-        self.g.add_rule(op, Rule { nodes, root, weight, tag: 0 });
-    }
-    pub fn chunk(&mut self, w: &[Sym]) -> OpId {
-        let op = self.op();
-        self.rule(op, 1.0, &[], &Self::atoms(w));
-        op
-    }
-    pub fn choice(&mut self, alts: &[Vec<Sym>], weights: &[f64]) -> OpId {
-        let op = self.op();
-        for (i, w) in alts.iter().enumerate() {
-            self.rule(op, weights[i], &[], &Self::atoms(w));
-        }
-        op
-    }
-    pub fn frame(&mut self, pre: &[Sym], slot: OpId, post: &[Sym]) -> OpId {
-        let op = self.op();
-        let mut parts = Self::atoms(pre);
-        parts.push(Part::C(slot));
-        parts.extend(Self::atoms(post));
-        self.rule(op, 1.0, &[], &parts);
-        op
-    }
-    pub fn agree(&mut self, pre: &[Sym], slot: OpId, mid: &[Sym], post: &[Sym]) -> OpId {
-        let op = self.op();
-        let mut parts = Self::atoms(pre);
-        parts.push(Part::S(0));
-        parts.extend(Self::atoms(mid));
-        parts.push(Part::S(0));
-        parts.extend(Self::atoms(post));
-        self.rule(op, 1.0, &[slot], &parts);
-        op
-    }
-    pub fn new_slot(&mut self, rng: &mut Rng) -> OpId {
-        let na = self.g.n_atoms;
-        let k = rng.range(2, 4);
-        let alts: Vec<Vec<Sym>> = (0..k).map(|_| Self::word(rng, na, 1, 3)).collect();
-        let ws: Vec<f64> = (0..k).map(|_| 0.3 + rng.f64()).collect();
-        self.choice(&alts, &ws)
-    }
-    pub fn finish(mut self, top: &[Part]) -> Ptgrs {
-        self.rule(0, 1.0, &[], top);
-        self.g
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Family {
-    Repeat,
-    Frame,
-    Agree,
-    Hier,
-    List,
-    Mixed,
-}
-pub const TRAIN_FAMILIES: [Family; 6] =
-    [Family::Repeat, Family::Frame, Family::Agree, Family::Hier, Family::List, Family::Mixed];
-fn frag_repeat(b: &mut Builder, rng: &mut Rng) -> Vec<Part> {
-    let na = b.g.n_atoms;
-    let nm = rng.range(1, 2);
-    let mut ms: Vec<OpId> = Vec::new();
-    for _ in 0..nm {
-        let w = Builder::word(rng, na, 2, 4);
-        ms.push(b.chunk(&w));
-    }
-    let mut top: Vec<Part> = Vec::new();
-    for _ in 0..rng.range(3, 7) {
-        top.push(Part::C(ms[rng.below(ms.len())]));
-        if rng.chance(0.5) {
-            top.push(Part::A(rng.below(na) as Sym));
-        }
-    }
-    top
-}
-fn frag_frame(b: &mut Builder, rng: &mut Rng) -> Vec<Part> {
-    let na = b.g.n_atoms;
-    let pre = Builder::word(rng, na, 1, 3);
-    let post = Builder::word(rng, na, 1, 2);
-    let slot = b.new_slot(rng);
-    let f = b.frame(&pre, slot, &post);
-    (0..rng.range(4, 8)).map(|_| Part::C(f)).collect()
-}
-fn frag_agree(b: &mut Builder, rng: &mut Rng) -> Vec<Part> {
-    let na = b.g.n_atoms;
-    let pre = Builder::word(rng, na, 1, 2);
-    let mid = Builder::word(rng, na, 1, 2);
-    let post = Builder::word(rng, na, 1, 2);
-    let slot = b.new_slot(rng);
-    let t = b.agree(&pre, slot, &mid, &post);
-    (0..rng.range(3, 6)).map(|_| Part::C(t)).collect()
-}
-fn frag_hier(b: &mut Builder, rng: &mut Rng, depth: usize) -> Vec<Part> {
-    let na = b.g.n_atoms;
-    let mut level: Vec<OpId> = Vec::new();
-    for _ in 0..rng.range(2, 3) {
-        let w = Builder::word(rng, na, 2, 3);
-        level.push(b.chunk(&w));
-    }
-    for _ in 0..depth {
-        let mut next: Vec<OpId> = Vec::new();
-        for _ in 0..rng.range(1, 2) {
-            let op = b.op();
-            let k = rng.range(2, 3);
-            let parts: Vec<Part> = (0..k).map(|_| Part::C(level[rng.below(level.len())])).collect();
-            b.rule(op, 1.0, &[], &parts);
-            next.push(op);
-        }
-        level = next;
-    }
-    (0..rng.range(3, 5)).map(|_| Part::C(level[rng.below(level.len())])).collect()
-}
-fn frag_list(b: &mut Builder, rng: &mut Rng) -> Vec<Part> {
-    let na = b.g.n_atoms;
-    let slot = b.new_slot(rng);
-    let sep = rng.below(na) as Sym;
-    let r = rng.range(4, 8);
-    let mut top: Vec<Part> = Vec::new();
-    for i in 0..r {
-        top.push(Part::C(slot));
-        if i + 1 < r {
-            top.push(Part::A(sep));
-        }
-    }
-    top
-}
-fn fragment(b: &mut Builder, rng: &mut Rng, idx: usize) -> Vec<Part> {
-    match idx % 5 {
-        0 => frag_repeat(b, rng),
-        1 => frag_frame(b, rng),
-        2 => frag_agree(b, rng),
-        3 => {
-            let d = rng.range(1, 2);
-            frag_hier(b, rng, d)
-        }
-        _ => frag_list(b, rng),
-    }
-}
-pub fn build_cause(rng: &mut Rng, fam: Family, n_atoms: usize) -> Ptgrs {
-    let mut b = Builder::new(n_atoms);
-    let top: Vec<Part> = match fam {
-        Family::Repeat => fragment(&mut b, rng, 0),
-        Family::Frame => fragment(&mut b, rng, 1),
-        Family::Agree => fragment(&mut b, rng, 2),
-        Family::Hier => fragment(&mut b, rng, 3),
-        Family::List => fragment(&mut b, rng, 4),
-        Family::Mixed => {
-            let i = rng.below(5);
-            let j = (i + 1 + rng.below(4)) % 5;
-            let mut a = fragment(&mut b, rng, i);
-            let c = fragment(&mut b, rng, j);
-            if rng.chance(0.5) {
-                a.extend(c);
-                a
-            } else {
-                let mut c = c;
-                c.extend(a);
-                c
-            }
-        }
-    };
-    b.finish(&top)
-}
-pub struct Instance {
-    pub e: Vec<u8>,
-    pub cause: Ptgrs,
-    pub atom_byte: Vec<u8>,
-    pub spans: Vec<(u16, usize, usize)>,
-}
-impl Instance {
-    pub fn cause_in_canon(&self, canon: &Canon) -> Ptgrs {
-        let mut map: Vec<Sym> = vec![0; self.cause.n_atoms];
-        let mut extra = canon.n();
-        for a in 0..self.cause.n_atoms {
-            let s = canon.sym_of[self.atom_byte[a] as usize];
-            if s != ABSENT {
-                map[a] = s as Sym;
-            } else {
-                map[a] = extra as Sym;
-                extra += 1;
-            }
-        }
-        self.cause.relabel(&map, extra)
-    }
-}
-pub fn random_alphabet(rng: &mut Rng, n: usize) -> Vec<u8> {
-    let mut pool: Vec<u8> = if rng.chance(0.5) { (33..=126u8).collect() } else { (0..=255u8).collect() };
-    rng.shuffle(&mut pool);
-    pool.truncate(n.min(pool.len()));
-    pool
-}
-pub fn draw_instance(rng: &mut Rng, fam: Family, len_lo: usize, len_hi: usize) -> Option<Instance> {
-    let n_atoms = rng.range(4, 10);
-    let cause = build_cause(rng, fam, n_atoms);
-    if cause.validate().is_err() {
-        return None;
-    }
-    let lim = Limits { max_len: len_hi, ..Limits::default() };
-    let s = cause.generate(rng, &lim)?;
-    if s.syms.len() < len_lo || s.syms.len() > len_hi {
-        return None;
-    }
-    let atom_byte = random_alphabet(rng, n_atoms);
-    let e: Vec<u8> = s.syms.iter().map(|&a| atom_byte[a as usize]).collect();
-    let mut seen = [false; 256];
-    let mut distinct = 0;
-    for &b in &e {
-        if !seen[b as usize] {
-            seen[b as usize] = true;
-            distinct += 1;
-        }
-    }
-    if distinct < 3 {
-        return None;
-    }
-    Some(Instance { e, cause, atom_byte, spans: s.spans })
-}
-pub fn training_e(rng: &mut Rng) -> Vec<u8> {
-    for _ in 0..200 {
-        let fam = TRAIN_FAMILIES[rng.below(TRAIN_FAMILIES.len())];
-        if let Some(inst) = draw_instance(rng, fam, 24, 160) {
-            return inst.e;
-        }
-    }
-    b"abcabcabcabcabcabcabcabc".to_vec()
+pub enum SepMode {
+    None,
+    Newline,
+    Random,
 }
 #[derive(Clone, Debug)]
-pub struct ObsDist {
-    pub strings: Option<f64>,
-    pub ngrams: f64,
-    pub lengths: f64,
+pub struct Episode {
+    pub effect: Vec<u8>,
+    pub hidden_cause: CauseFamily,
 }
-impl ObsDist {
-    pub fn total(&self) -> f64 {
-        match self.strings {
-            Some(s) => (s + self.ngrams + self.lengths) / 3.0,
-            None => (self.ngrams + self.lengths) / 2.0,
+#[derive(Clone, Debug)]
+pub struct CompositeEpisode {
+    pub effect: Vec<u8>,
+    pub hidden_query_idx: usize,
+    pub hidden_match_idx: usize,
+    pub hidden_families: Vec<CauseFamily>,
+    pub hidden_core_spans: Vec<(usize, usize)>,
+    pub hidden_tag_spans: Vec<Option<(usize, usize)>>,
+}
+#[derive(Clone, Debug)]
+pub struct MultiHopEpisode {
+    pub effect: Vec<u8>,
+    pub hidden_concept_name: Vec<u8>,
+    pub hidden_cause_pair: (CauseFamily, CauseFamily),
+    pub hidden_prim_names: Vec<Vec<u8>>,
+}
+struct TermNode {
+    terminal: Option<u8>,
+    children: Vec<usize>,
+}
+struct TermGraph {
+    nodes: Vec<TermNode>,
+}
+impl TermGraph {
+    fn new() -> Self {
+        Self { nodes: Vec::new() }
+    }
+    fn add_leaf(&mut self, byte: u8) -> usize {
+        let id = self.nodes.len();
+        self.nodes.push(TermNode {
+            terminal: Some(byte),
+            children: Vec::new(),
+        });
+        id
+    }
+    fn add_branch(&mut self, children: Vec<usize>) -> usize {
+        let id = self.nodes.len();
+        self.nodes.push(TermNode {
+            terminal: None,
+            children,
+        });
+        id
+    }
+    fn linearize(&self, root: usize, max_len: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(max_len);
+        self.dfs(root, 0, max_len, &mut out);
+        out
+    }
+    fn dfs(&self, id: usize, depth: usize, max_len: usize, out: &mut Vec<u8>) {
+        if out.len() >= max_len || depth > 28 {
+            return;
         }
-    }
-    pub fn quality(&self) -> f64 {
-        1.0 - self.total()
-    }
-}
-fn bump<K: Ord>(m: &mut BTreeMap<K, f64>, k: K) {
-    *m.entry(k).or_insert(0.0) += 1.0;
-}
-fn js<K: Ord + Clone>(p: &BTreeMap<K, f64>, q: &BTreeMap<K, f64>) -> f64 {
-    let sp: f64 = p.values().sum();
-    let sq: f64 = q.values().sum();
-    if sp <= 0.0 || sq <= 0.0 {
-        return 1.0;
-    }
-    let mut both: BTreeMap<K, (f64, f64)> = BTreeMap::new();
-    for (k, v) in p {
-        both.entry(k.clone()).or_insert((0.0, 0.0)).0 = v / sp;
-    }
-    for (k, v) in q {
-        both.entry(k.clone()).or_insert((0.0, 0.0)).1 = v / sq;
-    }
-    let mut d = 0.0;
-    for (_, &(a, b)) in both.iter() {
-        let m = 0.5 * (a + b);
-        if a > 0.0 {
-            d += 0.5 * a * (a / m).log2();
+        let node = &self.nodes[id];
+        if let Some(b) = node.terminal {
+            out.push(b);
+            return;
         }
-        if b > 0.0 {
-            d += 0.5 * b * (b / m).log2();
-        }
-    }
-    d.clamp(0.0, 1.0)
-}
-fn profile(samples: &[Vec<Sym>], n: usize) -> BTreeMap<Vec<Sym>, f64> {
-    let mut m: BTreeMap<Vec<Sym>, f64> = BTreeMap::new();
-    for s in samples {
-        if s.len() >= n {
-            for w in s.windows(n) {
-                bump(&mut m, w.to_vec());
+        for &child in &node.children {
+            self.dfs(child, depth + 1, max_len, out);
+            if out.len() >= max_len {
+                break;
             }
         }
     }
-    m
 }
-pub fn sample_many(sys: &Ptgrs, rng: &mut Rng, n: usize, lim: &Limits) -> Vec<Vec<Sym>> {
-    let mut out: Vec<Vec<Sym>> = Vec::new();
-    let mut tries = 0;
-    while out.len() < n && tries < n * 4 {
-        tries += 1;
-        if let Some(s) = sys.generate(rng, lim) {
-            out.push(s.syms);
+fn sample_alphabet(rng: &mut Rng, count: usize, lo: u8, hi: u8) -> Vec<u8> {
+    let mut pool: Vec<u8> = (lo..=hi).collect();
+    rng.shuffle(&mut pool);
+    pool.truncate(count.min(pool.len()));
+    pool
+}
+pub fn sample_episode(rng: &mut Rng, family: CauseFamily) -> Episode {
+    sample_episode_in_range(rng, family, 32, 126)
+}
+pub fn sample_episode_in_range(rng: &mut Rng, family: CauseFamily, lo: u8, hi: u8) -> Episode {
+    let mut tg = TermGraph::new();
+    let max_len = 28 + rng.next_usize(21);
+    let root = match family {
+        CauseFamily::Periodic => {
+            let period = 2 + rng.next_usize(4);
+            let alpha = sample_alphabet(rng, period, lo, hi);
+            let leaves: Vec<usize> = alpha.into_iter().map(|b| tg.add_leaf(b)).collect();
+            let motif = tg.add_branch(leaves);
+            let reps = (max_len / period).max(6) + 1;
+            tg.add_branch(vec![motif; reps])
+        }
+        CauseFamily::Symmetric => {
+            let half = 3 + rng.next_usize(4);
+            let odd = rng.next_usize(2) == 1;
+            let alpha = sample_alphabet(rng, half + usize::from(odd), lo, hi);
+            let fwd: Vec<usize> = alpha[..half].iter().map(|&b| tg.add_leaf(b)).collect();
+            let rev: Vec<usize> = fwd.iter().rev().copied().collect();
+            let mut kids = fwd;
+            if odd {
+                kids.push(tg.add_leaf(alpha[half]));
+            }
+            kids.extend(rev);
+            let pal = tg.add_branch(kids);
+            tg.add_branch(vec![pal, pal, pal, pal])
+        }
+        CauseFamily::Nested => {
+            let depth = 4 + rng.next_usize(3);
+            let alpha = sample_alphabet(rng, depth * 2 + 2, lo, hi);
+            let core_a = tg.add_leaf(alpha[0]);
+            let core_b = tg.add_leaf(alpha[1]);
+            let mut cur = tg.add_branch(vec![core_a, core_b, core_a]);
+            for d in 0..depth {
+                let open = tg.add_leaf(alpha[2 + d * 2]);
+                let close = tg.add_leaf(alpha[3 + d * 2]);
+                cur = tg.add_branch(vec![open, cur, close]);
+            }
+            let r = cur;
+            tg.add_branch(vec![r, r, r])
+        }
+        CauseFamily::SharedMotif => {
+            let alpha = sample_alphabet(rng, 8, lo, hi);
+            let m0 = tg.add_leaf(alpha[0]);
+            let m1 = tg.add_leaf(alpha[1]);
+            let m2 = tg.add_leaf(alpha[2]);
+            let shared = tg.add_branch(vec![m0, m1, m2, m1]);
+            let b0 = tg.add_leaf(alpha[3]);
+            let b1 = tg.add_leaf(alpha[4]);
+            let b2 = tg.add_leaf(alpha[5]);
+            let b3 = tg.add_leaf(alpha[6]);
+            let b4 = tg.add_leaf(alpha[7]);
+            tg.add_branch(vec![
+                shared, b0, shared, b1, shared, b2, shared, b3, shared, b4, shared,
+            ])
+        }
+        CauseFamily::Substitution => {
+            let alpha = sample_alphabet(rng, 5, lo, hi);
+            let a0 = tg.add_leaf(alpha[0]);
+            let a1 = tg.add_leaf(alpha[1]);
+            let a2 = tg.add_leaf(alpha[2]);
+            let a3 = tg.add_leaf(alpha[3]);
+            let a4 = tg.add_leaf(alpha[4]);
+            let mut prev = tg.add_branch(vec![a0, a1]);
+            let mut curr = tg.add_branch(vec![a2, a3, a4]);
+            for _ in 0..6 {
+                let next = tg.add_branch(vec![curr, prev]);
+                prev = curr;
+                curr = next;
+            }
+            curr
+        }
+        CauseFamily::Grammar => {
+            let alpha = sample_alphabet(rng, 14, lo, hi);
+            let sep = tg.add_leaf(alpha[0]);
+            let r0 = tg.add_leaf(alpha[1]);
+            let r1 = tg.add_leaf(alpha[2]);
+            let r2 = tg.add_leaf(alpha[3]);
+            let stem = tg.add_branch(vec![r0, r1, r2]);
+            let s0 = tg.add_leaf(alpha[4]);
+            let s1 = tg.add_leaf(alpha[5]);
+            let w0 = tg.add_branch(vec![stem, s0]);
+            let w1 = tg.add_branch(vec![stem, s1]);
+            let a0 = tg.add_leaf(alpha[6]);
+            let a1 = tg.add_leaf(alpha[7]);
+            let a2 = tg.add_leaf(alpha[8]);
+            let w2 = tg.add_branch(vec![a0, a1, a2]);
+            let b0 = tg.add_leaf(alpha[9]);
+            let b1 = tg.add_leaf(alpha[10]);
+            let b2 = tg.add_leaf(alpha[11]);
+            let w3 = tg.add_branch(vec![b0, b1, b2]);
+            let clause_a = tg.add_branch(vec![w0, sep, w2, sep, w1]);
+            let clause_b = tg.add_branch(vec![w2, sep, w3, sep, w0]);
+            tg.add_branch(vec![clause_a, sep, clause_b, sep, clause_a])
+        }
+    };
+    let mut effect = tg.linearize(root, max_len);
+    while effect.len() < 24 {
+        let copy = effect.clone();
+        effect.extend_from_slice(&copy);
+    }
+    effect.truncate(max_len);
+    Episode {
+        effect,
+        hidden_cause: family,
+    }
+}
+fn choose_sep(rng: &mut Rng, mode: SepMode) -> &'static [u8] {
+    match mode {
+        SepMode::None => b"",
+        SepMode::Newline => b"\n",
+        SepMode::Random => match rng.next_usize(4) {
+            0 => b"",
+            1 => b"\n",
+            2 => b" | ",
+            _ => b"; ",
+        },
+    }
+}
+pub fn sample_composite_episode(
+    rng: &mut Rng,
+    num_molds: usize,
+    with_tags: bool,
+    printable_query: bool,
+    query_last: bool,
+    sep_mode: SepMode,
+) -> CompositeEpisode {
+    let mut fams = CauseFamily::ALL.to_vec();
+    rng.shuffle(&mut fams);
+    let k = num_molds.clamp(2, fams.len());
+    fams.truncate(k);
+    let target_fam = fams[0];
+    let sep = choose_sep(rng, sep_mode);
+    let mut entries: Vec<(Option<Vec<u8>>, Vec<u8>, CauseFamily, bool, bool)> =
+        Vec::with_capacity(k + 1);
+    for (idx, &fam) in fams.iter().enumerate() {
+        let body = sample_episode_in_range(rng, fam, 33, 90).effect;
+        let tag = if with_tags {
+            let prefix = if printable_query {
+                format!("MOLD_{}: ", fam.name().to_uppercase()).into_bytes()
+            } else {
+                let tag_len = 8 + rng.next_usize(5);
+                sample_alphabet(rng, tag_len, 33, 90)
+            };
+            Some(prefix)
+        } else {
+            None
+        };
+        entries.push((tag, body, fam, false, idx == 0));
+    }
+    let (q_lo, q_hi) = if printable_query {
+        (97, 122)
+    } else {
+        (140, 220)
+    };
+    let query = sample_episode_in_range(rng, target_fam, q_lo, q_hi).effect;
+    if query_last {
+        rng.shuffle(&mut entries);
+        entries.push((None, query, target_fam, true, false));
+    } else {
+        entries.push((None, query, target_fam, true, false));
+        rng.shuffle(&mut entries);
+    }
+    let mut effect = Vec::new();
+    let mut hidden_query_idx = 0;
+    let mut hidden_match_idx = 0;
+    let mut hidden_families = Vec::with_capacity(entries.len());
+    let mut hidden_core_spans = Vec::with_capacity(entries.len());
+    let mut hidden_tag_spans = Vec::with_capacity(entries.len());
+    for (i, (tag_opt, body, fam, is_query, is_match)) in entries.into_iter().enumerate() {
+        if i > 0 {
+            effect.extend_from_slice(sep);
+        }
+        let tag_span = if let Some(tag) = tag_opt {
+            let ts = effect.len();
+            effect.extend_from_slice(&tag);
+            let te = effect.len();
+            Some((ts, te))
+        } else {
+            None
+        };
+        let cs = effect.len();
+        effect.extend_from_slice(&body);
+        let ce = effect.len();
+        if is_query {
+            hidden_query_idx = i;
+        }
+        if is_match {
+            hidden_match_idx = i;
+        }
+        hidden_families.push(fam);
+        hidden_core_spans.push((cs, ce));
+        hidden_tag_spans.push(tag_span);
+    }
+    CompositeEpisode {
+        effect,
+        hidden_query_idx,
+        hidden_match_idx,
+        hidden_families,
+        hidden_core_spans,
+        hidden_tag_spans,
+    }
+}
+fn sample_unique_words(rng: &mut Rng, count: usize, readable: bool) -> Vec<Vec<u8>> {
+    if readable {
+        let mut pool: Vec<&'static [u8]> = vec![
+            b"SOLAR", b"LUNAR", b"PRISM", b"HELIX", b"TORUS", b"QUARK", b"ORBIT", b"PULSE",
+            b"DRIFT", b"SHARD", b"FLARE", b"CHORD", b"WEAVE", b"SPARK",
+        ];
+        rng.shuffle(&mut pool);
+        return pool
+            .into_iter()
+            .take(count)
+            .map(|w| w.to_vec())
+            .collect();
+    }
+    let mut out: Vec<Vec<u8>> = Vec::with_capacity(count);
+    while out.len() < count {
+        let w = sample_alphabet(rng, 5, b'A', b'Z');
+        if !out.contains(&w) {
+            out.push(w);
         }
     }
     out
 }
-pub fn obs_dist(a: &Ptgrs, b: &Ptgrs, rng: &mut Rng, n: usize, lim: &Limits) -> Option<ObsDist> {
-    let sa = sample_many(a, rng, n, lim);
-    let sb = sample_many(b, rng, n, lim);
-    if sa.is_empty() || sb.is_empty() || sa.len() < n / 2 || sb.len() < n / 2 {
-        return None;
+pub fn sample_multihop_episode(
+    rng: &mut Rng,
+    flat: bool,
+    readable: bool,
+) -> MultiHopEpisode {
+    let mut fams = CauseFamily::ALL.to_vec();
+    rng.shuffle(&mut fams);
+    fams.truncate(4);
+    let words = sample_unique_words(rng, 8, readable);
+    let prim_names: Vec<Vec<u8>> = words[0..4].to_vec();
+    let comp_names: Vec<Vec<u8>> = words[4..8].to_vec();
+    let mut pairs: Vec<(usize, usize)> = vec![(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)];
+    let target_pair = pairs.remove(0);
+    rng.shuffle(&mut pairs);
+    let mut chosen_pairs: Vec<(usize, usize, Vec<u8>, bool)> = vec![
+        (target_pair.0, target_pair.1, comp_names[0].clone(), true),
+        (pairs[0].0, pairs[0].1, comp_names[1].clone(), false),
+        (pairs[1].0, pairs[1].1, comp_names[2].clone(), false),
+        (pairs[2].0, pairs[2].1, comp_names[3].clone(), false),
+    ];
+    rng.shuffle(&mut chosen_pairs);
+    let line_sep: &[u8] = if flat { b" | " } else { b"\n" };
+    let assign_op: &[u8] = match rng.next_usize(3) {
+        0 => b" = ",
+        1 => b" : ",
+        _ => b" -> ",
+    };
+    let join_op: &[u8] = match rng.next_usize(3) {
+        0 => b" + ",
+        1 => b" & ",
+        _ => b" , ",
+    };
+    let mut effect = Vec::new();
+    for i in 0..4 {
+        if i > 0 {
+            effect.extend_from_slice(line_sep);
+        }
+        effect.extend_from_slice(&prim_names[i]);
+        effect.extend_from_slice(b": ");
+        let body = sample_episode_in_range(rng, fams[i], 33, 63).effect;
+        effect.extend_from_slice(&body);
     }
-    let mut ma: BTreeMap<Vec<Sym>, f64> = BTreeMap::new();
-    let mut mb: BTreeMap<Vec<Sym>, f64> = BTreeMap::new();
-    for s in &sa {
-        bump(&mut ma, s.clone());
+    let mut hidden_concept_name = Vec::new();
+    for (u, v, cname, is_target) in chosen_pairs {
+        effect.extend_from_slice(line_sep);
+        effect.extend_from_slice(&cname);
+        effect.extend_from_slice(assign_op);
+        effect.extend_from_slice(&prim_names[u]);
+        effect.extend_from_slice(join_op);
+        effect.extend_from_slice(&prim_names[v]);
+        if is_target {
+            hidden_concept_name = cname;
+        }
     }
-    for s in &sb {
-        bump(&mut mb, s.clone());
+    effect.extend_from_slice(line_sep);
+    let q1 = sample_episode_in_range(rng, fams[target_pair.0], b'a', b'z').effect;
+    let q2 = sample_episode_in_range(rng, fams[target_pair.1], b'a', b'z').effect;
+    effect.extend_from_slice(&q1);
+    effect.extend_from_slice(&q2);
+    MultiHopEpisode {
+        effect,
+        hidden_concept_name,
+        hidden_cause_pair: (fams[target_pair.0], fams[target_pair.1]),
+        hidden_prim_names: prim_names,
     }
-    let uniq_a = ma.len() as f64 / sa.len() as f64;
-    let uniq_b = mb.len() as f64 / sb.len() as f64;
-    let strings = if uniq_a > 0.5 || uniq_b > 0.5 { None } else { Some(js(&ma, &mb)) };
-    let mut ng = 0.0;
-    for k in 1..=3 {
-        ng += js(&profile(&sa, k), &profile(&sb, k));
+}
+
+
+
+========================================
+File: ./src/rng.rs
+========================================
+use std::f32::consts::TAU;
+#[derive(Clone, Debug)]
+pub struct Rng {
+    s: [u64; 4],
+}
+impl Rng {
+    pub fn new(seed: u64) -> Self {
+        let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut s = [0u64; 4];
+        for slot in &mut s {
+            z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut x = z;
+            x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            *slot = x ^ (x >> 31);
+        }
+        Self { s }
     }
-    ng /= 3.0;
-    let mut la: BTreeMap<usize, f64> = BTreeMap::new();
-    let mut lb: BTreeMap<usize, f64> = BTreeMap::new();
-    for s in &sa {
-        bump(&mut la, s.len() / 4);
+    pub fn next_u64(&mut self) -> u64 {
+        let result = self.s[1].wrapping_mul(5).rotate_left(7).wrapping_mul(9);
+        let t = self.s[1] << 17;
+        self.s[2] ^= self.s[0];
+        self.s[3] ^= self.s[1];
+        self.s[1] ^= self.s[2];
+        self.s[0] ^= self.s[3];
+        self.s[2] ^= t;
+        self.s[3] = self.s[3].rotate_left(45);
+        result
     }
-    for s in &sb {
-        bump(&mut lb, s.len() / 4);
+    pub fn next_u8(&mut self) -> u8 {
+        (self.next_u64() >> 56) as u8
     }
-    Some(ObsDist { strings, ngrams: ng, lengths: js(&la, &lb) })
+    pub fn next_usize(&mut self, bound: usize) -> usize {
+        if bound == 0 {
+            return 0;
+        }
+        (self.next_u64() as usize) % bound
+    }
+    pub fn next_f32(&mut self) -> f32 {
+        ((self.next_u64() >> 40) as f32) / ((1u32 << 24) as f32)
+    }
+    pub fn next_normal(&mut self) -> f32 {
+        let u1 = self.next_f32().max(1e-7);
+        let u2 = self.next_f32();
+        (-2.0 * u1.ln()).sqrt() * (TAU * u2).cos()
+    }
+    pub fn shuffle<T>(&mut self, slice: &mut [T]) {
+        for i in (1..slice.len()).rev() {
+            let j = self.next_usize(i + 1);
+            slice.swap(i, j);
+        }
+    }
 }
 
 
@@ -1462,332 +3118,422 @@ pub fn obs_dist(a: &Ptgrs, b: &Ptgrs, rng: &mut Rng, n: usize, lim: &Limits) -> 
 ========================================
 File: ./src/train.rs
 ========================================
-use std::io;
-use crate::abduction::{self, SearchCfg};
-use crate::ad::{Adam, Params};
-use crate::eff::{self, ViewCfg};
-use crate::emit::EmitCfg;
-use crate::model::{Closure, Model, CLOSED_EXPERIMENT};
-use crate::phi::PhiCfg;
-use crate::ptgrs::{self, FamilySpec};
-use crate::rng::{tag, Rng};
-use crate::substrate;
-#[derive(Clone, Copy, Debug)]
-pub struct TrainCfg {
-    pub seed: u64,
-    pub episodes: usize,
-    pub batch: usize,
-    pub lr: f32,
-    pub view: ViewCfg,
-    pub search: SearchCfg,
-    pub infer: SearchCfg,
-    pub emit: EmitCfg,
-    pub log_every: usize,
-}
-impl Default for TrainCfg {
-    fn default() -> Self {
-        TrainCfg {
-            seed: 20_261_125,
-            episodes: 240,
-            batch: 4,
-            lr: 3e-3,
-            view: ViewCfg::default(),
-            search: SearchCfg {
-                max_ops: 10,
-                max_rel: 60_000_000,
-                phi: PhiCfg { mech: 4, purview: 3, mip: 4, perturb: true },
-                ..SearchCfg::default()
-            },
-            infer: SearchCfg::default(),
-            emit: EmitCfg::default(),
-            log_every: 20,
-        }
-    }
-}
-#[derive(Clone, Copy, Debug)]
-pub struct CurveRow {
-    pub ep: usize,
-    pub phi: f32,
-    pub cov: f32,
-    pub ops: usize,
-    pub rel: u64,
-}
-pub struct TrainReport {
-    pub episodes: usize,
+use crate::graph::{NUM_PARAMS, PhiGraph, STATE_DIM};
+use crate::multihop::analyze_multihop;
+use crate::phi::{
+    PreparedComposite, PreparedEpisode, compute_composite_phi_prepared,
+    compute_phi_sharp_prepared, cosine_sim, discover_causal_regimes, project_query_to_regimes,
+};
+use crate::ptgrs::{
+    CauseFamily, SepMode, sample_composite_episode, sample_episode, sample_episode_in_range,
+    sample_multihop_episode,
+};
+use crate::rng::Rng;
+use std::thread;
+use std::time::Instant;
+pub struct TrainConfig {
     pub steps: usize,
-    pub nan_steps: usize,
-    pub curve: Vec<CurveRow>,
-    pub final_phi_mean: f32,
-    pub fingerprint: u64,
-    pub total_rel: u64,
+    pub pop_pairs: usize,
+    pub sigma: f32,
+    pub lr: f32,
+    pub seed: u64,
 }
-fn finite(g: &[Vec<f32>]) -> bool {
-    g.iter().all(|b| b.iter().all(|x| x.is_finite()))
-}
-pub fn train(cfg: &TrainCfg, out_path: &str) -> io::Result<(Model, TrainReport)> {
-    let mut rng = Rng::new(cfg.seed);
-    let mut p: Params = substrate::init(&mut rng.fork(tag("init")));
-    let mut opt = Adam::new(&p, cfg.lr);
-    let mut grads: Vec<Vec<f32>> = p.data.iter().map(|b| vec![0.0f32; b.len()]).collect();
-    let spec = FamilySpec::train();
-    let mut curve: Vec<CurveRow> = Vec::new();
-    let mut steps = 0usize;
-    let mut nan_steps = 0usize;
-    let mut total_rel = 0u64;
-    let mut pending = 0usize;
-    let batch = cfg.batch.max(1);
-    for ep in 0..cfg.episodes {
-        let mut er = rng.fork(tag("ptgrs").wrapping_add(ep as u64));
-        let draw = ptgrs::episode(&spec, &mut er);
-        let e = draw.e;
-        drop(draw.cause);
-        let v = eff::build(&e, &cfg.view);
-        let w = substrate::wire(&v);
-        let seed = rng.fork(tag("search")).next_u64();
-        let out = abduction::search(&p, &e, &v, &w, &cfg.search, seed, Some(&mut grads));
-        total_rel = total_rel.saturating_add(out.rel);
-        curve.push(CurveRow { ep, phi: out.phi, cov: out.cov, ops: out.ops, rel: out.rel });
-        pending += 1;
-        if pending >= batch {
-            if finite(&grads) {
-                opt.step(&mut p, &grads);
-                steps += 1;
-            } else {
-                nan_steps += 1;
-            }
-            for b in grads.iter_mut() {
-                for x in b.iter_mut() {
-                    *x = 0.0;
-                }
-            }
-            pending = 0;
-        }
-        if cfg.log_every > 0 && (ep + 1) % cfg.log_every == 0 {
-            let k = curve.len().min(cfg.log_every);
-            let m: f32 = curve[curve.len() - k..].iter().map(|r| r.phi).sum::<f32>() / k as f32;
-            eprintln!("ep {:>5}  phi_moy {:.6}  steps {}  rel {}", ep + 1, m, steps, total_rel);
-        }
-    }
-    if pending > 0 {
-        if finite(&grads) {
-            opt.step(&mut p, &grads);
-            steps += 1;
-        } else {
-            nan_steps += 1;
-        }
-    }
-    let model = Model {
-        params: p,
-        view: cfg.view,
-        search: cfg.infer,
-        emit: cfg.emit,
-        seed: cfg.seed,
-        episodes: cfg.episodes as u64,
-        steps: steps as u64,
-        closure: Closure::closed(),
-        experiment: CLOSED_EXPERIMENT.to_string(),
-        fingerprint: 0,
-    };
-    let fp = model.save(out_path)?;
-    let k = curve.len().min(20).max(1);
-    let final_phi_mean = if curve.is_empty() {
-        0.0
-    } else {
-        curve[curve.len() - k..].iter().map(|r| r.phi).sum::<f32>() / k as f32
-    };
-    Ok((
-        model,
-        TrainReport {
-            episodes: cfg.episodes,
-            steps,
-            nan_steps,
-            curve,
-            final_phi_mean,
-            fingerprint: fp,
-            total_rel,
-        },
-    ))
-}
-pub fn write_manifest(path: &str, cfg: &TrainCfg, rep: &TrainReport) -> io::Result<()> {
-    let mut s = String::new();
-    s.push_str(&format!("experiment\t{}\n", CLOSED_EXPERIMENT));
-    s.push_str(&format!("fingerprint\t{:016x}\n", rep.fingerprint));
-    s.push_str(&format!("seed\t{}\n", cfg.seed));
-    s.push_str(&format!("episodes\t{}\n", rep.episodes));
-    s.push_str(&format!("optimizer_steps\t{}\n", rep.steps));
-    s.push_str(&format!("nan_steps\t{}\n", rep.nan_steps));
-    s.push_str(&format!("total_rel\t{}\n", rep.total_rel));
-    s.push_str(&format!("final_phi_mean\t{:.8}\n", rep.final_phi_mean));
-    s.push_str(&format!("train_max_ops\t{}\n", cfg.search.max_ops));
-    s.push_str(&format!("infer_max_ops\t{}\n", cfg.infer.max_ops));
-    s.push_str(&format!("phi_mech\t{}\n", cfg.search.phi.mech));
-    s.push_str(&format!("phi_mip\t{}\n", cfg.search.phi.mip));
-    s.push_str(&format!("emit_phi_min\t{:.8}\n", cfg.emit.phi_min));
-    s.push_str(&format!("emit_stab_min\t{:.8}\n", cfg.emit.stab_min));
-    s.push_str(&format!("emit_delim\t{}\n", cfg.emit.delim));
-    s.push_str("training_signal\tphi_sharp+coverage+residue\n");
-    s.push_str("excluded\tnl_text,definitions,self_described_e,rendered_h,intentions,pretrained_prior,nl_head\n");
-    s.push_str("checkpoint_selection\tnone\n");
-    for r in rep.curve.iter() {
-        s.push_str(&format!(
-            "curve\t{}\t{:.8}\t{:.8}\t{}\t{}\n",
-            r.ep, r.phi, r.cov, r.ops, r.rel
-        ));
-    }
-    std::fs::write(path, s)
-}
-
-
-
-========================================
-File: ./src/util.rs
-========================================
-use std::time::{SystemTime, UNIX_EPOCH};
-const INV53: f64 = 1.0 / 9_007_199_254_740_992.0;
-#[derive(Clone, Debug)]
-pub struct Rng {
-    s: u64,
-}
-impl Rng {
-    pub fn new(seed: u64) -> Rng {
-        Rng { s: seed ^ 0x9E37_79B9_7F4A_7C15 }
-    }
-    pub fn next_u64(&mut self) -> u64 {
-        self.s = self.s.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.s;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-    pub fn f64(&mut self) -> f64 {
-        (self.next_u64() >> 11) as f64 * INV53
-    }
-    pub fn below(&mut self, n: usize) -> usize {
-        if n <= 1 { 0 } else { (self.next_u64() % (n as u64)) as usize }
-    }
-    pub fn range(&mut self, lo: usize, hi: usize) -> usize {
-        if hi <= lo { lo } else { lo + self.below(hi - lo + 1) }
-    }
-    pub fn chance(&mut self, p: f64) -> bool {
-        self.f64() < p
-    }
-    pub fn normal(&mut self) -> f64 {
-        let u1 = self.f64().max(1e-300);
-        let u2 = self.f64();
-        (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
-    }
-    pub fn shuffle<T>(&mut self, v: &mut [T]) {
-        let n = v.len();
-        for i in (1..n).rev() {
-            let j = self.below(i + 1);
-            v.swap(i, j);
-        }
-    }
-    pub fn weighted(&mut self, w: &[f64]) -> usize {
-        if w.is_empty() {
-            return 0;
-        }
-        let tot: f64 = w.iter().sum();
-        if !(tot > 0.0) {
-            return self.below(w.len());
-        }
-        let mut x = self.f64() * tot;
-        for (i, &wi) in w.iter().enumerate() {
-            if x < wi {
-                return i;
-            }
-            x -= wi;
-        }
-        w.len() - 1
-    }
-    pub fn fork(&mut self) -> Rng {
-        Rng::new(self.next_u64())
-    }
-}
-pub fn fnv64(data: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in data {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h
-}
-pub fn mix64(a: u64, b: u64) -> u64 {
-    let mut z = a ^ b.wrapping_add(0x9E37_79B9_7F4A_7C15).wrapping_add(a << 6).wrapping_add(a >> 2);
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z ^ (z >> 29)
-}
-#[derive(Clone, Debug, Default)]
-pub struct Meter {
-    pub ticks: u64,
-    pub limit: u64,
-}
-impl Meter {
-    pub fn new(limit: u64) -> Meter {
-        Meter { ticks: 0, limit }
-    }
-    pub fn spend(&mut self, n: u64) {
-        self.ticks = self.ticks.saturating_add(n);
-    }
-    pub fn exhausted(&self) -> bool {
-        self.ticks >= self.limit
-    }
-    pub fn used(&self) -> f64 {
-        if self.limit == 0 { 1.0 } else { (self.ticks as f64 / self.limit as f64).min(1.0) }
-    }
-}
-pub fn sigmoid(x: f64) -> f64 {
-    1.0 / (1.0 + (-x).exp())
-}
-pub fn mean(v: &[f64]) -> f64 {
-    if v.is_empty() { 0.0 } else { v.iter().sum::<f64>() / v.len() as f64 }
-}
-pub fn std_dev(v: &[f64]) -> f64 {
-    if v.len() < 2 {
+fn span_iou(a: (usize, usize), b: (usize, usize)) -> f32 {
+    let inter_s = a.0.max(b.0);
+    let inter_e = a.1.min(b.1);
+    if inter_e <= inter_s {
         return 0.0;
     }
-    let m = mean(v);
-    (v.iter().map(|x| (x - m) * (x - m)).sum::<f64>() / (v.len() as f64 - 1.0)).sqrt()
+    let inter = (inter_e - inter_s) as f32;
+    let union = ((a.1 - a.0) + (b.1 - b.0)) as f32 - inter;
+    if union <= 0.0 { 0.0 } else { inter / union }
 }
-pub fn softmax(x: &[f64]) -> Vec<f64> {
-    if x.is_empty() {
-        return Vec::new();
+fn batch_collapse_penalty(states: &[[f32; STATE_DIM]]) -> f32 {
+    let mut sum = 0.0f32;
+    let mut max_sq = 0.0f32;
+    let mut pairs = 0usize;
+    for i in 0..states.len() {
+        for j in (i + 1)..states.len() {
+            let c = cosine_sim(&states[i], &states[j]).max(0.0);
+            let sq = c * c;
+            sum += sq;
+            if sq > max_sq {
+                max_sq = sq;
+            }
+            pairs += 1;
+        }
     }
-    let m = x.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    let e: Vec<f64> = x.iter().map(|v| (v - m).exp()).collect();
-    let s: f64 = e.iter().sum();
-    e.iter().map(|v| v / s).collect()
+    if pairs == 0 {
+        0.0
+    } else {
+        0.5 * (sum / (pairs as f32)) + 0.5 * max_sq
+    }
 }
-pub fn lse(x: &[f64]) -> f64 {
-    if x.is_empty() {
-        return f64::NEG_INFINITY;
+fn cross_specificity(
+    graph: &PhiGraph,
+    singles: &[PreparedEpisode],
+    states: &[[f32; STATE_DIM]],
+    residuals: &[f32],
+) -> f32 {
+    let n = singles.len();
+    if n < 2 {
+        return 0.0;
     }
-    let m = x.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    if m == f64::NEG_INFINITY {
-        return m;
+    let rels_list: Vec<_> = singles
+        .iter()
+        .map(|ep| graph.encode_relations(&ep.orig))
+        .collect();
+    let mut spec_sum = 0.0f32;
+    for i in 0..n {
+        let mut min_other = f32::INFINITY;
+        for j in 0..n {
+            if i == j {
+                continue;
+            }
+            let (_, _, err_ij) = graph.evaluate_hypothesis(&states[i], &rels_list[j]);
+            if err_ij < min_other {
+                min_other = err_ij;
+            }
+        }
+        spec_sum += ((min_other - residuals[i]) / (min_other + 0.05)).clamp(0.0, 1.0);
     }
-    m + x.iter().map(|v| (v - m).exp()).sum::<f64>().ln()
+    spec_sum / (n as f32)
 }
-pub fn unix_now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
-}
-pub fn iso_utc(secs: u64) -> String {
-    let days = (secs / 86_400) as i64;
-    let rem = secs % 86_400;
-    let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let mut y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
-    if mo <= 2 {
-        y += 1;
+fn eval_batch(
+    graph: &PhiGraph,
+    singles: &[PreparedEpisode],
+    composites: &[PreparedComposite],
+    comp_w: f32,
+) -> f32 {
+    let mut sum_phi = 0.0f32;
+    let mut sum_gate_c = 0.0f32;
+    let mut min_gate_c = 1.0f32;
+    let mut states = Vec::with_capacity(singles.len());
+    let mut residuals = Vec::with_capacity(singles.len());
+    for ep in singles {
+        let rep = compute_phi_sharp_prepared(graph, ep, false);
+        sum_phi += rep.phi_sharp;
+        sum_gate_c += rep.gate_contrast;
+        if rep.gate_contrast < min_gate_c {
+            min_gate_c = rep.gate_contrast;
+        }
+        states.push(rep.trace.final_state);
+        residuals.push(rep.residual);
     }
-    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mo, d, h, m, s)
+    let n = singles.len() as f32;
+    let mean_phi = sum_phi / n;
+    let mean_gate_c = sum_gate_c / n;
+    let collapse = batch_collapse_penalty(&states);
+    let spec = cross_specificity(graph, singles, &states, &residuals);
+    let mut comp_sum = 0.0f32;
+    for comp in composites {
+        comp_sum += compute_composite_phi_prepared(graph, comp).score;
+    }
+    let mean_comp = if composites.is_empty() {
+        0.0
+    } else {
+        comp_sum / (composites.len() as f32)
+    };
+    mean_phi
+        + 0.55 * spec
+        + 0.20 * mean_gate_c
+        + 0.30 * min_gate_c
+        - 0.40 * collapse
+        + comp_w * mean_comp
+}
+pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
+    let start = Instant::now();
+    let mut rng = Rng::new(cfg.seed);
+    let mut theta = PhiGraph::random(&mut rng).weights;
+    let mut m = vec![0.0f32; NUM_PARAMS];
+    let mut v = vec![0.0f32; NUM_PARAMS];
+    let beta1 = 0.9f32;
+    let beta2 = 0.999f32;
+    let eps_adam = 1e-8f32;
+    let n_threads = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(cfg.pop_pairs.max(1));
+    println!(
+        "Entraînement Phisharp v0.6 ({} paramètres, {} étapes, {} paires ES, {} threads)...",
+        NUM_PARAMS, cfg.steps, cfg.pop_pairs, n_threads
+    );
+    for step in 1..=cfg.steps {
+        let comp_w = 0.10 + 0.45 * ((step as f32) / 120.0).min(1.0);
+        let mut prep_rng = Rng::new(rng.next_u64());
+        let singles: Vec<PreparedEpisode> = CauseFamily::ALL
+            .iter()
+            .map(|&fam| {
+                let eff = sample_episode(&mut rng, fam).effect;
+                PreparedEpisode::from_bytes(&eff, &mut prep_rng)
+            })
+            .collect();
+        let composites = vec![
+            PreparedComposite::from_bytes(
+                &sample_composite_episode(&mut rng, 3, false, false, false, SepMode::None).effect,
+            ),
+            PreparedComposite::from_bytes(
+                &sample_composite_episode(&mut rng, 3, true, false, false, SepMode::Random).effect,
+            ),
+        ];
+        let pair_seeds: Vec<u64> = (0..cfg.pop_pairs).map(|_| rng.next_u64()).collect();
+        let results: Vec<(u64, f32, f32)> = thread::scope(|s| {
+            let chunk_size = cfg.pop_pairs.div_ceil(n_threads);
+            let mut handles = Vec::new();
+            for chunk in pair_seeds.chunks(chunk_size) {
+                let theta_ref = &theta;
+                let singles_ref = &singles;
+                let comp_ref = &composites;
+                let sigma = cfg.sigma;
+                handles.push(s.spawn(move || {
+                    let mut local = Vec::with_capacity(chunk.len());
+                    for &pseed in chunk {
+                        let mut prng = Rng::new(pseed);
+                        let mut w_pos = Vec::with_capacity(NUM_PARAMS);
+                        let mut w_neg = Vec::with_capacity(NUM_PARAMS);
+                        for &w in theta_ref {
+                            let noise = prng.next_normal() * sigma;
+                            w_pos.push(w + noise);
+                            w_neg.push(w - noise);
+                        }
+                        let f_pos = eval_batch(
+                            &PhiGraph::from_weights(w_pos),
+                            singles_ref,
+                            comp_ref,
+                            comp_w,
+                        );
+                        let f_neg = eval_batch(
+                            &PhiGraph::from_weights(w_neg),
+                            singles_ref,
+                            comp_ref,
+                            comp_w,
+                        );
+                        local.push((pseed, f_pos, f_neg));
+                    }
+                    local
+                }));
+            }
+            let mut merged = Vec::with_capacity(cfg.pop_pairs);
+            for h in handles {
+                merged.extend(h.join().unwrap());
+            }
+            merged
+        });
+        let diffs: Vec<f32> = results.iter().map(|&(_, fp, fn_)| fp - fn_).collect();
+        let var: f32 = diffs.iter().map(|d| d * d).sum::<f32>() / (diffs.len() as f32);
+        let std = var.sqrt().max(1e-6);
+        let mut grad = vec![0.0f32; NUM_PARAMS];
+        let scale = 1.0 / (2.0 * (cfg.pop_pairs as f32) * cfg.sigma * std);
+        for (&(pseed, _, _), &diff) in results.iter().zip(diffs.iter()) {
+            let mut prng = Rng::new(pseed);
+            let coeff = diff * scale;
+            for g in &mut grad {
+                *g += coeff * prng.next_normal();
+            }
+        }
+        let t = step as i32;
+        let b1_corr = 1.0 - beta1.powi(t);
+        let b2_corr = 1.0 - beta2.powi(t);
+        for i in 0..NUM_PARAMS {
+            let g = grad[i] - 1e-4 * theta[i];
+            m[i] = beta1 * m[i] + (1.0 - beta1) * g;
+            v[i] = beta2 * v[i] + (1.0 - beta2) * g * g;
+            let m_hat = m[i] / b1_corr;
+            let v_hat = v[i] / b2_corr;
+            theta[i] += cfg.lr * m_hat / (v_hat.sqrt() + eps_adam);
+        }
+        if step == 1 || step % 25 == 0 || step == cfg.steps {
+            let model = PhiGraph::from_weights(theta.clone());
+            let mut phi = 0.0;
+            let mut gen_sum = 0.0;
+            let mut disc = 0.0;
+            let mut integ = 0.0;
+            let mut gate_c = 0.0;
+            let mut min_gate_c = 1.0f32;
+            let mut res = 0.0;
+            let mut states = Vec::with_capacity(singles.len());
+            let mut residuals = Vec::with_capacity(singles.len());
+            for ep in &singles {
+                let r = compute_phi_sharp_prepared(&model, ep, false);
+                phi += r.phi_sharp;
+                gen_sum += r.generativity;
+                disc += r.discrimination;
+                integ += r.integration;
+                gate_c += r.gate_contrast;
+                if r.gate_contrast < min_gate_c {
+                    min_gate_c = r.gate_contrast;
+                }
+                res += r.residual;
+                states.push(r.trace.final_state);
+                residuals.push(r.residual);
+            }
+            let n = singles.len() as f32;
+            let coll = batch_collapse_penalty(&states);
+            let spec = cross_specificity(&model, &singles, &states, &residuals);
+            let sel: f32 = composites
+                .iter()
+                .map(|c| compute_composite_phi_prepared(&model, c).selectivity)
+                .sum::<f32>()
+                / (composites.len() as f32);
+            println!(
+                "step {:>4}/{:<4} | φ={:+.4} | Gen={:.3} Disc={:.3} Spec={:.3} Gate={:.2}/{:.2} IIT={:.3} RefSel={:.3} | res={:.3} coll={:.3} ({:.1}s)",
+                step,
+                cfg.steps,
+                phi / n,
+                gen_sum / n,
+                disc / n,
+                spec,
+                gate_c / n,
+                min_gate_c,
+                integ / n,
+                sel,
+                res / n,
+                coll,
+                start.elapsed().as_secs_f32()
+            );
+        }
+    }
+    let final_model = PhiGraph::from_weights(theta);
+    evaluate_post_hoc(&final_model, cfg.seed ^ 0xDEAD_BEEF);
+    final_model
+}
+fn evaluate_post_hoc(model: &PhiGraph, seed: u64) {
+    let mut rng = Rng::new(seed);
+    let mut same_sum = 0.0f32;
+    let mut diff_sum = 0.0f32;
+    let trials = 48;
+    for _ in 0..trials {
+        let f1 = CauseFamily::ALL[rng.next_usize(CauseFamily::ALL.len())];
+        let mut f2 = CauseFamily::ALL[rng.next_usize(CauseFamily::ALL.len())];
+        while f2 == f1 {
+            f2 = CauseFamily::ALL[rng.next_usize(CauseFamily::ALL.len())];
+        }
+        let e_a = sample_episode_in_range(&mut rng, f1, 33, 90);
+        let e_b = sample_episode_in_range(&mut rng, f1, 140, 220);
+        let e_c = sample_episode_in_range(&mut rng, f2, 140, 220);
+        let h_a = model.abduce(&model.encode_bytes(&e_a.effect), None).final_state;
+        let h_b = model.abduce(&model.encode_bytes(&e_b.effect), None).final_state;
+        let h_c = model.abduce(&model.encode_bytes(&e_c.effect), None).final_state;
+        same_sum += cosine_sim(&h_a, &h_b);
+        diff_sum += cosine_sim(&h_a, &h_c);
+    }
+    let same_avg = same_sum / (trials as f32);
+    let diff_avg = diff_sum / (trials as f32);
+    let proj_trials = 50;
+    let mut hits_glued = 0usize;
+    let mut hits_tagged = 0usize;
+    let mut ref_hits = 0usize;
+    for _ in 0..proj_trials {
+        let ep_raw = sample_composite_episode(&mut rng, 4, false, false, true, SepMode::None);
+        let regs_raw = discover_causal_regimes(model, &ep_raw.effect, true);
+        if regs_raw.len() >= 2 {
+            let q_idx = regs_raw.len() - 1;
+            let q_reg = regs_raw[q_idx];
+            let true_q = ep_raw.hidden_core_spans[ep_raw.hidden_query_idx];
+            let true_m = ep_raw.hidden_core_spans[ep_raw.hidden_match_idx];
+            if span_iou((q_reg.core_start, q_reg.core_end), true_q) >= 0.45 {
+                let matches = project_query_to_regimes(model, &ep_raw.effect, &regs_raw, q_idx);
+                if let Some(top) = matches.first()
+                    && span_iou((top.core_start, top.core_end), true_m) >= 0.45
+                {
+                    hits_glued += 1;
+                }
+            }
+        }
+        let ep_tag = sample_composite_episode(&mut rng, 4, true, true, true, SepMode::Random);
+        let regs_tag = discover_causal_regimes(model, &ep_tag.effect, true);
+        if regs_tag.len() >= 2 {
+            let q_idx = regs_tag.len() - 1;
+            let q_reg = regs_tag[q_idx];
+            let true_q = ep_tag.hidden_core_spans[ep_tag.hidden_query_idx];
+            let true_m = ep_tag.hidden_core_spans[ep_tag.hidden_match_idx];
+            let true_tag = ep_tag.hidden_tag_spans[ep_tag.hidden_match_idx];
+            if span_iou((q_reg.core_start, q_reg.core_end), true_q) >= 0.45 {
+                let matches = project_query_to_regimes(model, &ep_tag.effect, &regs_tag, q_idx);
+                if let Some(top) = matches.first()
+                    && span_iou((top.core_start, top.core_end), true_m) >= 0.45
+                {
+                    hits_tagged += 1;
+                    if let (Some(ext_ref), Some(gt_tag)) = (top.referent, true_tag)
+                        && span_iou(ext_ref, gt_tag) >= 0.50
+                    {
+                        ref_hits += 1;
+                    }
+                }
+            }
+        }
+    }
+    let mh_trials = 50;
+    let mut mh_decomposed = 0usize;
+    let mut mh_hits = 0usize;
+    let mut mh_flat_hits = 0usize;
+    let mut mh_margin = 0.0f32;
+    for _ in 0..mh_trials {
+        let ep = sample_multihop_episode(&mut rng, false, false);
+        if let Some(ana) = analyze_multihop(model, &ep.effect) {
+            if ana.target_spans.len() >= 2 {
+                mh_decomposed += 1;
+            }
+            if let Some(top) = ana.hop2_matches.first()
+                && top.concept.name_bytes == ep.hidden_concept_name
+            {
+                mh_hits += 1;
+                if ana.hop2_matches.len() >= 2 {
+                    mh_margin += top.score - ana.hop2_matches[1].score;
+                }
+            }
+        }
+        let ep_flat = sample_multihop_episode(&mut rng, true, false);
+        if let Some(ana) = analyze_multihop(model, &ep_flat.effect)
+            && let Some(top) = ana.hop2_matches.first()
+            && top.concept.name_bytes == ep_flat.hidden_concept_name
+        {
+            mh_flat_hits += 1;
+        }
+    }
+    println!("\n--- Évaluation post-hoc 1 : Abstraction Méta-relationnelle (0 octet commun) ---");
+    println!("  Même cause cachée : cos = {:+.4}", same_avg);
+    println!("  Causes différentes: cos = {:+.4}", diff_avg);
+    println!("  Marge             : {:+.4}", same_avg - diff_avg);
+    println!("\n--- Évaluation post-hoc 2 : Flux continu 1-saut auto-segmenté (4 moules, hasard = 25%) ---");
+    println!(
+        "  Moules collés SANS séparateur (0 octet commun)     : {}/{} ({:.1}%)",
+        hits_glued,
+        proj_trials,
+        100.0 * (hits_glued as f32) / (proj_trials as f32)
+    );
+    println!(
+        "  Moules étiquetés, sép. aléatoire (0 octet commun)  : {}/{} ({:.1}%)  [référent exact={}/{}]",
+        hits_tagged,
+        proj_trials,
+        100.0 * (hits_tagged as f32) / (proj_trials as f32),
+        ref_hits,
+        hits_tagged
+    );
+    println!("\n--- Évaluation post-hoc 3 : Multi-Sauts sur Définitions Composées (4 concepts, hasard = 25%) ---");
+    println!(
+        "  Décomposition 2 causes (cible hybride)             : {}/{} ({:.1}%)",
+        mh_decomposed,
+        mh_trials,
+        100.0 * (mh_decomposed as f32) / (mh_trials as f32)
+    );
+    println!(
+        "  Concept composé exact (multiligne, 0 octet commun) : {}/{} ({:.1}%)  [marge Top1-Top2 = {:+.4}]",
+        mh_hits,
+        mh_trials,
+        100.0 * (mh_hits as f32) / (mh_trials as f32),
+        if mh_hits > 0 {
+            mh_margin / (mh_hits as f32)
+        } else {
+            0.0
+        }
+    );
+    println!(
+        "  Concept composé exact (flux plat, 0 octet commun)  : {}/{} ({:.1}%)",
+        mh_flat_hits,
+        mh_trials,
+        100.0 * (mh_flat_hits as f32) / (mh_trials as f32)
+    );
 }
 
 
