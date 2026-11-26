@@ -1,61 +1,46 @@
-[1m[33mwarning[0m[1m: unused variable: `dlen`[0m
-   [1m[94m--> [0msrc/multihop.rs:477:37
+[1m[33mwarning[0m[1m: field `t_bwd` is never read[0m
+   [1m[94m--> [0msrc/main.rs:226:5
     [1m[94m|[0m
-[1m[94m477[0m [1m[94m|[0m                     let (back, fwd, dlen) = diag_extent(bytes, t, j);
-    [1m[94m|[0m                                     [1m[33m^^^^[0m [1m[33mhelp: if this is intentional, prefix it with an underscore: `_dlen`[0m
-    [1m[94m|[0m
-    [1m[94m= [0m[1mnote[0m: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
-
-[1m[33mwarning[0m[1m: field `mean_gate` is never read[0m
-  [1m[94m--> [0msrc/phi.rs:13:9
-   [1m[94m|[0m
-[1m[94m 9[0m [1m[94m|[0m pub struct DiscoveredRegime {
-   [1m[94m|[0m            [1m[94m----------------[0m [1m[94mfield in this struct[0m
+[1m[94m221[0m [1m[94m|[0m struct RelationalView {
+    [1m[94m|[0m        [1m[94m--------------[0m [1m[94mfield in this struct[0m
 [1m[94m...[0m
-[1m[94m13[0m [1m[94m|[0m     pub mean_gate: f32,
-   [1m[94m|[0m         [1m[33m^^^^^^^^^[0m
-   [1m[94m|[0m
-   [1m[94m= [0m[1mnote[0m: `DiscoveredRegime` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
-   [1m[94m= [0m[1mnote[0m: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+[1m[94m226[0m [1m[94m|[0m     t_bwd: Vec<f64>,  // v_size * v_size
+    [1m[94m|[0m     [1m[33m^^^^^[0m
+    [1m[94m|[0m
+    [1m[94m= [0m[1mnote[0m: `RelationalView` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+    [1m[94m= [0m[1mnote[0m: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
 
-[1m[33mwarning[0m: `phisharp` (bin "phisharp") generated 2 warnings (run `cargo fix --bin "phisharp" -p phisharp` to apply 1 suggestion)
-[1m[92m    Finished[0m `release` profile [optimized] target(s) in 0.01s
-[1m[92m     Running[0m `target/release/phisharp train --out out/sharp.phis --steps 300`
-Entraînement Phisharp v0.7 (1638 paramètres : 1541 Hop-1 + 97 Champ Réf., 300 étapes, 4 threads)...
-step    1/300  | φ=+0.0265 | Gen=0.291 Disc=0.030 Spec=0.005 Gate=0.25/0.25 IIT=0.087 RefSel=0.259 | res=0.561 coll=0.855 (0.1s)
-step   25/300  | φ=+0.4685 | Gen=0.660 Disc=0.493 Spec=0.053 Gate=0.25/0.24 IIT=0.138 RefSel=0.301 | res=0.194 coll=0.601 (2.0s)
-step   50/300  | φ=+0.6438 | Gen=0.852 Disc=0.761 Spec=0.141 Gate=0.26/0.26 IIT=0.160 RefSel=0.288 | res=0.077 coll=0.640 (3.8s)
-step   75/300  | φ=+0.6479 | Gen=0.817 Disc=0.820 Spec=0.275 Gate=0.32/0.28 IIT=0.183 RefSel=0.423 | res=0.095 coll=0.573 (5.7s)
-step  100/300  | φ=+0.6677 | Gen=0.779 Disc=0.813 Spec=0.273 Gate=0.42/0.34 IIT=0.252 RefSel=0.641 | res=0.117 coll=0.500 (7.5s)
-step  125/300  | φ=+0.7503 | Gen=0.813 Disc=0.843 Spec=0.255 Gate=0.55/0.47 IIT=0.389 RefSel=0.383 | res=0.098 coll=0.437 (9.2s)
-step  150/300  | φ=+0.7571 | Gen=0.819 Disc=0.869 Spec=0.262 Gate=0.64/0.56 IIT=0.357 RefSel=0.447 | res=0.094 coll=0.471 (11.0s)
-step  175/300  | φ=+0.7506 | Gen=0.818 Disc=0.884 Spec=0.290 Gate=0.75/0.61 IIT=0.267 RefSel=0.370 | res=0.095 coll=0.412 (12.7s)
-step  200/300  | φ=+0.7242 | Gen=0.778 Disc=0.866 Spec=0.280 Gate=0.84/0.76 IIT=0.208 RefSel=0.581 | res=0.120 coll=0.377 (14.5s)
-step  225/300  | φ=+0.7998 | Gen=0.860 Disc=0.867 Spec=0.334 Gate=0.83/0.72 IIT=0.330 RefSel=0.371 | res=0.070 coll=0.418 (16.3s)
-step  250/300  | φ=+0.7990 | Gen=0.840 Disc=0.858 Spec=0.334 Gate=0.85/0.79 IIT=0.362 RefSel=0.518 | res=0.080 coll=0.265 (18.0s)
-step  275/300  | φ=+0.7681 | Gen=0.821 Disc=0.846 Spec=0.420 Gate=0.88/0.79 IIT=0.279 RefSel=0.573 | res=0.092 coll=0.355 (19.8s)
-step  300/300  | φ=+0.8055 | Gen=0.854 Disc=0.853 Spec=0.302 Gate=0.89/0.79 IIT=0.319 RefSel=0.414 | res=0.074 coll=0.406 (21.5s)
+[1m[33mwarning[0m[1m: fields `diff_stability` and `residual_norm` are never read[0m
+   [1m[94m--> [0msrc/main.rs:420:5
+    [1m[94m|[0m
+[1m[94m415[0m [1m[94m|[0m struct PhiReport {
+    [1m[94m|[0m        [1m[94m---------[0m [1m[94mfields in this struct[0m
+[1m[94m...[0m
+[1m[94m420[0m [1m[94m|[0m     diff_stability: f64,
+    [1m[94m|[0m     [1m[33m^^^^^^^^^^^^^^[0m
+[1m[94m421[0m [1m[94m|[0m     residual_norm: f64,
+    [1m[94m|[0m     [1m[33m^^^^^^^^^^^^^[0m
+    [1m[94m|[0m
+    [1m[94m= [0m[1mnote[0m: `PhiReport` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
 
-Phase B — Champ Référentiel Connexionniste (97 poids, 150 étapes ES non-supervisées)...
-ref     1/150  | φ_ref=+0.4539 (21.6s)
-ref    30/150  | φ_ref=+0.8562 (21.9s)
-ref    60/150  | φ_ref=+0.9712 (22.2s)
-ref    90/150  | φ_ref=+1.5951 (22.5s)
-ref   120/150  | φ_ref=+1.7290 (22.9s)
-ref   150/150  | φ_ref=+1.7076 (23.2s)
-
---- Évaluation post-hoc 1 : Abstraction Méta-relationnelle (0 octet commun) ---
-  Même cause cachée : cos = +0.9213
-  Causes différentes: cos = +0.1468
-  Marge             : +0.7745
-
---- Évaluation post-hoc 2 : Flux continu 1-saut auto-segmenté (4 moules, hasard = 25%) ---
-  Moules collés SANS séparateur (0 octet commun)     : 46/50 (92.0%)
-  Moules étiquetés, sép. aléatoire (0 octet commun)  : 44/50 (88.0%)  [référent exact=44/44]
-
---- Évaluation post-hoc 3 : Multi-Sauts 100% Connexionniste (4 concepts, hasard = 25%) ---
-  Décomposition 2 causes (cible hybride)             : 47/50 (94.0%)
-  Crête alignée / exacte (multiligne, 0 octet com.)  : 2/50 (4.0%) | exact=0/50  [marge=+0.0882]
-  Crête alignée / exacte (flux plat, 0 octet com.)   : 2/50 (4.0%) | exact=0/50
-
-Modèle sauvegardé dans 'out/sharp.phis'.
+[1m[33mwarning[0m: `phisharp` (bin "phisharp") generated 2 warnings
+[1m[92m    Finished[0m `release` profile [optimized] target(s) in 0.00s
+[1m[92m     Running[0m `target/release/phisharp train --out out/sharp.phis --steps 300 --seed 42`
+=== ENTRAÎNEMENT FERMÉ PHISHARP (PTGRS + φ_sharp uniquement, 428 params) ===
+step    1/300 | φ_sharp=0.0000 | G=0.002 D=0.002 P=0.001 MIP=0.000
+step   20/300 | φ_sharp=0.0043 | G=0.149 D=0.625 P=0.140 MIP=0.046
+step   40/300 | φ_sharp=0.0135 | G=0.219 D=0.701 P=0.204 MIP=0.090
+step   60/300 | φ_sharp=0.0318 | G=0.204 D=0.696 P=0.198 MIP=0.200
+step   80/300 | φ_sharp=0.0467 | G=0.243 D=0.619 P=0.225 MIP=0.260
+step  100/300 | φ_sharp=0.0701 | G=0.283 D=0.759 P=0.287 MIP=0.322
+step  120/300 | φ_sharp=0.1083 | G=0.291 D=0.699 P=0.284 MIP=0.483
+step  140/300 | φ_sharp=0.0302 | G=0.182 D=0.644 P=0.176 MIP=0.265
+step  160/300 | φ_sharp=0.0839 | G=0.388 D=0.881 P=0.352 MIP=0.340
+step  180/300 | φ_sharp=0.0745 | G=0.234 D=0.609 P=0.213 MIP=0.440
+step  200/300 | φ_sharp=0.1059 | G=0.342 D=0.715 P=0.333 MIP=0.422
+step  220/300 | φ_sharp=0.1344 | G=0.306 D=0.808 P=0.328 MIP=0.569
+step  240/300 | φ_sharp=0.0473 | G=0.164 D=0.440 P=0.138 MIP=0.509
+step  260/300 | φ_sharp=0.2331 | G=0.417 D=0.659 P=0.495 MIP=0.637
+step  280/300 | φ_sharp=0.1277 | G=0.291 D=0.632 P=0.283 MIP=0.592
+step  300/300 | φ_sharp=0.1469 | G=0.300 D=0.706 P=0.256 MIP=0.611
+Modèle figé sauvegardé : out/sharp.phis
