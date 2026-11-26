@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::Write;
@@ -6,9 +6,10 @@ use std::path::Path;
 use std::thread;
 
 const DIM: usize = 8;
-const LATENT_K: usize = 6;
-const TRAIN_BUDGET: usize = 6;
-const MAGIC: &[u8; 8] = b"PHIS2024";
+const K1: usize = 6; // Nœuds causaux réifiés (Niveau 1)
+const K2: usize = 3; // Nœuds méta-relationnels (Niveau 2)
+const DEFAULT_BUDGET: usize = 6;
+const MAGIC: &[u8; 8] = b"PHIS24V2";
 
 // ============================================================================
 // 1. PRNG déterministe (SplitMix64 + Box-Muller, zéro dépendance)
@@ -35,13 +36,13 @@ impl Rng {
     }
 
     fn next_f64(&mut self) -> f64 {
-        ((self.next_u64() >> 11) as f64) * (1.0 / ((1u64 << 53) as f64))
+        ((self.next_u64() >> 11) as f64) * (1.0_f64 / ((1u64 << 53) as f64))
     }
 
     fn next_normal(&mut self) -> f64 {
-        let u1 = (self.next_f64()).max(1e-12);
+        let u1 = self.next_f64().max(1e-12_f64);
         let u2 = self.next_f64();
-        (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+        (-2.0_f64 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
     }
 
     fn range_usize(&mut self, upper: usize) -> usize {
@@ -60,8 +61,7 @@ impl Rng {
 }
 
 // ============================================================================
-// 2. PTGRS : Probabilistic Term Graph Rewriting System
-//    Ne fournit que E à l'entraînement ; C est conservée pour l'étalonnage.
+// 2. PTGRS purement générique (entraînement fermé ; C réservée à l'étalonnage)
 // ============================================================================
 
 #[derive(Clone)]
@@ -79,9 +79,16 @@ struct PtgrsCause {
     terminals: Vec<u8>,
 }
 
+struct MultiScaleGroundTruth {
+    r1: HashMap<(u8, u8), f64>,
+    r2: HashMap<(u8, u8), f64>,
+    r3: HashMap<(u8, u8), f64>,
+}
+
 impl PtgrsCause {
-    /// Famille d'entraînement (in-distribution) : règles binaires/ternaires, profondeur modérée.
-    fn sample_id(rng: &mut Rng) -> Self {
+    /// Générateur d'entraînement strictement générique : aucune structure linguistique
+    /// ni moule prédéfini ; uniquement des graphes de réécriture aléatoires.
+    fn sample_generic(rng: &mut Rng) -> Self {
         let mut pool: Vec<u8> = (0u8..=255).collect();
         rng.shuffle(&mut pool);
 
@@ -90,21 +97,28 @@ impl PtgrsCause {
         let nonterms = &pool[0..n_nonterms];
         let terminals = pool[n_nonterms..n_nonterms + n_terms].to_vec();
 
-        let mut rules = Vec::new();
+        let mut rules = Vec::with_capacity(n_nonterms);
         for (idx, &nt) in nonterms.iter().enumerate() {
-            let next_nt = nonterms[(idx + 1) % n_nonterms];
-            let t1 = terminals[rng.range_usize(n_terms)];
-            let t2 = terminals[rng.range_usize(n_terms)];
-            let t3 = terminals[rng.range_usize(n_terms)];
+            let primary_len = 2 + rng.range_usize(3); // longueur 2..4
+            let mut rhs_primary = Vec::with_capacity(primary_len);
+            let nt_pos = rng.range_usize(primary_len);
+            let target_nt = nonterms[(idx + 1 + rng.range_usize(n_nonterms - 1)) % n_nonterms];
 
-            let rhs_primary = match rng.range_usize(3) {
-                0 => vec![t1, next_nt, t2],
-                1 => vec![next_nt, t1, t2],
-                _ => vec![t1, t2, next_nt],
-            };
-            let rhs_alt = vec![t2, t3];
-            let prob_primary = 0.65 + 0.25 * rng.next_f64();
+            for pos in 0..primary_len {
+                if pos == nt_pos {
+                    rhs_primary.push(target_nt);
+                } else {
+                    rhs_primary.push(terminals[rng.range_usize(n_terms)]);
+                }
+            }
 
+            let alt_len = 2 + rng.range_usize(2); // longueur 2..3 (terminaux purs)
+            let mut rhs_alt = Vec::with_capacity(alt_len);
+            for _ in 0..alt_len {
+                rhs_alt.push(terminals[rng.range_usize(n_terms)]);
+            }
+
+            let prob_primary = 0.65_f64 + 0.25_f64 * rng.next_f64();
             rules.push(RewriteRule {
                 lhs: nt,
                 rhs_primary,
@@ -120,17 +134,18 @@ impl PtgrsCause {
         }
     }
 
-    /// Famille OOD (barreau 1) : règles croisées, motifs en miroir et profondeur contrôlée.
+    /// Famille PTGRS hors-distribution (barreau 1) : double branchement récursif
+    /// et compositions plus profondes jamais vues à l'entraînement.
     fn sample_ood(rng: &mut Rng, depth_family: usize) -> Self {
         let mut pool: Vec<u8> = (0u8..=255).collect();
         rng.shuffle(&mut pool);
 
-        let n_nonterms = 4 + (depth_family.min(4));
-        let n_terms = 8 + rng.range_usize(6);
+        let n_nonterms = 4 + depth_family.min(4);
+        let n_terms = 7 + rng.range_usize(6);
         let nonterms = &pool[0..n_nonterms];
         let terminals = pool[n_nonterms..n_nonterms + n_terms].to_vec();
 
-        let mut rules = Vec::new();
+        let mut rules = Vec::with_capacity(n_nonterms);
         for (idx, &nt) in nonterms.iter().enumerate() {
             let n1 = nonterms[(idx + 1) % n_nonterms];
             let n2 = nonterms[(idx + 2) % n_nonterms];
@@ -138,10 +153,9 @@ impl PtgrsCause {
             let t2 = terminals[rng.range_usize(n_terms)];
             let t3 = terminals[rng.range_usize(n_terms)];
 
-            // Structures inédites : motifs emboîtés (t1 n1 t2 n2 t1)
             let rhs_primary = vec![t1, n1, t2, n2, t1];
             let rhs_alt = vec![t3, t2, t1];
-            let prob_primary = 0.72 + 0.18 * rng.next_f64();
+            let prob_primary = 0.72_f64 + 0.18_f64 * rng.next_f64();
 
             rules.push(RewriteRule {
                 lhs: nt,
@@ -158,7 +172,6 @@ impl PtgrsCause {
         }
     }
 
-    /// Génère un flux d'octets E en réécrivant le graphe de termes.
     fn emit_effect(&self, rng: &mut Rng, max_depth: usize, target_len: usize) -> Vec<u8> {
         let mut out = Vec::with_capacity(target_len + 32);
         let mut rule_map: HashMap<u8, &RewriteRule> = HashMap::new();
@@ -193,40 +206,122 @@ impl PtgrsCause {
         out
     }
 
-    /// Distribution observationnelle empirique de référence de C (jamais vue en entraînement).
-    fn ground_truth_transitions(&self, rng: &mut Rng, max_depth: usize) -> HashMap<(u8, u8), f64> {
-        let mut counts: HashMap<(u8, u8), usize> = HashMap::new();
-        let mut row_totals: HashMap<u8, usize> = HashMap::new();
-        for _ in 0..16 {
-            let sample = self.emit_effect(rng, max_depth, 160);
+    /// Distribution observationnelle multi-échelle de référence de C (jamais vue à l'entraînement).
+    fn ground_truth_multi_scale(&self, rng: &mut Rng, max_depth: usize) -> MultiScaleGroundTruth {
+        let mut c1: HashMap<(u8, u8), usize> = HashMap::new();
+        let mut s1: HashMap<u8, usize> = HashMap::new();
+        let mut c2: HashMap<(u8, u8), usize> = HashMap::new();
+        let mut s2: HashMap<u8, usize> = HashMap::new();
+        let mut c3: HashMap<(u8, u8), usize> = HashMap::new();
+        let mut s3: HashMap<u8, usize> = HashMap::new();
+
+        for _ in 0..24 {
+            let sample = self.emit_effect(rng, max_depth, 180);
             for w in sample.windows(2) {
-                *counts.entry((w[0], w[1])).or_insert(0) += 1;
-                *row_totals.entry(w[0]).or_insert(0) += 1;
+                *c1.entry((w[0], w[1])).or_insert(0) += 1;
+                *s1.entry(w[0]).or_insert(0) += 1;
+            }
+            for w in sample.windows(3) {
+                *c2.entry((w[0], w[2])).or_insert(0) += 1;
+                *s2.entry(w[0]).or_insert(0) += 1;
+            }
+            for w in sample.windows(4) {
+                *c3.entry((w[0], w[3])).or_insert(0) += 1;
+                *s3.entry(w[0]).or_insert(0) += 1;
             }
         }
-        let mut probs = HashMap::new();
-        for ((u, v), c) in counts {
-            let tot = *row_totals.get(&u).unwrap_or(&1) as f64;
-            probs.insert((u, v), (c as f64) / tot);
+
+        let norm = |c: HashMap<(u8, u8), usize>, s: HashMap<u8, usize>| -> HashMap<(u8, u8), f64> {
+            let mut out = HashMap::with_capacity(c.len());
+            for ((u, v), cnt) in c {
+                let tot = *s.get(&u).unwrap_or(&1) as f64;
+                out.insert((u, v), (cnt as f64) / tot);
+            }
+            out
+        };
+
+        MultiScaleGroundTruth {
+            r1: norm(c1, s1),
+            r2: norm(c2, s2),
+            r3: norm(c3, s3),
         }
-        probs
     }
 }
 
 // ============================================================================
-// 3. Représentation strictement relationnelle de E (invariante au renommage)
+// 3. Représentation relationnelle multi-échelle (100 % invariante par bijection)
 // ============================================================================
+
+#[derive(Clone)]
+struct ScaleGraph {
+    r: [Vec<f64>; 3],     // R^(1), R^(2), R^(3) : v_size * v_size
+    w: [Vec<f64>; 3],     // Poids de lignes normalisés (somme = 1 par échelle)
+    h_marg: [f64; 3],     // Entropie croisée de référence unigramme P_marg par échelle
+}
 
 #[derive(Clone)]
 struct RelationalView {
     vocab: Vec<u8>,
     seq: Vec<usize>,
     v_size: usize,
-    t_fwd: Vec<f64>,  // v_size * v_size
-    t_bwd: Vec<f64>,  // v_size * v_size
-    t_skip: Vec<f64>, // v_size * v_size
-    row_has_mass: Vec<bool>,
+    p_marg: Vec<f64>,
+    graph: ScaleGraph,
+    shuf_graph: ScaleGraph, // Contre-exemple E- conservant exactement les marginales P_marg
     node_init: Vec<[f64; DIM]>,
+}
+
+fn build_scale_graph(seq: &[usize], v_size: usize, p_marg: &[f64]) -> ScaleGraph {
+    let mut r = [
+        vec![0.0_f64; v_size * v_size],
+        vec![0.0_f64; v_size * v_size],
+        vec![0.0_f64; v_size * v_size],
+    ];
+    let mut w = [
+        vec![0.0_f64; v_size],
+        vec![0.0_f64; v_size],
+        vec![0.0_f64; v_size],
+    ];
+    let mut h_marg = [1.0_f64; 3];
+
+    for (s_idx, lag) in [1usize, 2, 3].into_iter().enumerate() {
+        if seq.len() <= lag || v_size == 0 {
+            continue;
+        }
+        let mut counts = vec![0.0_f64; v_size * v_size];
+        let mut row_sums = vec![0.0_f64; v_size];
+        let mut total = 0.0_f64;
+
+        for t in 0..(seq.len() - lag) {
+            let u = seq[t];
+            let v = seq[t + lag];
+            if u < v_size && v < v_size {
+                counts[u * v_size + v] += 1.0_f64;
+                row_sums[u] += 1.0_f64;
+                total += 1.0_f64;
+            }
+        }
+        if total <= 0.0_f64 {
+            continue;
+        }
+
+        let mut hm = 0.0_f64;
+        for u in 0..v_size {
+            if row_sums[u] > 0.0_f64 {
+                let wu = row_sums[u] / total;
+                w[s_idx][u] = wu;
+                for v in 0..v_size {
+                    let p = counts[u * v_size + v] / row_sums[u];
+                    r[s_idx][u * v_size + v] = p;
+                    if p > 1e-12_f64 {
+                        hm -= wu * p * p_marg[v].max(1e-9_f64).ln();
+                    }
+                }
+            }
+        }
+        h_marg[s_idx] = hm.max(0.05_f64);
+    }
+
+    ScaleGraph { r, w, h_marg }
 }
 
 impl RelationalView {
@@ -248,166 +343,209 @@ impl RelationalView {
 
     fn from_indexed(vocab: Vec<u8>, seq: Vec<usize>) -> Self {
         let v_size = vocab.len().max(1);
-        let mut fwd_c = vec![0.0; v_size * v_size];
-        let mut bwd_c = vec![0.0; v_size * v_size];
-        let mut skip_c = vec![0.0; v_size * v_size];
-        let mut freq = vec![0.0; v_size];
-
+        let mut freq = vec![0.0_f64; v_size];
         for &s in &seq {
             if s < v_size {
-                freq[s] += 1.0;
+                freq[s] += 1.0_f64;
             }
         }
-        for w in seq.windows(2) {
-            if w[0] < v_size && w[1] < v_size {
-                fwd_c[w[0] * v_size + w[1]] += 1.0;
-                bwd_c[w[1] * v_size + w[0]] += 1.0;
-            }
-        }
-        for w in seq.windows(3) {
-            if w[0] < v_size && w[2] < v_size {
-                skip_c[w[0] * v_size + w[2]] += 1.0;
-            }
-        }
-
-        let mut t_fwd = vec![0.0; v_size * v_size];
-        let mut t_bwd = vec![0.0; v_size * v_size];
-        let mut t_skip = vec![0.0; v_size * v_size];
-        let mut row_has_mass = vec![false; v_size];
-
+        let tot = seq.len().max(1) as f64;
+        let mut p_marg = vec![0.0_f64; v_size];
         for u in 0..v_size {
-            let sf: f64 = fwd_c[u * v_size..(u + 1) * v_size].iter().sum();
-            let sb: f64 = bwd_c[u * v_size..(u + 1) * v_size].iter().sum();
-            let ss: f64 = skip_c[u * v_size..(u + 1) * v_size].iter().sum();
-            if sf > 0.0 {
-                row_has_mass[u] = true;
-                for v in 0..v_size {
-                    t_fwd[u * v_size + v] = fwd_c[u * v_size + v] / sf;
-                }
-            }
-            if sb > 0.0 {
-                for v in 0..v_size {
-                    t_bwd[u * v_size + v] = bwd_c[u * v_size + v] / sb;
-                }
-            }
-            if ss > 0.0 {
-                for v in 0..v_size {
-                    t_skip[u * v_size + v] = skip_c[u * v_size + v] / ss;
-                }
+            p_marg[u] = (freq[u] + 1e-6_f64) / (tot + 1e-6_f64 * (v_size as f64));
+        }
+
+        let graph = build_scale_graph(&seq, v_size, &p_marg);
+
+        // Graphe arrière lag-1 uniquement pour enrichir la signature relationnelle locale
+        let mut bwd_c = vec![0.0_f64; v_size * v_size];
+        let mut bwd_s = vec![0.0_f64; v_size];
+        for win in seq.windows(2) {
+            if win[0] < v_size && win[1] < v_size {
+                bwd_c[win[1] * v_size + win[0]] += 1.0_f64;
+                bwd_s[win[1]] += 1.0_f64;
             }
         }
 
-        // Traits purement relationnels par symbole (invariants aux valeurs d'octets).
-        let total_len = seq.len().max(1) as f64;
+        // Distance moyenne de récurrence par symbole (capte périodicité / profondeur)
+        let mut last_pos = vec![None::<usize>; v_size];
+        let mut gap_sum = vec![0.0_f64; v_size];
+        let mut gap_cnt = vec![0.0_f64; v_size];
+        for (pos, &s) in seq.iter().enumerate() {
+            if s < v_size {
+                if let Some(prev) = last_pos[s] {
+                    gap_sum[s] += (pos - prev) as f64;
+                    gap_cnt[s] += 1.0_f64;
+                }
+                last_pos[s] = Some(pos);
+            }
+        }
+
         let ln_v = (v_size.max(2) as f64).ln();
-        let mut node_init = vec![[0.0; DIM]; v_size];
+        let mut node_init = vec![[0.0_f64; DIM]; v_size];
 
         for u in 0..v_size {
-            let p_freq = freq[u] / total_len;
-            let mut h_fwd = 0.0;
-            let mut h_bwd = 0.0;
-            let mut deg_fwd = 0.0;
-            let mut deg_bwd = 0.0;
-            let mut skip_align = 0.0;
+            if freq[u] <= 0.0_f64 {
+                continue;
+            }
+            let mut h1 = 0.0_f64;
+            let mut hb = 0.0_f64;
+            let mut h2 = 0.0_f64;
+            let mut h3 = 0.0_f64;
+            let mut deg_fwd = 0.0_f64;
+            let mut deg_bwd = 0.0_f64;
+            let mut align_12 = 0.0_f64;
 
             for v in 0..v_size {
-                let pf = t_fwd[u * v_size + v];
-                let pb = t_bwd[u * v_size + v];
-                let ps = t_skip[u * v_size + v];
-                if pf > 1e-12 {
-                    h_fwd -= pf * pf.ln();
-                    deg_fwd += 1.0;
+                let p1 = graph.r[0][u * v_size + v];
+                let p2 = graph.r[1][u * v_size + v];
+                let p3 = graph.r[2][u * v_size + v];
+                let pb = if bwd_s[u] > 0.0_f64 {
+                    bwd_c[u * v_size + v] / bwd_s[u]
+                } else {
+                    0.0_f64
+                };
+
+                if p1 > 1e-12_f64 {
+                    h1 -= p1 * p1.ln();
+                    deg_fwd += 1.0_f64;
                 }
-                if pb > 1e-12 {
-                    h_bwd -= pb * pb.ln();
-                    deg_bwd += 1.0;
+                if pb > 1e-12_f64 {
+                    hb -= pb * pb.ln();
+                    deg_bwd += 1.0_f64;
                 }
-                skip_align += pf * ps;
+                if p2 > 1e-12_f64 {
+                    h2 -= p2 * p2.ln();
+                }
+                if p3 > 1e-12_f64 {
+                    h3 -= p3 * p3.ln();
+                }
+                align_12 += p1 * p2;
             }
-            let self_loop = t_fwd[u * v_size + u];
+
             let asym = (deg_fwd - deg_bwd) / (v_size as f64);
-            // Position relative normalisée du centre de masse dans E
-            let mut pos_sum = 0.0;
-            let mut pos_cnt = 0.0;
-            for (idx, &s) in seq.iter().enumerate() {
-                if s == u {
-                    pos_sum += (idx as f64) / total_len;
-                    pos_cnt += 1.0;
-                }
-            }
-            let mean_pos = if pos_cnt > 0.0 { pos_sum / pos_cnt } else { 0.5 };
+            let mean_gap = if gap_cnt[u] > 0.0_f64 {
+                (gap_sum[u] / gap_cnt[u]) / (v_size as f64 + 1.0_f64)
+            } else {
+                1.0_f64
+            };
 
             node_init[u] = [
-                (p_freq * (v_size as f64)).tanh(),
-                h_fwd / ln_v,
-                h_bwd / ln_v,
-                deg_fwd / (v_size as f64),
-                deg_bwd / (v_size as f64),
-                self_loop,
+                (p_marg[u] * (v_size as f64) - 1.0_f64).tanh(),
+                h1 / ln_v,
+                hb / ln_v,
+                h2 / ln_v,
+                h3 / ln_v,
                 asym.tanh(),
-                (skip_align * 2.0 + mean_pos - 0.5).tanh(),
+                (align_12 * 3.0_f64).tanh(),
+                (1.0_f64 / (1.0_f64 + mean_gap)).tanh(),
             ];
         }
+
+        // Contre-exemple E- : permutation déterministe ne dépendant ni des valeurs d'octets
+        // ni de l'alphabet, préservant exactement p_marg.
+        let mut shuf_seq = seq.clone();
+        let mut shuf_rng = Rng::new(
+            0xD1B5_4A32_D192_ED03u64
+                ^ ((seq.len() as u64).wrapping_mul(0x9E37_79B9))
+                ^ (v_size as u64),
+        );
+        shuf_rng.shuffle(&mut shuf_seq);
+        let shuf_graph = build_scale_graph(&shuf_seq, v_size, &p_marg);
 
         Self {
             vocab,
             seq,
             v_size,
-            t_fwd,
-            t_bwd,
-            t_skip,
-            row_has_mass,
+            p_marg,
+            graph,
+            shuf_graph,
             node_init,
         }
     }
 
-    /// Construit un sous-ensemble sur le même vocabulaire partagé (pour Projection & Déplacement).
     fn subslice_same_vocab(&self, start: usize, end: usize) -> Self {
         let s = start.min(self.seq.len());
         let e = end.min(self.seq.len()).max(s);
         Self::from_indexed(self.vocab.clone(), self.seq[s..e].to_vec())
     }
-
-    /// Contre-exemple négatif (permutation cyclique des cibles de transition : même support, structure brisée).
-    fn negative_transition_matrix(&self) -> Vec<f64> {
-        let mut neg = vec![0.0; self.v_size * self.v_size];
-        if self.v_size <= 1 {
-            return neg;
-        }
-        for u in 0..self.v_size {
-            for v in 0..self.v_size {
-                let shifted_v = (v + 1 + (u % (self.v_size - 1))) % self.v_size;
-                neg[u * self.v_size + shifted_v] = self.t_fwd[u * self.v_size + v];
-            }
-        }
-        neg
-    }
 }
 
 // ============================================================================
-// 4. Architecture connexionniste non-réciproque Phisharp
+// 4. Architecture connexionniste hiérarchique top-down Phisharp V2
+//    (Réification L0 -> L1 -> L2 et déploiement vertical H => R^(1..3))
 // ============================================================================
 
-const OFF_W_LAT: usize = 0;
-const OFF_U_OBS_LAT: usize = OFF_W_LAT + LATENT_K * LATENT_K;
-const OFF_U_LAT_FWD: usize = OFF_U_OBS_LAT + DIM * DIM;
-const OFF_U_LAT_OBS: usize = OFF_U_LAT_FWD + DIM * DIM;
-const OFF_U_REFUTE: usize = OFF_U_LAT_OBS + DIM * DIM;
-const OFF_U_ABSTRACT: usize = OFF_U_REFUTE + DIM * DIM;
-const OFF_U_BILIN: usize = OFF_U_ABSTRACT + DIM * DIM;
-const OFF_B_LAT: usize = OFF_U_BILIN + DIM * DIM;
-const PARAM_COUNT: usize = OFF_B_LAT + DIM;
+const OFF_W_LAT1: usize = 0;
+const OFF_W_LAT2: usize = OFF_W_LAT1 + K1 * K1;
+const OFF_W_UP_12: usize = OFF_W_LAT2 + K2 * K2;
+const OFF_W_DOWN_21: usize = OFF_W_UP_12 + K2 * K1;
+
+const OFF_U_IN: usize = OFF_W_DOWN_21 + K1 * K2;
+const OFF_U_OBS_1: usize = OFF_U_IN + DIM * DIM;
+const OFF_U_LAT1: usize = OFF_U_OBS_1 + DIM * DIM;
+const OFF_U_UP_12: usize = OFF_U_LAT1 + DIM * DIM;
+const OFF_U_LAT2: usize = OFF_U_UP_12 + DIM * DIM;
+const OFF_U_DOWN_21: usize = OFF_U_LAT2 + DIM * DIM;
+const OFF_U_META: usize = OFF_U_DOWN_21 + DIM * DIM;
+const OFF_U_G: usize = OFF_U_META + DIM * DIM;
+const OFF_U_DOWN_10: usize = OFF_U_G + DIM * DIM;
+const OFF_U_EMIT: usize = OFF_U_DOWN_10 + DIM * DIM;
+const OFF_U_SYM: usize = OFF_U_EMIT + DIM * DIM;
+const OFF_U_REF1: usize = OFF_U_SYM + DIM * DIM;
+const OFF_U_REF2: usize = OFF_U_REF1 + DIM * DIM;
+
+const OFF_B1: usize = OFF_U_REF2 + DIM * DIM;
+const OFF_B2: usize = OFF_B1 + DIM;
+const OFF_GATES: usize = OFF_B2 + DIM;
+const PARAM_COUNT: usize = OFF_GATES + 4;
+
+const SCALE_W: [f64; 3] = [0.50_f64, 0.30_f64, 0.20_f64];
 
 #[derive(Clone)]
-struct PhisharpModel {
-    params: Vec<f64>,
+struct HierState {
+    h1: Vec<[f64; DIM]>,
+    h2: Vec<[f64; DIM]>,
+}
+
+impl HierState {
+    fn zeros(k1: usize, k2: usize) -> Self {
+        Self {
+            h1: vec![[0.0_f64; DIM]; k1],
+            h2: vec![[0.0_f64; DIM]; k2],
+        }
+    }
+
+    fn seeded() -> Self {
+        let mut h1 = vec![[0.0_f64; DIM]; K1];
+        for (k, v) in h1.iter_mut().enumerate() {
+            for d in 0..DIM {
+                v[d] = 0.08_f64 * (((k + 1) * (d + 2)) as f64).sin();
+            }
+            rms_norm(v);
+        }
+        let mut h2 = vec![[0.0_f64; DIM]; K2];
+        for (m, v) in h2.iter_mut().enumerate() {
+            for d in 0..DIM {
+                v[d] = 0.08_f64 * (((m + 3) * (d + 1)) as f64).cos();
+            }
+            rms_norm(v);
+        }
+        Self { h1, h2 }
+    }
+}
+
+struct TopDownUnfold {
+    a_ground: Vec<f64>,   // V * k1
+    g_op: Vec<f64>,       // k1 * k1 (opérateur de réécriture latent non-réciproque)
+    emit: Vec<f64>,       // k1 * V
+    r_hat: [Vec<f64>; 3], // R_hat^(1..3) : V * V (déployées verticalement sans lire E)
 }
 
 #[derive(Clone)]
 struct AbductionTrace {
-    latent: Vec<[f64; DIM]>,
-    pred_t: Vec<f64>,
-    residual_per_node: Vec<f64>,
+    state: HierState,
+    snapshots: Vec<(usize, HierState)>,
     phi_history: Vec<f64>,
 }
 
@@ -423,10 +561,21 @@ struct PhiReport {
     shaping_score: f64,
 }
 
+#[derive(Clone)]
+struct PhisharpModel {
+    params: Vec<f64>,
+}
+
+#[inline]
+fn sigmoid(x: f64) -> f64 {
+    1.0_f64 / (1.0_f64 + (-x.clamp(-20.0_f64, 20.0_f64)).exp())
+}
+
+#[inline]
 fn mat_vec(mat: &[f64], x: &[f64; DIM]) -> [f64; DIM] {
-    let mut y = [0.0; DIM];
+    let mut y = [0.0_f64; DIM];
     for r in 0..DIM {
-        let mut acc = 0.0;
+        let mut acc = 0.0_f64;
         let base = r * DIM;
         for c in 0..DIM {
             acc += mat[base + c] * x[c];
@@ -436,19 +585,82 @@ fn mat_vec(mat: &[f64], x: &[f64; DIM]) -> [f64; DIM] {
     y
 }
 
+#[inline]
 fn dot(a: &[f64; DIM], b: &[f64; DIM]) -> f64 {
-    let mut s = 0.0;
+    let mut s = 0.0_f64;
     for i in 0..DIM {
         s += a[i] * b[i];
     }
     s
 }
 
+#[inline]
+fn vec_norm(v: &[f64; DIM]) -> f64 {
+    dot(v, v).sqrt()
+}
+
+#[inline]
+fn rms_norm(v: &mut [f64; DIM]) {
+    let mean_sq = dot(v, v) / (DIM as f64);
+    if mean_sq < 1e-18_f64 {
+        return;
+    }
+    let denom = (mean_sq + 0.25_f64).sqrt();
+    for x in v.iter_mut() {
+        *x /= denom;
+    }
+}
+
+fn softmax_slice(logits: &[f64], out: &mut [f64]) {
+    let mut max_l = f64::NEG_INFINITY;
+    for &l in logits {
+        if l > max_l {
+            max_l = l;
+        }
+    }
+    let mut sum_e = 0.0_f64;
+    for (o, &l) in out.iter_mut().zip(logits.iter()) {
+        let e = (l - max_l).exp();
+        *o = e;
+        sum_e += e;
+    }
+    let inv = 1.0_f64 / (sum_e + 1e-12_f64);
+    for o in out.iter_mut() {
+        *o *= inv;
+    }
+}
+
+/// Produit matriciel dense C(m x n) = A(m x p) * B(p x n).
+fn mat_mul(a: &[f64], b: &[f64], m: usize, p: usize, n: usize) -> Vec<f64> {
+    let mut c = vec![0.0_f64; m * n];
+    for i in 0..m {
+        let ai = i * p;
+        let ci = i * n;
+        for k in 0..p {
+            let aik = a[ai + k];
+            if aik == 0.0_f64 {
+                continue;
+            }
+            let bk = k * n;
+            for j in 0..n {
+                c[ci + j] += aik * b[bk + j];
+            }
+        }
+    }
+    c
+}
+
 impl PhisharpModel {
     fn new_random(rng: &mut Rng) -> Self {
-        let mut params = vec![0.0; PARAM_COUNT];
+        let mut params = vec![0.0_f64; PARAM_COUNT];
         for (i, p) in params.iter_mut().enumerate() {
-            let scale = if i < OFF_U_OBS_LAT { 0.45 } else { 0.35 };
+            let scale = if i < OFF_U_IN {
+                0.45_f64
+            } else if i < OFF_B1 {
+                0.35_f64
+            } else {
+                0.10_f64
+            };
             *p = rng.next_normal() * scale;
         }
         Self { params }
@@ -460,7 +672,7 @@ impl PhisharpModel {
                 fs::create_dir_all(parent)?;
             }
         }
-        let mut buf = Vec::with_capacity(8 + 8 + self.params.len() * 8);
+        let mut buf = Vec::with_capacity(16 + self.params.len() * 8);
         buf.extend_from_slice(MAGIC);
         buf.extend_from_slice(&(self.params.len() as u64).to_le_bytes());
         for &p in &self.params {
@@ -474,14 +686,14 @@ impl PhisharpModel {
         if data.len() < 16 || &data[0..8] != MAGIC {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "Format de modèle .phis invalide",
+                "Format de modèle .phis V2 invalide",
             ));
         }
         let count = u64::from_le_bytes(data[8..16].try_into().unwrap()) as usize;
         if count != PARAM_COUNT || data.len() != 16 + count * 8 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "Nombre de paramètres incompatible",
+                "Nombre de paramètres V2 incompatible",
             ));
         }
         let mut params = Vec::with_capacity(count);
@@ -491,312 +703,519 @@ impl PhisharpModel {
         Ok(Self { params })
     }
 
-    fn w_lat(&self, dst: usize, src: usize) -> f64 {
-        self.params[OFF_W_LAT + dst * LATENT_K + src]
+    #[inline]
+    fn w_lat1(&self, dst: usize, src: usize) -> f64 {
+        if dst < K1 && src < K1 {
+            self.params[OFF_W_LAT1 + dst * K1 + src]
+        } else {
+            0.0_f64
+        }
     }
-    fn u_obs_lat(&self) -> &[f64] {
-        &self.params[OFF_U_OBS_LAT..OFF_U_LAT_FWD]
+    #[inline]
+    fn w_lat2(&self, dst: usize, src: usize) -> f64 {
+        if dst < K2 && src < K2 {
+            self.params[OFF_W_LAT2 + dst * K2 + src]
+        } else {
+            0.0_f64
+        }
     }
-    fn u_lat_fwd(&self) -> &[f64] {
-        &self.params[OFF_U_LAT_FWD..OFF_U_LAT_OBS]
+    #[inline]
+    fn w_up_12(&self, dst2: usize, src1: usize) -> f64 {
+        if dst2 < K2 && src1 < K1 {
+            self.params[OFF_W_UP_12 + dst2 * K1 + src1]
+        } else {
+            0.0_f64
+        }
     }
-    fn u_lat_obs(&self) -> &[f64] {
-        &self.params[OFF_U_LAT_OBS..OFF_U_REFUTE]
-    }
-    fn u_refute(&self) -> &[f64] {
-        &self.params[OFF_U_REFUTE..OFF_U_ABSTRACT]
-    }
-    fn u_abstract(&self) -> &[f64] {
-        &self.params[OFF_U_ABSTRACT..OFF_U_BILIN]
-    }
-    fn u_bilin(&self) -> &[f64] {
-        &self.params[OFF_U_BILIN..OFF_B_LAT]
-    }
-    fn b_lat(&self) -> &[f64] {
-        &self.params[OFF_B_LAT..PARAM_COUNT]
+    #[inline]
+    fn w_down_21(&self, dst1: usize, src2: usize) -> f64 {
+        if dst1 < K1 && src2 < K2 {
+            self.params[OFF_W_DOWN_21 + dst1 * K2 + src2]
+        } else {
+            0.0_f64
+        }
     }
 
-    /// Projette l'état causal latent H sur la matrice de transitions prédite T_hat.
-    /// Passe strictement par H : si H = 0 (budget nul), T_hat est uniforme.
-    fn predict_transitions(&self, view: &RelationalView, latent: &[[f64; DIM]]) -> Vec<f64> {
-        let v = view.v_size;
-        let k_len = latent.len();
-        let mut z = vec![[0.0; DIM]; v];
+    fn u_in(&self) -> &[f64] { &self.params[OFF_U_IN..OFF_U_OBS_1] }
+    fn u_obs_1(&self) -> &[f64] { &self.params[OFF_U_OBS_1..OFF_U_LAT1] }
+    fn u_lat1(&self) -> &[f64] { &self.params[OFF_U_LAT1..OFF_U_UP_12] }
+    fn u_up_12(&self) -> &[f64] { &self.params[OFF_U_UP_12..OFF_U_LAT2] }
+    fn u_lat2(&self) -> &[f64] { &self.params[OFF_U_LAT2..OFF_U_DOWN_21] }
+    fn u_down_21(&self) -> &[f64] { &self.params[OFF_U_DOWN_21..OFF_U_META] }
+    fn u_meta(&self) -> &[f64] { &self.params[OFF_U_META..OFF_U_G] }
+    fn u_g(&self) -> &[f64] { &self.params[OFF_U_G..OFF_U_DOWN_10] }
+    fn u_down_10(&self) -> &[f64] { &self.params[OFF_U_DOWN_10..OFF_U_EMIT] }
+    fn u_emit(&self) -> &[f64] { &self.params[OFF_U_EMIT..OFF_U_SYM] }
+    fn u_sym(&self) -> &[f64] { &self.params[OFF_U_SYM..OFF_U_REF1] }
+    fn u_ref1(&self) -> &[f64] { &self.params[OFF_U_REF1..OFF_U_REF2] }
+    fn u_ref2(&self) -> &[f64] { &self.params[OFF_U_REF2..OFF_B1] }
+    fn b1(&self) -> &[f64] { &self.params[OFF_B1..OFF_B2] }
+    fn b2(&self) -> &[f64] { &self.params[OFF_B2..OFF_GATES] }
+    fn gates(&self) -> (f64, f64, f64, f64) {
+        (
+            self.params[OFF_GATES],
+            self.params[OFF_GATES + 1],
+            self.params[OFF_GATES + 2],
+            self.params[OFF_GATES + 3],
+        )
+    }
 
-        // Couplage attentionnel entre chaque symbole relationnel et les nœuds latents H
-        for u in 0..v {
-            let x_u = &view.node_init[u];
-            let mut logits = vec![0.0; k_len];
-            let mut max_l = f64::NEG_INFINITY;
-            for k in 0..k_len {
-                let l = dot(x_u, &latent[k]);
-                logits[k] = l;
-                if l > max_l {
-                    max_l = l;
-                }
-            }
-            let mut sum_e = 0.0;
-            for l in &mut logits {
-                *l = (*l - max_l).exp();
-                sum_e += *l;
-            }
-            let mut acc = [0.0; DIM];
-            for k in 0..k_len {
-                let w = logits[k] / (sum_e + 1e-12);
-                let proj = mat_vec(self.u_lat_obs(), &latent[k]);
+    /// Déploiement vertical pur H = (H1, H2) ==> R_hat^(1..3) = A * G^s * E_emit.
+    /// Zéro lecture gauche-droite de la séquence E.
+    fn unfold_top_down(
+        &self,
+        node_init: &[[f64; DIM]],
+        state: &HierState,
+        cut_vertical: bool,
+    ) -> TopDownUnfold {
+        let v = node_init.len();
+        let k1 = state.h1.len();
+        let k2 = state.h2.len();
+
+        if v == 0 || k1 == 0 {
+            let unif = if v > 0 { 1.0_f64 / (v as f64) } else { 0.0_f64 };
+            let r = vec![unif; v * v];
+            return TopDownUnfold {
+                a_ground: Vec::new(),
+                g_op: Vec::new(),
+                emit: Vec::new(),
+                r_hat: [r.clone(), r.clone(), r],
+            };
+        }
+
+        // 1. Modulation verticale L2 -> L1 (non-réciproque)
+        let mut h1_eff = state.h1.clone();
+        let mut g2_ctx = [0.0_f64; DIM];
+
+        if !cut_vertical && k2 > 0 {
+            let mut h2_down = vec![[0.0_f64; DIM]; k2];
+            let inv_k2 = 1.0_f64 / (k2 as f64);
+            for m in 0..k2 {
+                h2_down[m] = mat_vec(self.u_down_21(), &state.h2[m]);
+                let meta_m = mat_vec(self.u_meta(), &state.h2[m]);
                 for d in 0..DIM {
-                    acc[d] += w * proj[d];
+                    g2_ctx[d] += meta_m[d] * inv_k2;
                 }
             }
             for d in 0..DIM {
-                z[u][d] = acc[d].tanh();
+                g2_ctx[d] = g2_ctx[d].tanh();
             }
-        }
 
-        // Propagation relationnelle sur le graphe d'entrée + tête bilinéaire asymétrique
-        let mut pred = vec![0.0; v * v];
-        for u in 0..v {
-            let zu_b = mat_vec(self.u_bilin(), &z[u]);
-            let mut row_logits = vec![0.0; v];
-            let mut max_l = f64::NEG_INFINITY;
-            for w in 0..v {
-                let l = dot(&zu_b, &z[w]);
-                row_logits[w] = l;
-                if l > max_l {
-                    max_l = l;
+            for k in 0..k1 {
+                let mut td = [0.0_f64; DIM];
+                for m in 0..k2 {
+                    let w = self.w_down_21(k, m);
+                    if w != 0.0_f64 {
+                        for d in 0..DIM {
+                            td[d] += w * h2_down[m][d];
+                        }
+                    }
+                }
+                let base_norm = vec_norm(&state.h1[k]);
+                if base_norm > 1e-12_f64 {
+                    for d in 0..DIM {
+                        h1_eff[k][d] += 0.65_f64 * td[d].tanh();
+                    }
+                    rms_norm(&mut h1_eff[k]);
                 }
             }
-            let mut sum_e = 0.0;
-            for l in &mut row_logits {
-                *l = (*l - max_l).exp();
-                sum_e += *l;
-            }
-            for w in 0..v {
-                pred[u * v + w] = row_logits[w] / (sum_e + 1e-12);
-            }
         }
-        pred
+
+        // 2. Opérateur latent non-réciproque G (k1 x k1) et ses puissances G^1, G^2, G^3
+        let mut g_op = vec![0.0_f64; k1 * k1];
+        let mut row_logits = vec![0.0_f64; k1];
+        let mut h1_norms = vec![0.0_f64; k1];
+        for k in 0..k1 {
+            h1_norms[k] = vec_norm(&h1_eff[k]);
+        }
+
+        for a in 0..k1 {
+            let ug_a = mat_vec(self.u_g(), &h1_eff[a]);
+            let mut qa = [0.0_f64; DIM];
+            for d in 0..DIM {
+                qa[d] = ug_a[d] + 0.50_f64 * h1_eff[a][d] * g2_ctx[d];
+            }
+            for b in 0..k1 {
+                let active = (h1_norms[a] * h1_norms[b]).tanh();
+                row_logits[b] = dot(&qa, &h1_eff[b]) + self.w_lat1(b, a) * active;
+            }
+            softmax_slice(&row_logits, &mut g_op[a * k1..(a + 1) * k1]);
+        }
+
+        let g2 = mat_mul(&g_op, &g_op, k1, k1, k1);
+        let g3 = mat_mul(&g2, &g_op, k1, k1, k1);
+
+        // 3. Ancrage relationnel A (V x k1)
+        let mut a_ground = vec![0.0_f64; v * k1];
+        let mut sym_in = vec![[0.0_f64; DIM]; v];
+        for u in 0..v {
+            sym_in[u] = mat_vec(self.u_in(), &node_init[u]);
+            for k in 0..k1 {
+                row_logits[k] = dot(&sym_in[u], &h1_eff[k]);
+            }
+            softmax_slice(&row_logits, &mut a_ground[u * k1..(u + 1) * k1]);
+        }
+
+        // 4. Émission top-down E_emit (k1 x V) : strictement uniforme si H = 0
+        let mut z_sym = vec![[0.0_f64; DIM]; v];
+        let mut u_sym_x = vec![[0.0_f64; DIM]; v];
+        for u in 0..v {
+            let mut h_mix = [0.0_f64; DIM];
+            for k in 0..k1 {
+                let w = a_ground[u * k1 + k];
+                for d in 0..DIM {
+                    h_mix[d] += w * h1_eff[k][d];
+                }
+            }
+            let proj = mat_vec(self.u_down_10(), &h_mix);
+            for d in 0..DIM {
+                z_sym[u][d] = (proj[d] + 0.55_f64 * proj[d] * node_init[u][d]).tanh();
+            }
+            u_sym_x[u] = mat_vec(self.u_sym(), &node_init[u]);
+        }
+
+        let mut emit = vec![0.0_f64; k1 * v];
+        let mut emit_logits = vec![0.0_f64; v];
+        for k in 0..k1 {
+            let ek = mat_vec(self.u_emit(), &h1_eff[k]);
+            let act_k = h1_norms[k].tanh();
+            for u in 0..v {
+                let mut target_u = [0.0_f64; DIM];
+                for d in 0..DIM {
+                    target_u[d] = z_sym[u][d] + act_k * u_sym_x[u][d];
+                }
+                emit_logits[u] = dot(&ek, &target_u);
+            }
+            softmax_slice(&emit_logits, &mut emit[k * v..(k + 1) * v]);
+        }
+
+        // 5. Déploiement multi-échelle vertical : R_hat^(s) = A * G^s * E_emit
+        let ge1 = mat_mul(&g_op, &emit, k1, k1, v);
+        let ge2 = mat_mul(&g2, &emit, k1, k1, v);
+        let ge3 = mat_mul(&g3, &emit, k1, k1, v);
+
+        let r_hat1 = mat_mul(&a_ground, &ge1, v, k1, v);
+        let r_hat2 = mat_mul(&a_ground, &ge2, v, k1, v);
+        let r_hat3 = mat_mul(&a_ground, &ge3, v, k1, v);
+
+        TopDownUnfold {
+            a_ground,
+            g_op,
+            emit,
+            r_hat: [r_hat1, r_hat2, r_hat3],
+        }
     }
 
-    /// Une étape de dynamique non-réciproque sur les nœuds latents (optionnellement coupée par masque MIP).
-    fn latent_step(
+    /// Une étape abductive hiérarchique (réification L0 -> L1 -> L2 + rétroaction L2 -> L1).
+    fn abductive_step(
         &self,
         view: &RelationalView,
-        latent: &[[f64; DIM]],
+        state: &HierState,
         use_refutation: bool,
-        cut_mask: Option<u32>,
-    ) -> (Vec<[f64; DIM]>, Vec<f64>, Vec<f64>) {
+        cut_l1: Option<u32>,
+        cut_l2: Option<u32>,
+        cut_vertical: bool,
+    ) -> HierState {
         let v = view.v_size;
-        let k_len = latent.len();
-        let pred = self.predict_transitions(view, latent);
+        let k1 = state.h1.len();
+        let k2 = state.h2.len();
 
-        // 1. Calcul du résidu relationnel R_err = T_fwd - T_hat
-        let mut residual_per_node = vec![0.0; v];
-        let mut obs_err_vec = vec![[0.0; DIM]; v];
+        let unfold = self.unfold_top_down(&view.node_init, state, cut_vertical);
+        let res_norm = multi_scale_l1(&view.graph, &unfold.r_hat, v);
+
+        // 1. Résidu relationnel multi-échelle au niveau 0 (s'annule quand R_hat == R)
+        let mut delta_obs = vec![[0.0_f64; DIM]; v];
         for u in 0..v {
-            if !view.row_has_mass[u] {
-                continue;
-            }
-            let mut l1 = 0.0;
-            for w in 0..v {
-                let diff = view.t_fwd[u * v + w] - pred[u * v + w];
-                l1 += diff.abs();
-                for d in 0..DIM {
-                    obs_err_vec[u][d] += diff * view.node_init[w][d];
+            for s in 0..3 {
+                let sw = SCALE_W[s];
+                if view.graph.w[s][u] <= 0.0_f64 {
+                    continue;
                 }
-            }
-            // Intègre aussi la relation skip-1 pour capter les compositions profondes
-            for w in 0..v {
-                let s_val = view.t_skip[u * v + w];
-                if s_val > 0.0 {
-                    for d in 0..DIM {
-                        obs_err_vec[u][d] += 0.25 * s_val * view.node_init[w][d];
+                let base = u * v;
+                for w in 0..v {
+                    let diff = view.graph.r[s][base + w] - unfold.r_hat[s][base + w];
+                    if diff.abs() > 1e-12_f64 {
+                        let c = sw * diff;
+                        for d in 0..DIM {
+                            delta_obs[u][d] += c * view.node_init[w][d];
+                        }
                     }
                 }
             }
-            residual_per_node[u] = l1 * 0.5;
         }
 
-        // 2. Mise à jour abductive non-réciproque + abstraction hiérarchique
-        let mut next_latent = vec![[0.0; DIM]; k_len];
-        let b = self.b_lat();
+        let (wa1, ba1, wa2, ba2) = self.gates();
+        // Portes d'intégration pilotées par le résidu (contractent en attracteur stable)
+        let alpha1 = 0.12_f64 + 0.46_f64 * sigmoid(wa1 * res_norm + ba1);
+        let alpha2 = 0.12_f64 + 0.46_f64 * sigmoid(wa2 * res_norm + ba2);
 
-        for dst in 0..k_len {
-            let mut acc = [0.0; DIM];
+        // 2. Mise à jour Niveau 1 (bottom-up résiduel + couplage non-réciproque + top-down L2)
+        let mut next_h1 = vec![[0.0_f64; DIM]; k1];
+        let b1 = self.b1();
 
-            // Signal abductif depuis les symboles relationnels pondéré par affinité
+        let mut lat1_msg = vec![[0.0_f64; DIM]; k1];
+        for src in 0..k1 {
+            lat1_msg[src] = mat_vec(self.u_lat1(), &state.h1[src]);
+        }
+        let mut down2_msg = vec![[0.0_f64; DIM]; k2];
+        for m in 0..k2 {
+            down2_msg[m] = mat_vec(self.u_down_21(), &state.h2[m]);
+        }
+        let mut obs1_msg = vec![[0.0_f64; DIM]; v];
+        for u in 0..v {
+            obs1_msg[u] = mat_vec(self.u_obs_1(), &delta_obs[u]);
+        }
+
+        for dst in 0..k1 {
+            let mut acc = [0.0_f64; DIM];
+
+            // Signal abductif bottom-up pondéré par l'ancrage A[u, dst]
             for u in 0..v {
-                let gate = (dot(&view.node_init[u], &latent[dst]) + 0.15 * (dst as f64)).tanh();
-                let mapped = mat_vec(self.u_obs_lat(), &obs_err_vec[u]);
-                let scale = (0.5 + 0.5 * gate) / (v as f64);
+                let wu = view.graph.w[0][u];
+                if wu <= 0.0_f64 {
+                    continue;
+                }
+                let coeff = wu * (0.25_f64 + 0.75_f64 * unfold.a_ground[u * k1 + dst]);
                 for d in 0..DIM {
-                    acc[d] += scale * mapped[d];
+                    acc[d] += coeff * obs1_msg[u][d];
                 }
             }
 
-            // Couplages dirigés non-réciproques W_lat[dst, src]
-            for src in 0..k_len {
-                if let Some(mask) = cut_mask {
-                    let side_dst = ((mask >> dst.min(30)) & 1) != 0;
-                    let side_src = ((mask >> src.min(30)) & 1) != 0;
-                    if side_dst != side_src {
-                        continue; // Coupe MIP : sectionne les liens inter-partitions
+            // Couplage latéral non-réciproque W_lat1
+            for src in 0..k1 {
+                if let Some(mask) = cut_l1 {
+                    let s_dst = ((mask >> dst.min(30)) & 1) != 0;
+                    let s_src = ((mask >> src.min(30)) & 1) != 0;
+                    if s_dst != s_src {
+                        continue;
                     }
                 }
-                let w = if dst < LATENT_K && src < LATENT_K {
-                    self.w_lat(dst, src)
-                } else {
-                    0.0
-                };
-                let msg = mat_vec(self.u_lat_fwd(), &latent[src]);
-                for d in 0..DIM {
-                    acc[d] += w * msg[d];
-                }
-                // Abstraction dirigée des nœuds bas vers les nœuds hauts (src < dst)
-                if src < dst {
-                    let abs_msg = mat_vec(self.u_abstract(), &latent[src]);
+                let w = self.w_lat1(dst, src);
+                if w != 0.0_f64 {
                     for d in 0..DIM {
-                        acc[d] += 0.20 * abs_msg[d];
+                        acc[d] += w * lat1_msg[src][d];
                     }
                 }
             }
 
-            // Intégration temporelle (trajectoire abductive)
-            for d in 0..DIM {
-                let raw = 0.60 * latent[dst][d] + 0.40 * (acc[d] + b[d]).tanh();
-                next_latent[dst][d] = raw.tanh();
-            }
-        }
-
-        // 3. Réfutation active interne : tester une contre-hypothèse et corriger ce qui s'effondre
-        if use_refutation && cut_mask.is_none() {
-            let mut refuted = next_latent.clone();
-            // Cibler le nœud le plus actif pour tenter de le réfuter
-            let mut peak_k = 0;
-            let mut peak_norm = -1.0;
-            for (k, h) in refuted.iter().enumerate() {
-                let n = dot(h, h);
-                if n > peak_norm {
-                    peak_norm = n;
-                    peak_k = k;
+            // Contrainte verticale descendante L2 -> L1
+            if !cut_vertical {
+                for m in 0..k2 {
+                    let w = self.w_down_21(dst, m);
+                    if w != 0.0_f64 {
+                        for d in 0..DIM {
+                            acc[d] += 0.55_f64 * w * down2_msg[m][d];
+                        }
+                    }
                 }
             }
-            let perturb = mat_vec(self.u_refute(), &refuted[peak_k]);
+
             for d in 0..DIM {
-                refuted[peak_k][d] = (refuted[peak_k][d] - 0.35 * perturb[d].tanh()).tanh();
+                next_h1[dst][d] =
+                    (1.0_f64 - alpha1) * state.h1[dst][d] + alpha1 * (acc[d] + b1[d]).tanh();
             }
+            rms_norm(&mut next_h1[dst]);
+        }
 
-            let pred_base = self.predict_transitions(view, &next_latent);
-            let pred_ref = self.predict_transitions(view, &refuted);
-            let gain_base = transition_gain(&view.t_fwd, &pred_base, &view.row_has_mass, v);
-            let gain_ref = transition_gain(&view.t_fwd, &pred_ref, &view.row_has_mass, v);
+        // 3. Mise à jour Niveau 2 (réification pure de L1 et de son graphe G, zéro accès à L0)
+        let mut next_h2 = vec![[0.0_f64; DIM]; k2];
+        let b2 = self.b2();
 
-            // Si la contre-hypothèse explique mieux ou résiste mieux, déplacer la trajectoire vers elle
-            if gain_ref > gain_base {
-                next_latent = refuted;
-            } else {
-                // Sinon, consolider la composante qui a survécu à la réfutation
+        let mut e1_reified = vec![[0.0_f64; DIM]; k1];
+        for k in 0..k1 {
+            let mut flow = [0.0_f64; DIM];
+            for j in 0..k1 {
+                let gkj = unfold.g_op[k * k1 + j];
                 for d in 0..DIM {
-                    let delta = next_latent[peak_k][d] - refuted[peak_k][d];
-                    next_latent[peak_k][d] = (next_latent[peak_k][d] + 0.15 * delta).tanh();
+                    flow[d] += gkj * next_h1[j][d];
                 }
+            }
+            let mut combined = [0.0_f64; DIM];
+            for d in 0..DIM {
+                combined[d] = next_h1[k][d] + 0.50_f64 * flow[d] + 0.40_f64 * (next_h1[k][d] - state.h1[k][d]);
+            }
+            e1_reified[k] = mat_vec(self.u_up_12(), &combined);
+        }
+
+        let mut lat2_msg = vec![[0.0_f64; DIM]; k2];
+        for src in 0..k2 {
+            lat2_msg[src] = mat_vec(self.u_lat2(), &state.h2[src]);
+        }
+
+        for dst in 0..k2 {
+            let mut acc = [0.0_f64; DIM];
+
+            if !cut_vertical {
+                for src1 in 0..k1 {
+                    let w = self.w_up_12(dst, src1);
+                    if w != 0.0_f64 {
+                        for d in 0..DIM {
+                            acc[d] += w * e1_reified[src1][d];
+                        }
+                    }
+                }
+            }
+
+            for src in 0..k2 {
+                if let Some(mask) = cut_l2 {
+                    let s_dst = ((mask >> dst.min(30)) & 1) != 0;
+                    let s_src = ((mask >> src.min(30)) & 1) != 0;
+                    if s_dst != s_src {
+                        continue;
+                    }
+                }
+                let w = self.w_lat2(dst, src);
+                if w != 0.0_f64 {
+                    for d in 0..DIM {
+                        acc[d] += w * lat2_msg[src][d];
+                    }
+                }
+            }
+
+            for d in 0..DIM {
+                next_h2[dst][d] =
+                    (1.0_f64 - alpha2) * state.h2[dst][d] + alpha2 * (acc[d] + b2[d]).tanh();
+            }
+            rms_norm(&mut next_h2[dst]);
+        }
+
+        let mut next_state = HierState {
+            h1: next_h1,
+            h2: next_h2,
+        };
+
+        // 4. Réfutation active conservatrice (teste une contre-hypothèse aux niveaux L1 et L2)
+        if use_refutation && cut_l1.is_none() && cut_l2.is_none() && !cut_vertical && k1 > 0 && k2 > 0 {
+            let mut peak1 = 0usize;
+            let mut best_n1 = -1.0_f64;
+            for (k, h) in next_state.h1.iter().enumerate() {
+                let n = dot(h, h);
+                if n > best_n1 {
+                    best_n1 = n;
+                    peak1 = k;
+                }
+            }
+            let mut peak2 = 0usize;
+            let mut best_n2 = -1.0_f64;
+            for (m, h) in next_state.h2.iter().enumerate() {
+                let n = dot(h, h);
+                if n > best_n2 {
+                    best_n2 = n;
+                    peak2 = m;
+                }
+            }
+
+            let mut refuted = next_state.clone();
+            let p1 = mat_vec(self.u_ref1(), &refuted.h1[peak1]);
+            for d in 0..DIM {
+                refuted.h1[peak1][d] -= 0.32_f64 * p1[d].tanh();
+            }
+            rms_norm(&mut refuted.h1[peak1]);
+
+            let p2 = mat_vec(self.u_ref2(), &refuted.h2[peak2]);
+            for d in 0..DIM {
+                refuted.h2[peak2][d] -= 0.32_f64 * p2[d].tanh();
+            }
+            rms_norm(&mut refuted.h2[peak2]);
+
+            let gain_curr = multi_scale_gain(&view.graph, &unfold.r_hat, v);
+            let unfold_base = self.unfold_top_down(&view.node_init, &next_state, false);
+            let gain_base = multi_scale_gain(&view.graph, &unfold_base.r_hat, v);
+            let unfold_ref = self.unfold_top_down(&view.node_init, &refuted, false);
+            let gain_ref = multi_scale_gain(&view.graph, &unfold_ref.r_hat, v);
+
+            if gain_ref > gain_base {
+                next_state = refuted;
+            } else if gain_base >= gain_curr {
+                // Consolide ce qui a résisté à la réfutation
+                for d in 0..DIM {
+                    let d1 = next_state.h1[peak1][d] - refuted.h1[peak1][d];
+                    next_state.h1[peak1][d] += 0.12_f64 * d1;
+                    let d2 = next_state.h2[peak2][d] - refuted.h2[peak2][d];
+                    next_state.h2[peak2][d] += 0.12_f64 * d2;
+                }
+                rms_norm(&mut next_state.h1[peak1]);
+                rms_norm(&mut next_state.h2[peak2]);
             }
         }
 
-        (next_latent, pred, residual_per_node)
+        next_state
     }
 
-    /// Exécute la trajectoire abductive sur un budget donné T.
     fn run_abduction(
         &self,
         view: &RelationalView,
         budget: usize,
         use_refutation: bool,
+        capture_steps: &[usize],
         record_phi: bool,
     ) -> AbductionTrace {
-        let mut latent = vec![[0.0; DIM]; LATENT_K];
+        let mut state = HierState::zeros(K1, K2);
+        let mut snapshots = Vec::new();
         let mut phi_history = Vec::new();
 
+        if capture_steps.contains(&0) {
+            snapshots.push((0, state.clone()));
+        }
+        if record_phi {
+            phi_history.push(
+                self.evaluate_phi_state(view, &state, 0, use_refutation)
+                    .phi_sharp,
+            );
+        }
         if budget == 0 {
-            let pred = self.predict_transitions(view, &latent);
-            let mut res = vec![0.0; view.v_size];
-            for u in 0..view.v_size {
-                if view.row_has_mass[u] {
-                    let mut l1 = 0.0;
-                    for w in 0..view.v_size {
-                        l1 += (view.t_fwd[u * view.v_size + w] - pred[u * view.v_size + w]).abs();
-                    }
-                    res[u] = l1 * 0.5;
-                }
-            }
-            if record_phi {
-                let rep = self.evaluate_phi_state(view, &latent, budget, use_refutation);
-                phi_history.push(rep.phi_sharp);
-            }
             return AbductionTrace {
-                latent,
-                pred_t: pred,
-                residual_per_node: res,
+                state,
+                snapshots,
                 phi_history,
             };
         }
 
-        // Initialisation symétrique légèrement brisée par l'indice de couche d'abstraction
-        for (k, h) in latent.iter_mut().enumerate() {
-            for d in 0..DIM {
-                h[d] = 0.05 * (((k + 1) * (d + 1)) as f64).sin();
-            }
-        }
-
-        let mut last_pred = Vec::new();
-        let mut last_res = Vec::new();
-
+        state = HierState::seeded();
         for step in 1..=budget {
-            let (nl, pred, res) = self.latent_step(view, &latent, use_refutation, None);
-            latent = nl;
-            last_pred = pred;
-            last_res = res;
-            if record_phi {
-                let rep = self.evaluate_phi_state(view, &latent, step, use_refutation);
-                phi_history.push(rep.phi_sharp);
+            state = self.abductive_step(view, &state, use_refutation, None, None, false);
+            if capture_steps.contains(&step) {
+                snapshots.push((step, state.clone()));
             }
-        }
-
-        let final_pred = self.predict_transitions(view, &latent);
-        if last_pred.is_empty() {
-            last_pred = final_pred;
-        } else {
-            last_pred = final_pred;
+            if record_phi {
+                phi_history.push(
+                    self.evaluate_phi_state(view, &state, step, use_refutation)
+                        .phi_sharp,
+                );
+            }
         }
 
         AbductionTrace {
-            latent,
-            pred_t: last_pred,
-            residual_per_node: last_res,
+            state,
+            snapshots,
             phi_history,
         }
     }
 
-    /// Calcul du substitut de φ_sharp (IIT 4.0 + stabilité différentielle + résidu).
     fn evaluate_phi(
         &self,
         view: &RelationalView,
         budget: usize,
         use_refutation: bool,
     ) -> PhiReport {
-        let trace = self.run_abduction(view, budget, use_refutation, false);
-        self.evaluate_phi_state(view, &trace.latent, budget, use_refutation)
+        let trace = self.run_abduction(view, budget, use_refutation, &[], false);
+        self.evaluate_phi_state(view, &trace.state, budget, use_refutation)
     }
 
+    /// Substitut V2 de φ_sharp :
+    /// - Générativité, Discrimination, Projection strictement au-dessus des marginales P_marg
+    /// - Combinaison sans compensation min(G, D, P)
+    /// - MIP exacte hiérarchique (coupes L1, coupes L2, coupe verticale L1<->L2, ablations de nœuds)
+    /// - Stabilité différentielle (réfutation L1+L2 et déplacement) + pénalité de résidu
     fn evaluate_phi_state(
         &self,
         view: &RelationalView,
-        latent: &[[f64; DIM]],
+        state: &HierState,
         budget: usize,
         use_refutation: bool,
     ) -> PhiReport {
         let v = view.v_size;
-        if v <= 1 || view.seq.len() < 8 {
+        if v <= 1 || view.seq.len() < 16 {
             return PhiReport {
                 generativity: 0.0,
                 discrimination: 0.0,
@@ -809,125 +1228,137 @@ impl PhisharpModel {
             };
         }
 
-        let pred = self.predict_transitions(view, latent);
+        let unfold = self.unfold_top_down(&view.node_init, state, false);
 
-        // 1. Générativité (gain normalisé sur T_fwd par rapport à l'uniforme)
-        let gen_raw = transition_gain(&view.t_fwd, &pred, &view.row_has_mass, v);
+        // 1. Générativité multi-échelle au-dessus de H(P_marg)
+        let gen_raw = multi_scale_gain(&view.graph, &unfold.r_hat, v);
 
-        // 2. Discrimination (contraste entre E et contre-exemple négatif E-)
-        let neg_t = view.negative_transition_matrix();
-        let neg_gain = transition_gain(&neg_t, &pred, &view.row_has_mass, v);
-        let disc_raw = gen_raw - neg_gain;
+        // 2. Discrimination : contraste face à E- (permuté à marginales P_marg identiques)
+        let neg_gain = multi_scale_gain(&view.shuf_graph, &unfold.r_hat, v);
+        let disc_raw = (gen_raw - neg_gain).clamp(-1.0_f64, 1.0_f64);
 
-        // 3. Projection (abduction sur la première moitié de E, prédiction sur la seconde)
+        // 3. Projection stricte : abduit sur la 1re moitié seule, déplie sur la 2e sans la lire
         let mid = view.seq.len() / 2;
         let first_half = view.subslice_same_vocab(0, mid);
         let second_half = view.subslice_same_vocab(mid, view.seq.len());
-        let proj_raw = if budget == 0 {
-            0.0
+        let proj_raw = if budget == 0 || state.h1.is_empty() {
+            0.0_f64
         } else {
-            let trace_a = self.run_abduction(&first_half, budget, use_refutation, false);
-            let pred_on_b = self.predict_transitions(&second_half, &trace_a.latent);
-            transition_gain(
-                &second_half.t_fwd,
-                &pred_on_b,
-                &second_half.row_has_mass,
-                second_half.v_size,
-            )
+            let tr_half = self.run_abduction(&first_half, budget, use_refutation, &[], false);
+            let unfold_half = self.unfold_top_down(&first_half.node_init, &tr_half.state, false);
+            multi_scale_gain(&second_half.graph, &unfold_half.r_hat, v)
         };
 
-        // 4. Intégration causale exacte (MIP sur toutes les bipartitions non-triviales de H)
-        let k_len = latent.len();
-        let mip_integration = if budget == 0 || k_len <= 1 {
-            0.0
+        // 4. Intégration causale exacte (MIP hiérarchique complète)
+        let k1 = state.h1.len();
+        let k2 = state.h2.len();
+        let mip_integration = if budget == 0 || k1 <= 1 || k2 <= 1 {
+            0.0_f64
         } else {
-            let (full_next, _, _) = self.latent_step(view, latent, false, None);
-            let pred_full = self.predict_transitions(view, &full_next);
+            let full_next = self.abductive_step(view, state, false, None, None, false);
+            let pred_full = self.unfold_top_down(&view.node_init, &full_next, false);
 
-            let num_masks = 1u32 << (k_len.min(10) - 1);
-            let mut min_cut_divergence = f64::INFINITY;
-            for mask in 1..num_masks {
-                let (cut_next, _, _) = self.latent_step(view, latent, false, Some(mask));
-                let pred_cut = self.predict_transitions(view, &cut_next);
-                let div = transition_l1(&pred_full, &pred_cut, &view.row_has_mass, v);
-                if div < min_cut_divergence {
-                    min_cut_divergence = div;
+            let mut min_div = f64::INFINITY;
+
+            // (a) Toutes les bipartitions internes de Niveau 1
+            let masks1 = 1u32 << (k1.min(10) - 1);
+            for mask in 1..masks1 {
+                let cut_next = self.abductive_step(view, state, false, Some(mask), None, false);
+                let pred_cut = self.unfold_top_down(&view.node_init, &cut_next, false);
+                let div = multi_scale_pred_tvd(&pred_full.r_hat, &pred_cut.r_hat, &view.graph.w, v);
+                if div < min_div {
+                    min_div = div;
                 }
             }
-            // Pénalité si un nœud latent est épiphénoménal (norme nulle ou sans effet sur T_hat)
-            for drop_k in 0..k_len {
-                let mut ablated = latent.to_vec();
-                ablated[drop_k] = [0.0; DIM];
-                let pred_abl = self.predict_transitions(view, &ablated);
-                let eff = transition_l1(&pred, &pred_abl, &view.row_has_mass, v);
-                if eff < min_cut_divergence {
-                    min_cut_divergence = eff;
+
+            // (b) Toutes les bipartitions internes de Niveau 2
+            let masks2 = 1u32 << (k2.min(10) - 1);
+            for mask in 1..masks2 {
+                let cut_next = self.abductive_step(view, state, false, None, Some(mask), false);
+                let pred_cut = self.unfold_top_down(&view.node_init, &cut_next, false);
+                let div = multi_scale_pred_tvd(&pred_full.r_hat, &pred_cut.r_hat, &view.graph.w, v);
+                if div < min_div {
+                    min_div = div;
                 }
             }
-            (min_cut_divergence * 4.0).tanh().clamp(0.0, 1.0)
+
+            // (c) Coupe verticale entre Niveau 1 et Niveau 2 (interdit un L2 décoratif)
+            let vcut_next = self.abductive_step(view, state, false, None, None, true);
+            let pred_vcut = self.unfold_top_down(&view.node_init, &vcut_next, true);
+            let vdiv = multi_scale_pred_tvd(&pred_full.r_hat, &pred_vcut.r_hat, &view.graph.w, v);
+            if vdiv < min_div {
+                min_div = vdiv;
+            }
+
+            // (d) Ablation individuelle de chaque nœud (rejet des branches épiphénoménales)
+            for drop1 in 0..k1 {
+                let mut abl = state.clone();
+                abl.h1[drop1] = [0.0_f64; DIM];
+                let pred_abl = self.unfold_top_down(&view.node_init, &abl, false);
+                let eff = multi_scale_pred_tvd(&unfold.r_hat, &pred_abl.r_hat, &view.graph.w, v);
+                if eff < min_div {
+                    min_div = eff;
+                }
+            }
+            for drop2 in 0..k2 {
+                let mut abl = state.clone();
+                abl.h2[drop2] = [0.0_f64; DIM];
+                let pred_abl = self.unfold_top_down(&view.node_init, &abl, false);
+                let eff = multi_scale_pred_tvd(&unfold.r_hat, &pred_abl.r_hat, &view.graph.w, v);
+                if eff < min_div {
+                    min_div = eff;
+                }
+            }
+
+            (min_div * 10.0_f64).tanh().clamp(0.0_f64, 1.0_f64)
         };
 
-        // 5. Stabilité différentielle (réfutation d'un nœud + déplacement de fenêtre)
-        let diff_stability = if budget == 0 {
-            0.0
+        // 5. Stabilité différentielle (réfutation partielle L1+L2 + déplacement central)
+        let diff_stability = if budget == 0 || gen_raw <= 1e-6_f64 || k1 == 0 || k2 == 0 {
+            0.0_f64
         } else {
-            let mut ref_lat = latent.to_vec();
+            let mut ref_state = state.clone();
             for d in 0..DIM {
-                ref_lat[0][d] *= 0.70;
+                ref_state.h1[0][d] *= 0.72_f64;
+                ref_state.h2[0][d] *= 0.72_f64;
             }
-            let pred_ref = self.predict_transitions(view, &ref_lat);
-            let g_ref = transition_gain(&view.t_fwd, &pred_ref, &view.row_has_mass, v);
-            let ref_stab = if gen_raw > 1e-6 {
-                (g_ref / gen_raw).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
+            let pred_ref = self.unfold_top_down(&view.node_init, &ref_state, false);
+            let g_ref = multi_scale_gain(&view.graph, &pred_ref.r_hat, v);
+            let ref_stab = (g_ref / gen_raw).clamp(0.0_f64, 1.0_f64);
 
             let q1 = view.seq.len() / 4;
             let q3 = (3 * view.seq.len()) / 4;
             let shifted = view.subslice_same_vocab(q1, q3);
-            let pred_shift = self.predict_transitions(&shifted, latent);
-            let g_shift = transition_gain(
-                &shifted.t_fwd,
-                &pred_shift,
-                &shifted.row_has_mass,
-                shifted.v_size,
-            );
-            let shift_stab = if gen_raw > 1e-6 {
-                (g_shift / gen_raw).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
+            let g_shift = multi_scale_gain(&shifted.graph, &unfold.r_hat, v);
+            let shift_stab = (g_shift / gen_raw).clamp(0.0_f64, 1.0_f64);
 
-            0.5 * (ref_stab + shift_stab)
+            0.5_f64 * (ref_stab + shift_stab)
         };
 
-        // 6. Résidu non expliqué de E (empêche l'optimisation purement interne)
-        let residual_norm = transition_l1(&view.t_fwd, &pred, &view.row_has_mass, v).clamp(0.0, 1.0);
+        // 6. Résidu non expliqué
+        let residual_norm = multi_scale_l1(&view.graph, &unfold.r_hat, v).clamp(0.0_f64, 1.0_f64);
 
-        let g_clamped = gen_raw.clamp(0.0, 1.0);
-        let d_clamped = disc_raw.clamp(0.0, 1.0);
-        let p_clamped = proj_raw.clamp(0.0, 1.0);
+        let g_c = gen_raw.clamp(0.0_f64, 1.0_f64);
+        let d_c = disc_raw.clamp(0.0_f64, 1.0_f64);
+        let p_c = proj_raw.clamp(0.0_f64, 1.0_f64);
 
         // Combinaison sans compensation : min(G, D, P)
-        let base_min = g_clamped.min(d_clamped).min(p_clamped);
-        let phi_sharp = base_min
-            * (0.35 + 0.65 * diff_stability)
-            * mip_integration
-            * (1.0 - 0.5 * residual_norm);
+        let base_min = g_c.min(d_c).min(p_c);
+        let phi_sharp =
+            base_min * (mip_integration * diff_stability).sqrt() * (1.0_f64 - 0.5_f64 * residual_norm);
 
-        // Score continu pour guider ES hors des plateaux négatifs sans récompenser de faux positifs
-        let raw_min = gen_raw.min(disc_raw).min(proj_raw);
-        let shaping_score = if phi_sharp > 0.0 {
-            phi_sharp + 0.05 * (g_clamped + d_clamped + p_clamped) / 3.0
+        let shaping_score = if phi_sharp > 0.0_f64 {
+            phi_sharp + 0.08_f64 * (g_c + d_c + p_c) / 3.0_f64
         } else {
-            0.10 * raw_min - 0.05 * residual_norm + 0.02 * mip_integration
+            0.25_f64 * (0.40_f64 * gen_raw + 0.30_f64 * disc_raw + 0.30_f64 * proj_raw)
+                + 0.05_f64 * mip_integration
+                - 0.05_f64 * residual_norm
         };
 
         PhiReport {
-            generativity: g_clamped,
-            discrimination: d_clamped,
-            projection: p_clamped,
+            generativity: g_c,
+            discrimination: d_c,
+            projection: p_c,
             mip_integration,
             diff_stability,
             residual_norm,
@@ -936,182 +1367,341 @@ impl PhisharpModel {
         }
     }
 
-    /// Canal de sortie pur de `ask` : déroulement de l'attracteur relationnel depuis le résidu maximal.
-    /// Aucune tête NL, strictement équivariant au renommage bijectif d'alphabet.
-    fn ask_emit(&self, view: &RelationalView, budget: usize, max_out: usize) -> Vec<u8> {
-        if view.vocab.is_empty() {
+    /// Canal `ask` pur : déploiement vertical depuis l'opérateur latent G (sans autorégression)
+    /// sélectionné par clôture de résidu auto-référentielle : max [φ_sharp(E + ΔE) - φ_sharp(E)] - λ·Écho.
+    fn ask_emit(&self, view: &RelationalView, budget: usize, out_len: usize) -> Vec<u8> {
+        if view.vocab.is_empty() || view.seq.is_empty() {
             return Vec::new();
         }
-        let trace = self.run_abduction(view, budget, true, false);
         let v = view.v_size;
+        let trace = self.run_abduction(view, budget, true, &[], false);
+        let unfold = self.unfold_top_down(&view.node_init, &trace.state, false);
+        let phi_base = self
+            .evaluate_phi_state(view, &trace.state, budget, true)
+            .phi_sharp;
 
-        // Ancre : symbole présentant la plus forte tension résiduelle dans perceived.eff
-        let mut curr = 0usize;
-        let mut best_res = -1.0;
-        for (u, &r) in trace.residual_per_node.iter().enumerate() {
-            if view.row_has_mass[u] && r > best_res {
-                best_res = r;
-                curr = u;
-            }
+        // Identifie les symboles présentant le plus fort résidu multi-échelle dans E
+        let mut node_res: Vec<(usize, f64)> = (0..v)
+            .filter(|&u| view.graph.w[0][u] > 0.0_f64)
+            .map(|u| {
+                let mut err = 0.0_f64;
+                for s in 0..3 {
+                    let mut l1 = 0.0_f64;
+                    for w in 0..v {
+                        l1 += (view.graph.r[s][u * v + w] - unfold.r_hat[s][u * v + w]).abs();
+                    }
+                    err += SCALE_W[s] * 0.5_f64 * l1;
+                }
+                (u, err)
+            })
+            .collect();
+        node_res.sort_by(|a, b| b.1.total_cmp(&a.1));
+
+        // 4-grammes présents dans E (en indices de vocabulaire => 100 % invariant par bijection)
+        let mut e_4grams: HashSet<[usize; 4]> = HashSet::new();
+        for w in view.seq.windows(4) {
+            e_4grams.insert([w[0], w[1], w[2], w[3]]);
         }
 
-        let mut out_idx = vec![curr];
-        let mut visited_edges: HashMap<(usize, usize), usize> = HashMap::new();
+        let n_candidates = node_res.len().min(4).max(1);
+        let k1 = trace.state.h1.len();
 
-        for _ in 1..max_out {
-            let mut best_next = None;
-            let mut best_score = f64::NEG_INFINITY;
-            for w in 0..v {
-                let p = trace.pred_t[curr * v + w];
-                let visits = *visited_edges.get(&(curr, w)).unwrap_or(&0);
-                // Évite de boucler immédiatement tout en respectant l'attracteur
-                let score = p / (1.0 + 1.5 * (visits as f64));
-                if score > best_score {
-                    best_score = score;
-                    best_next = Some(w);
-                }
-            }
-            if let Some(nxt) = best_next {
-                let c = visited_edges.entry((curr, nxt)).or_insert(0);
-                *c += 1;
-                out_idx.push(nxt);
-                curr = nxt;
-                if *c >= 3 {
-                    break;
-                }
+        let mut best_cand_idx: Vec<usize> = Vec::new();
+        let mut best_closure = f64::NEG_INFINITY;
+
+        for c_i in 0..n_candidates {
+            let anchor = if c_i < node_res.len() {
+                node_res[c_i].0
             } else {
-                break;
+                0
+            };
+
+            // Déploiement strictement dans l'espace latent G, puis projection verticale E_emit
+            let mut lat_dist = vec![0.0_f64; k1];
+            for k in 0..k1 {
+                lat_dist[k] = unfold.a_ground[anchor * k1 + k];
+            }
+
+            let mut cand_idx = Vec::with_capacity(out_len);
+            cand_idx.push(anchor);
+
+            let mut edge_visits: HashMap<(usize, usize), usize> = HashMap::new();
+            let mut sym_visits = vec![0usize; v];
+            sym_visits[anchor] = 1;
+
+            for _ in 1..out_len {
+                // Avance de l'état dans l'espace causal latent : p_{t+1} = p_t * G
+                let mut next_lat = vec![0.0_f64; k1];
+                for src in 0..k1 {
+                    let ps = lat_dist[src];
+                    if ps <= 1e-12_f64 {
+                        continue;
+                    }
+                    for dst in 0..k1 {
+                        let vis = *edge_visits.get(&(src, dst)).unwrap_or(&0) as f64;
+                        next_lat[dst] += ps * unfold.g_op[src * k1 + dst] / (1.0_f64 + 0.6_f64 * vis);
+                    }
+                }
+                let sum_l: f64 = next_lat.iter().sum();
+                if sum_l > 1e-12_f64 {
+                    for x in &mut next_lat {
+                        *x /= sum_l;
+                    }
+                }
+
+                // Trouve l'arête latente dominante pour amortir les cycles courts
+                let src_peak = lat_dist
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.total_cmp(b.1))
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                let dst_peak = next_lat
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.total_cmp(b.1))
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                *edge_visits.entry((src_peak, dst_peak)).or_insert(0) += 1;
+
+                lat_dist = next_lat;
+
+                // Projection top-down pure : p_sym = lat_dist * E_emit
+                let mut best_sym = 0usize;
+                let mut best_p = f64::NEG_INFINITY;
+                for u in 0..v {
+                    let mut p = 0.0_f64;
+                    for k in 0..k1 {
+                        p += lat_dist[k] * unfold.emit[k * v + u];
+                    }
+                    let penalized = p / (1.0_f64 + 0.35_f64 * (sym_visits[u] as f64));
+                    if penalized > best_p {
+                        best_p = penalized;
+                        best_sym = u;
+                    }
+                }
+                sym_visits[best_sym] += 1;
+                cand_idx.push(best_sym);
+            }
+
+            // Évaluation auto-référentielle : φ_sharp(E ⊕ ΔE) - φ_sharp(E) - λ * Echo
+            let mut extended_seq = view.seq.clone();
+            extended_seq.extend_from_slice(&cand_idx);
+            let ext_view = RelationalView::from_indexed(view.vocab.clone(), extended_seq);
+            let phi_ext = self.evaluate_phi(&ext_view, budget, true).phi_sharp;
+
+            let echo_ratio = if cand_idx.len() >= 4 {
+                let mut hits = 0usize;
+                let total_w = cand_idx.len() - 3;
+                for w in cand_idx.windows(4) {
+                    if e_4grams.contains(&[w[0], w[1], w[2], w[3]]) {
+                        hits += 1;
+                    }
+                }
+                (hits as f64) / (total_w as f64)
+            } else {
+                0.0_f64
+            };
+
+            let closure_score = (phi_ext - phi_base) - 0.15_f64 * echo_ratio;
+            if closure_score > best_closure {
+                best_closure = closure_score;
+                best_cand_idx = cand_idx;
             }
         }
 
-        out_idx.into_iter().map(|i| view.vocab[i]).collect()
+        best_cand_idx.into_iter().map(|i| view.vocab[i]).collect()
     }
 }
 
 // ============================================================================
-// 5. Métriques d'information, baselines (Vraisemblance, MDL) et corrélation
+// 5. Métriques d'information, baselines (LL, MDL), équivalence C, corrélations
 // ============================================================================
 
-fn transition_gain(target: &[f64], pred: &[f64], active_rows: &[bool], v: usize) -> f64 {
-    let mut active = 0.0;
-    let mut nll_pred = 0.0;
-    let mut entropy = 0.0;
-    let unif_nll = (v.max(2) as f64).ln();
-
+fn scale_gain(target: &[f64], pred: &[f64], row_w: &[f64], h_marg: f64, v: usize) -> f64 {
+    let mut nll = 0.0_f64;
+    let mut w_tot = 0.0_f64;
     for u in 0..v {
-        if !active_rows[u] {
+        let wu = row_w[u];
+        if wu <= 0.0_f64 {
             continue;
         }
-        active += 1.0;
+        w_tot += wu;
+        let base = u * v;
         for w in 0..v {
-            let p = target[u * v + w];
-            if p > 1e-12 {
-                let q = pred[u * v + w].max(1e-9);
-                nll_pred -= p * q.ln();
-                entropy -= p * p.ln();
+            let p = target[base + w];
+            if p > 1e-12_f64 {
+                let q = pred[base + w].max(1e-9_f64);
+                nll -= wu * p * q.ln();
             }
         }
     }
-    if active == 0.0 {
-        return 0.0;
+    if w_tot <= 0.0_f64 {
+        return 0.0_f64;
     }
-    nll_pred /= active;
-    entropy /= active;
-    let denom = (unif_nll - entropy).max(1e-4);
-    ((unif_nll - nll_pred) / denom).clamp(-1.0, 1.0)
+    nll /= w_tot;
+    ((h_marg - nll) / h_marg.max(0.05_f64)).clamp(-1.0_f64, 1.0_f64)
 }
 
-fn transition_l1(a: &[f64], b: &[f64], active_rows: &[bool], v: usize) -> f64 {
-    let mut active = 0.0;
-    let mut total = 0.0;
-    for u in 0..v {
-        if !active_rows[u] {
-            continue;
-        }
-        active += 1.0;
-        let mut row_l1 = 0.0;
-        for w in 0..v {
-            row_l1 += (a[u * v + w] - b[u * v + w]).abs();
-        }
-        total += 0.5 * row_l1;
+fn multi_scale_gain(graph: &ScaleGraph, r_hat: &[Vec<f64>; 3], v: usize) -> f64 {
+    let mut acc = 0.0_f64;
+    for s in 0..3 {
+        acc += SCALE_W[s] * scale_gain(&graph.r[s], &r_hat[s], &graph.w[s], graph.h_marg[s], v);
     }
-    if active == 0.0 {
-        0.0
-    } else {
-        total / active
-    }
+    acc.clamp(-1.0_f64, 1.0_f64)
 }
 
-fn log_likelihood_score(view: &RelationalView, pred: &[f64]) -> f64 {
-    if view.seq.len() < 2 {
-        return -10.0;
-    }
-    let mut ll = 0.0;
-    for w in view.seq.windows(2) {
-        let p = pred[w[0] * view.v_size + w[1]].max(1e-9);
-        ll += p.ln();
-    }
-    ll / ((view.seq.len() - 1) as f64)
-}
-
-fn mdl_score(view: &RelationalView, pred: &[f64], latent: &[[f64; DIM]]) -> f64 {
-    let ll = log_likelihood_score(view, pred);
-    let mut active_energy = 0.0;
-    for h in latent {
-        for &val in h {
-            if val.abs() > 0.05 {
-                active_energy += val.abs();
+fn multi_scale_l1(graph: &ScaleGraph, r_hat: &[Vec<f64>; 3], v: usize) -> f64 {
+    let mut total = 0.0_f64;
+    for s in 0..3 {
+        let mut sc = 0.0_f64;
+        let mut wt = 0.0_f64;
+        for u in 0..v {
+            let wu = graph.w[s][u];
+            if wu <= 0.0_f64 {
+                continue;
             }
+            wt += wu;
+            let mut l1 = 0.0_f64;
+            let base = u * v;
+            for w in 0..v {
+                l1 += (graph.r[s][base + w] - r_hat[s][base + w]).abs();
+            }
+            sc += wu * 0.5_f64 * l1;
+        }
+        if wt > 0.0_f64 {
+            total += SCALE_W[s] * (sc / wt);
         }
     }
-    let n = view.seq.len().max(2) as f64;
-    // Score MDL (plus haut = meilleur) : vraisemblance - pénalité de description BIC-like
-    ll - 0.02 * active_energy * n.ln() / n
+    total
 }
 
-fn observational_equivalence(
-    view: &RelationalView,
-    pred: &[f64],
-    true_c_trans: &HashMap<(u8, u8), f64>,
+fn multi_scale_pred_tvd(
+    a: &[Vec<f64>; 3],
+    b: &[Vec<f64>; 3],
+    row_w: &[Vec<f64>; 3],
+    v: usize,
 ) -> f64 {
-    let mut active = 0.0;
-    let mut tvd_sum = 0.0;
-    for u in 0..view.v_size {
-        if !view.row_has_mass[u] {
-            continue;
+    let mut total = 0.0_f64;
+    for s in 0..3 {
+        let mut sc = 0.0_f64;
+        let mut wt = 0.0_f64;
+        for u in 0..v {
+            let wu = row_w[s][u];
+            if wu <= 0.0_f64 {
+                continue;
+            }
+            wt += wu;
+            let mut l1 = 0.0_f64;
+            let base = u * v;
+            for w in 0..v {
+                l1 += (a[s][base + w] - b[s][base + w]).abs();
+            }
+            sc += wu * 0.5_f64 * l1;
         }
-        let bu = view.vocab[u];
-        let mut row_tvd = 0.0;
-        let mut c_mass = 0.0;
-        for w in 0..view.v_size {
-            let bw = view.vocab[w];
-            let p_true = *true_c_trans.get(&(bu, bw)).unwrap_or(&0.0);
-            c_mass += p_true;
-            let p_pred = pred[u * view.v_size + w];
-            row_tvd += (p_true - p_pred).abs();
-        }
-        if c_mass > 0.1 {
-            active += 1.0;
-            tvd_sum += 0.5 * row_tvd;
+        if wt > 0.0_f64 {
+            total += SCALE_W[s] * (sc / wt);
         }
     }
-    if active == 0.0 {
-        0.0
-    } else {
-        (1.0 - tvd_sum / active).clamp(0.0, 1.0)
+    total
+}
+
+fn log_likelihood_graph(graph: &ScaleGraph, r_hat: &[Vec<f64>; 3], v: usize) -> f64 {
+    let mut ll = 0.0_f64;
+    for s in 0..3 {
+        let mut sc = 0.0_f64;
+        let mut wt = 0.0_f64;
+        for u in 0..v {
+            let wu = graph.w[s][u];
+            if wu <= 0.0_f64 {
+                continue;
+            }
+            wt += wu;
+            let base = u * v;
+            for w in 0..v {
+                let p = graph.r[s][base + w];
+                if p > 1e-12_f64 {
+                    sc += wu * p * r_hat[s][base + w].max(1e-9_f64).ln();
+                }
+            }
+        }
+        if wt > 0.0_f64 {
+            ll += SCALE_W[s] * (sc / wt);
+        }
     }
+    ll
+}
+
+fn mdl_graph(graph: &ScaleGraph, r_hat: &[Vec<f64>; 3], state: &HierState, seq_len: usize, v: usize) -> f64 {
+    let ll = log_likelihood_graph(graph, r_hat, v);
+    let mut energy = 0.0_f64;
+    for h in state.h1.iter().chain(state.h2.iter()) {
+        for &val in h {
+            if val.abs() > 0.05_f64 {
+                energy += val.abs();
+            }
+        }
+    }
+    let n = seq_len.max(2) as f64;
+    ll - 0.02_f64 * energy * n.ln() / n
+}
+
+/// Équivalence observationnelle multi-échelle avec la vraie cause cachée C
+/// (mesure directe de récupération de la structure conditionnelle de C au-delà du hasard).
+fn observational_equivalence_c(
+    view: &RelationalView,
+    r_hat: &[Vec<f64>; 3],
+    truth: &MultiScaleGroundTruth,
+) -> f64 {
+    let v = view.v_size;
+    let maps = [&truth.r1, &truth.r2, &truth.r3];
+    let mut total = 0.0_f64;
+
+    for s in 0..3 {
+        let mut sim_sum = 0.0_f64;
+        let mut w_sum = 0.0_f64;
+        for u in 0..v {
+            let wu = view.graph.w[s][u];
+            if wu <= 0.0_f64 {
+                continue;
+            }
+            let bu = view.vocab[u];
+            let mut c_mass = 0.0_f64;
+            let mut tvd = 0.0_f64;
+            let mut tvd_marg = 0.0_f64;
+
+            for w in 0..v {
+                let bw = view.vocab[w];
+                let pt = *maps[s].get(&(bu, bw)).unwrap_or(&0.0_f64);
+                c_mass += pt;
+                tvd += (pt - r_hat[s][u * v + w]).abs();
+                tvd_marg += (pt - view.p_marg[w]).abs();
+            }
+            if c_mass > 0.5_f64 {
+                // Récupération de la structure causale de C au-delà des marginales
+                let excess_recovery = (0.5_f64 * (tvd_marg - tvd)).clamp(-1.0_f64, 1.0_f64);
+                let direct_sim = (1.0_f64 - 0.5_f64 * tvd).clamp(0.0_f64, 1.0_f64);
+                sim_sum += wu * (0.5_f64 * direct_sim + 0.5_f64 * excess_recovery);
+                w_sum += wu;
+            }
+        }
+        if w_sum > 0.0_f64 {
+            total += SCALE_W[s] * (sim_sum / w_sum);
+        }
+    }
+    total
 }
 
 fn pearson_corr(xs: &[f64], ys: &[f64]) -> f64 {
     let n = xs.len().min(ys.len());
     if n < 2 {
-        return 0.0;
+        return 0.0_f64;
     }
     let mx = xs[..n].iter().sum::<f64>() / (n as f64);
     let my = ys[..n].iter().sum::<f64>() / (n as f64);
-    let mut num = 0.0;
-    let mut dx = 0.0;
-    let mut dy = 0.0;
+    let mut num = 0.0_f64;
+    let mut dx = 0.0_f64;
+    let mut dy = 0.0_f64;
     for i in 0..n {
         let a = xs[i] - mx;
         let b = ys[i] - my;
@@ -1120,11 +1710,37 @@ fn pearson_corr(xs: &[f64], ys: &[f64]) -> f64 {
         dy += b * b;
     }
     let den = (dx * dy).sqrt();
-    if den < 1e-12 { 0.0 } else { num / den }
+    if den < 1e-12_f64 { 0.0_f64 } else { num / den }
+}
+
+fn ranks(vals: &[f64]) -> Vec<f64> {
+    let n = vals.len();
+    let mut order: Vec<(usize, f64)> = vals.iter().copied().enumerate().collect();
+    order.sort_by(|a, b| a.1.total_cmp(&b.1));
+    let mut r = vec![0.0_f64; n];
+    let mut i = 0;
+    while i < n {
+        let mut j = i + 1;
+        while j < n && (order[j].1 - order[i].1).abs() < 1e-12_f64 {
+            j += 1;
+        }
+        let avg = 0.5_f64 * ((i + j - 1) as f64);
+        for k in i..j {
+            r[order[k].0] = avg;
+        }
+        i = j;
+    }
+    r
+}
+
+fn spearman_corr(xs: &[f64], ys: &[f64]) -> f64 {
+    let rx = ranks(xs);
+    let ry = ranks(ys);
+    pearson_corr(&rx, &ry)
 }
 
 // ============================================================================
-// 6. Entraînement fermé (PTGRS + φ_sharp uniquement, ES antithétique parallèle)
+// 6. Entraînement fermé multi-budget (PTGRS générique + φ_sharp uniquement)
 // ============================================================================
 
 fn train_closed(out_path: &Path, steps: usize, seed: u64) {
@@ -1132,34 +1748,35 @@ fn train_closed(out_path: &Path, steps: usize, seed: u64) {
     let mut model = PhisharpModel::new_random(&mut rng);
 
     let pop_pairs = 16usize; // 32 évaluations antithétiques par étape
-    let sigma = 0.08;
-    let lr = 0.06;
+    let sigma: f64 = 0.075;
+    let lr: f64 = 0.055;
     let batch_size = 6usize;
 
-    // Adam sur le gradient ES
-    let mut m_adam = vec![0.0; PARAM_COUNT];
-    let mut v_adam = vec![0.0; PARAM_COUNT];
+    let mut m_adam = vec![0.0_f64; PARAM_COUNT];
+    let mut v_adam = vec![0.0_f64; PARAM_COUNT];
     let beta1: f64 = 0.9;
     let beta2: f64 = 0.999;
 
     println!(
-        "=== ENTRAÎNEMENT FERMÉ PHISHARP (PTGRS + φ_sharp uniquement, {} params) ===",
+        "=== ENTRAÎNEMENT FERMÉ PHISHARP V2 (PTGRS générique + top-down hiérarchique, {} params) ===",
         PARAM_COUNT
     );
 
     for step in 1..=steps {
-        // Génère un lot de flux bruts E (C est immédiatement détruite)
+        let t_budget = 3 + rng.range_usize(5); // T dans 3..=7
+        let t_next = t_budget + 2; // Contrainte d'attracteur jusqu'à T+2 (jusqu'à 9)
+
         let mut batch_views = Vec::with_capacity(batch_size);
         for _ in 0..batch_size {
-            let cause = PtgrsCause::sample_id(&mut rng);
-            let bytes = cause.emit_effect(&mut rng, 4, 140);
+            let cause = PtgrsCause::sample_generic(&mut rng);
+            let depth = 3 + rng.range_usize(3);
+            let bytes = cause.emit_effect(&mut rng, depth, 150);
             batch_views.push(RelationalView::from_bytes(&bytes));
         }
 
-        // Bruits antithétiques
         let mut epsilons: Vec<Vec<f64>> = Vec::with_capacity(pop_pairs);
         for _ in 0..pop_pairs {
-            let mut e = vec![0.0; PARAM_COUNT];
+            let mut e = vec![0.0_f64; PARAM_COUNT];
             for val in &mut e {
                 *val = rng.next_normal();
             }
@@ -1168,7 +1785,7 @@ fn train_closed(out_path: &Path, steps: usize, seed: u64) {
 
         let base_params = &model.params;
         let views_ref = &batch_views;
-        let mut diffs = vec![0.0; pop_pairs];
+        let mut diffs = vec![0.0_f64; pop_pairs];
 
         thread::scope(|s| {
             let mut handles = Vec::with_capacity(pop_pairs);
@@ -1183,13 +1800,23 @@ fn train_closed(out_path: &Path, steps: usize, seed: u64) {
                     let m_plus = PhisharpModel { params: p_plus };
                     let m_minus = PhisharpModel { params: p_minus };
 
-                    let mut fit_plus = 0.0;
-                    let mut fit_minus = 0.0;
-                    for view in views_ref {
-                        fit_plus += m_plus.evaluate_phi(view, TRAIN_BUDGET, true).shaping_score;
-                        fit_minus += m_minus.evaluate_phi(view, TRAIN_BUDGET, true).shaping_score;
-                    }
-                    (idx, (fit_plus - fit_minus) / (views_ref.len() as f64))
+                    let eval_cand = |m: &PhisharpModel| -> f64 {
+                        let mut acc = 0.0_f64;
+                        let snaps = [t_budget, t_next];
+                        for view in views_ref {
+                            let tr = m.run_abduction(view, t_next, true, &snaps, false);
+                            let r1 = m.evaluate_phi_state(view, &tr.snapshots[0].1, t_budget, true);
+                            let r2 = m.evaluate_phi_state(view, &tr.snapshots[1].1, t_next, true);
+                            let drop_pen = (r1.phi_sharp - r2.phi_sharp).max(0.0_f64);
+                            acc += 0.45_f64 * r1.shaping_score
+                                + 0.45_f64 * r2.shaping_score
+                                + 0.10_f64 * r1.shaping_score.min(r2.shaping_score)
+                                - 0.20_f64 * drop_pen;
+                        }
+                        acc / (views_ref.len() as f64)
+                    };
+
+                    (idx, eval_cand(&m_plus) - eval_cand(&m_minus))
                 }));
             }
             for h in handles {
@@ -1198,12 +1825,11 @@ fn train_closed(out_path: &Path, steps: usize, seed: u64) {
             }
         });
 
-        // Normalisation des rangs / écart-type pour stabilité
         let std_d = (diffs.iter().map(|d| d * d).sum::<f64>() / (pop_pairs as f64))
             .sqrt()
-            .max(1e-6);
+            .max(1e-6_f64);
 
-        let mut grad = vec![0.0; PARAM_COUNT];
+        let mut grad = vec![0.0_f64; PARAM_COUNT];
         for (idx, eps) in epsilons.iter().enumerate() {
             let coeff = (diffs[idx] / std_d) / ((2 * pop_pairs) as f64 * sigma);
             for i in 0..PARAM_COUNT {
@@ -1211,37 +1837,45 @@ fn train_closed(out_path: &Path, steps: usize, seed: u64) {
             }
         }
 
-        let b1_corr = 1.0 - beta1.powi(step as i32);
-        let b2_corr = 1.0 - beta2.powi(step as i32);
+        let b1_corr = 1.0_f64 - beta1.powi(step as i32);
+        let b2_corr = 1.0_f64 - beta2.powi(step as i32);
         for i in 0..PARAM_COUNT {
-            m_adam[i] = beta1 * m_adam[i] + (1.0 - beta1) * grad[i];
-            v_adam[i] = beta2 * v_adam[i] + (1.0 - beta2) * grad[i] * grad[i];
+            m_adam[i] = beta1 * m_adam[i] + (1.0_f64 - beta1) * grad[i];
+            v_adam[i] = beta2 * v_adam[i] + (1.0_f64 - beta2) * grad[i] * grad[i];
             let m_hat = m_adam[i] / b1_corr;
             let v_hat = v_adam[i] / b2_corr;
-            model.params[i] += lr * m_hat / (v_hat.sqrt() + 1e-8);
-            model.params[i] = model.params[i].clamp(-4.0, 4.0);
+            model.params[i] += lr * m_hat / (v_hat.sqrt() + 1e-8_f64);
+            model.params[i] = model.params[i].clamp(-4.0_f64, 4.0_f64);
         }
 
-        if step == 1 || step % 20 == 0 || step == steps {
-            let mut g_sum = 0.0;
-            let mut d_sum = 0.0;
-            let mut p_sum = 0.0;
-            let mut mip_sum = 0.0;
-            let mut phi_sum = 0.0;
+        if step == 1 || step % 25 == 0 || step == steps {
+            let mut g_sum = 0.0_f64;
+            let mut d_sum = 0.0_f64;
+            let mut p_sum = 0.0_f64;
+            let mut mip_sum = 0.0_f64;
+            let mut phi_t = 0.0_f64;
+            let mut phi_t2 = 0.0_f64;
+            let snaps = [t_budget, t_next];
             for view in &batch_views {
-                let rep = model.evaluate_phi(view, TRAIN_BUDGET, true);
-                g_sum += rep.generativity;
-                d_sum += rep.discrimination;
-                p_sum += rep.projection;
-                mip_sum += rep.mip_integration;
-                phi_sum += rep.phi_sharp;
+                let tr = model.run_abduction(view, t_next, true, &snaps, false);
+                let r1 = model.evaluate_phi_state(view, &tr.snapshots[0].1, t_budget, true);
+                let r2 = model.evaluate_phi_state(view, &tr.snapshots[1].1, t_next, true);
+                g_sum += r1.generativity;
+                d_sum += r1.discrimination;
+                p_sum += r1.projection;
+                mip_sum += r1.mip_integration;
+                phi_t += r1.phi_sharp;
+                phi_t2 += r2.phi_sharp;
             }
             let nb = batch_views.len() as f64;
             println!(
-                "step {:4}/{} | φ_sharp={:.4} | G={:.3} D={:.3} P={:.3} MIP={:.3}",
+                "step {:4}/{} (T={},{}) | φ(T)={:.4} φ(T+2)={:.4} | G={:.3} D={:.3} P={:.3} MIP={:.3}",
                 step,
                 steps,
-                phi_sum / nb,
+                t_budget,
+                t_next,
+                phi_t / nb,
+                phi_t2 / nb,
                 g_sum / nb,
                 d_sum / nb,
                 p_sum / nb,
@@ -1250,42 +1884,52 @@ fn train_closed(out_path: &Path, steps: usize, seed: u64) {
         }
     }
 
-    model.save(out_path).expect("Échec écriture modèle");
-    println!("Modèle figé sauvegardé : {}", out_path.display());
+    model.save(out_path).expect("Échec écriture modèle V2");
+    println!("Modèle V2 figé sauvegardé : {}", out_path.display());
 }
 
 // ============================================================================
-// 7. Étalonnage + Témoins négatifs (porte d'arrêt avant tout passage au NL)
+// 7. Porte d'étalonnage V2 (C connue après coup + 6 témoins négatifs)
 // ============================================================================
 
 fn run_calibration(model: &PhisharpModel, seed: u64) {
     let mut rng = Rng::new(seed);
-    println!("=== PORTE D'ÉTALONNAGE (PTGRS, C connue après coup) ===");
+    let mut eval_rng = Rng::new(seed ^ 0x55AA_CC33);
+    println!("=== PORTE D'ÉTALONNAGE V2 (PTGRS générique, C connue après coup) ===");
 
     let mut eq_scores = Vec::new();
     let mut phi_scores = Vec::new();
     let mut ll_scores = Vec::new();
     let mut mdl_scores = Vec::new();
 
-    // 1. Corrélation φ_sharp vs équivalence observationnelle avec C (comparé à LL et MDL)
-    for trial in 0..30 {
-        let cause = PtgrsCause::sample_id(&mut rng);
-        let bytes = cause.emit_effect(&mut rng, 4, 160);
-        let view = RelationalView::from_bytes(&bytes);
-        let true_c = cause.ground_truth_transitions(&mut rng, 4);
-
-        // Varier le budget pour créer une plage de qualités d'hypothèses
-        let budget = match trial % 3 {
-            0 => 1,
-            1 => 3,
-            _ => TRAIN_BUDGET,
+    for trial in 0..36 {
+        let cause = PtgrsCause::sample_generic(&mut rng);
+        let depth = 3 + (trial % 3);
+        let len = match trial % 3 {
+            0 => 96,
+            1 => 144,
+            _ => 192,
         };
-        let trace = model.run_abduction(&view, budget, true, false);
-        let rep = model.evaluate_phi_state(&view, &trace.latent, budget, true);
+        let bytes = cause.emit_effect(&mut rng, depth, len);
+        let view = RelationalView::from_bytes(&bytes);
+        let truth = cause.ground_truth_multi_scale(&mut eval_rng, depth);
 
-        let eq = observational_equivalence(&view, &trace.pred_t, &true_c);
-        let ll = log_likelihood_score(&view, &trace.pred_t);
-        let mdl = mdl_score(&view, &trace.pred_t, &trace.latent);
+        let budget = match trial % 6 {
+            0 => 0,
+            1 => 1,
+            2 => 2,
+            3 => 4,
+            4 => 6,
+            _ => 8,
+        };
+        let use_ref = (trial % 4) != 1;
+        let trace = model.run_abduction(&view, budget, use_ref, &[], false);
+        let rep = model.evaluate_phi_state(&view, &trace.state, budget, use_ref);
+        let unfold = model.unfold_top_down(&view.node_init, &trace.state, false);
+
+        let eq = observational_equivalence_c(&view, &unfold.r_hat, &truth);
+        let ll = log_likelihood_graph(&view.graph, &unfold.r_hat, view.v_size);
+        let mdl = mdl_graph(&view.graph, &unfold.r_hat, &trace.state, view.seq.len(), view.v_size);
 
         eq_scores.push(eq);
         phi_scores.push(rep.phi_sharp);
@@ -1293,58 +1937,91 @@ fn run_calibration(model: &PhisharpModel, seed: u64) {
         mdl_scores.push(mdl);
     }
 
-    let corr_phi = pearson_corr(&phi_scores, &eq_scores);
-    let corr_ll = pearson_corr(&ll_scores, &eq_scores);
-    let corr_mdl = pearson_corr(&mdl_scores, &eq_scores);
-    let mean_phi_ptgrs = phi_scores.iter().sum::<f64>() / (phi_scores.len() as f64);
+    let r_phi = pearson_corr(&phi_scores, &eq_scores);
+    let r_ll = pearson_corr(&ll_scores, &eq_scores);
+    let r_mdl = pearson_corr(&mdl_scores, &eq_scores);
+
+    let s_phi = spearman_corr(&phi_scores, &eq_scores);
+    let s_ll = spearman_corr(&ll_scores, &eq_scores);
+    let s_mdl = spearman_corr(&mdl_scores, &eq_scores);
+
+    let mean_phi = phi_scores.iter().sum::<f64>() / (phi_scores.len() as f64);
 
     println!(
-        "Corrélation avec équivalence observationnelle(C) : φ_sharp={:+.4} | Vraisemblance={:+.4} | MDL={:+.4}",
-        corr_phi, corr_ll, corr_mdl
+        "Pearson  vs équiv. multi-échelle(C) : φ_sharp={:+.4} | Vraisemblance={:+.4} | MDL={:+.4}",
+        r_phi, r_ll, r_mdl
     );
-    println!("φ_sharp moyen sur PTGRS : {:.4}", mean_phi_ptgrs);
+    println!(
+        "Spearman vs équiv. multi-échelle(C) : φ_sharp={:+.4} | Vraisemblance={:+.4} | MDL={:+.4}",
+        s_phi, s_ll, s_mdl
+    );
+    println!("φ_sharp moyen sur PTGRS (t=0..8)    : {:.4}", mean_phi);
 
-    // 2. Témoin négatif A : octets aléatoires
-    let mut rand_phi = 0.0;
+    // Témoin 1 : octets aléatoires uniformes (10x)
+    let mut rand_phi = 0.0_f64;
     for _ in 0..10 {
-        let bytes: Vec<u8> = (0..160).map(|_| (rng.next_u64() % 12) as u8).collect();
+        let bytes: Vec<u8> = (0..160).map(|_| (rng.next_u64() % 10) as u8).collect();
         let view = RelationalView::from_bytes(&bytes);
-        rand_phi += model.evaluate_phi(&view, TRAIN_BUDGET, true).phi_sharp;
+        rand_phi += model.evaluate_phi(&view, DEFAULT_BUDGET, true).phi_sharp;
     }
-    rand_phi /= 10.0;
+    rand_phi /= 10.0_f64;
 
-    // 3. Témoin négatif B : H := E (copie directe, aucune intégration latente => MIP = 0)
-    let h_eq_e_phi = 0.0_f64; // Par construction, absence de graphe latent => MIP = 0.
-
-    // 4. Témoin négatif C : cause sur-générale (prédicteur uniforme/diffus => Discrimination = 0)
-    let cause_ref = PtgrsCause::sample_id(&mut rng);
+    // Témoin 2 : H := E (aucune intégration latente : h1 = [], h2 = [] => MIP = 0)
+    let cause_ref = PtgrsCause::sample_generic(&mut rng);
     let bytes_ref = cause_ref.emit_effect(&mut rng, 4, 160);
     let view_ref = RelationalView::from_bytes(&bytes_ref);
-    let zero_latent = vec![[0.0; DIM]; LATENT_K];
+    let empty_state = HierState::zeros(0, 0);
+    let h_eq_e_phi = model
+        .evaluate_phi_state(&view_ref, &empty_state, DEFAULT_BUDGET, true)
+        .phi_sharp;
+
+    // Témoin 3 : cause sur-générale (état latent nul => prédiction uniforme, D = 0)
+    let zero_state = HierState::zeros(K1, K2);
     let overgen_phi = model
-        .evaluate_phi_state(&view_ref, &zero_latent, TRAIN_BUDGET, true)
+        .evaluate_phi_state(&view_ref, &zero_state, DEFAULT_BUDGET, true)
         .phi_sharp;
 
-    // 5. Témoin négatif D : injection d'une branche épiphénoménale (nœud latent sans effet causal)
-    let trace_ref = model.run_abduction(&view_ref, TRAIN_BUDGET, true, false);
+    // Témoin 4 : E permuté à marginales P_marg identiques (10x)
+    let mut perm_sum = 0.0_f64;
+    let mut perm_max = 0.0_f64;
+    for _ in 0..10 {
+        let c = PtgrsCause::sample_generic(&mut rng);
+        let mut b = c.emit_effect(&mut rng, 4, 160);
+        rng.shuffle(&mut b);
+        let vp = RelationalView::from_bytes(&b);
+        let p = model.evaluate_phi(&vp, DEFAULT_BUDGET, true).phi_sharp;
+        perm_sum += p;
+        if p > perm_max {
+            perm_max = p;
+        }
+    }
+    let perm_mean = perm_sum / 10.0_f64;
+
+    // Témoin 5 : branches épiphénoménales (morte ET clone sur L1 et sur L2)
+    let trace_ref = model.run_abduction(&view_ref, DEFAULT_BUDGET, true, &[], false);
     let phi_clean = model
-        .evaluate_phi_state(&view_ref, &trace_ref.latent, TRAIN_BUDGET, true)
-        .phi_sharp;
-    let mut lat_epiph = trace_ref.latent.clone();
-    lat_epiph.push([0.0; DIM]); // Branche épiphénoménale redondante
-    let phi_epiph = model
-        .evaluate_phi_state(&view_ref, &lat_epiph, TRAIN_BUDGET, true)
+        .evaluate_phi_state(&view_ref, &trace_ref.state, DEFAULT_BUDGET, true)
         .phi_sharp;
 
-    // 6. Témoin négatif E : découplage par permutation de blocs de E après encodage
-    let mut perm_bytes = bytes_ref.clone();
-    rng.shuffle(&mut perm_bytes);
-    let view_perm = RelationalView::from_bytes(&perm_bytes);
-    let phi_decoupled = model
-        .evaluate_phi(&view_perm, TRAIN_BUDGET, true)
+    let mut l1_dead = trace_ref.state.clone();
+    l1_dead.h1.push([0.0_f64; DIM]);
+    let phi_l1_dead = model
+        .evaluate_phi_state(&view_ref, &l1_dead, DEFAULT_BUDGET, true)
         .phi_sharp;
 
-    // 7. Invariance par renommage bijectif de l'alphabet
+    let mut l1_clone = trace_ref.state.clone();
+    l1_clone.h1.push(trace_ref.state.h1[0]);
+    let phi_l1_clone = model
+        .evaluate_phi_state(&view_ref, &l1_clone, DEFAULT_BUDGET, true)
+        .phi_sharp;
+
+    let mut l2_clone = trace_ref.state.clone();
+    l2_clone.h2.push(trace_ref.state.h2[0]);
+    let phi_l2_clone = model
+        .evaluate_phi_state(&view_ref, &l2_clone, DEFAULT_BUDGET, true)
+        .phi_sharp;
+
+    // Témoin 6 : invariance exacte par renommage bijectif d'alphabet
     let mut bij: Vec<u8> = (0u8..=255).collect();
     rng.shuffle(&mut bij);
     let mut inv_bij = [0u8; 256];
@@ -1352,46 +2029,54 @@ fn run_calibration(model: &PhisharpModel, seed: u64) {
         inv_bij[mapped as usize] = orig as u8;
     }
     let renamed_bytes: Vec<u8> = bytes_ref.iter().map(|&b| bij[b as usize]).collect();
-    let view_renamed = RelationalView::from_bytes(&renamed_bytes);
+    let view_ren = RelationalView::from_bytes(&renamed_bytes);
 
-    let trace_orig = model.run_abduction(&view_ref, TRAIN_BUDGET, true, true);
-    let trace_ren = model.run_abduction(&view_renamed, TRAIN_BUDGET, true, true);
-    let max_phi_diff = trace_orig
+    let tr_orig = model.run_abduction(&view_ref, DEFAULT_BUDGET, true, &[], true);
+    let tr_ren = model.run_abduction(&view_ren, DEFAULT_BUDGET, true, &[], true);
+    let max_phi_diff = tr_orig
         .phi_history
         .iter()
-        .zip(trace_ren.phi_history.iter())
+        .zip(tr_ren.phi_history.iter())
         .map(|(a, b)| (a - b).abs())
         .fold(0.0_f64, f64::max);
 
-    let out_orig = model.ask_emit(&view_ref, TRAIN_BUDGET, 24);
-    let out_ren = model.ask_emit(&view_renamed, TRAIN_BUDGET, 24);
+    let out_orig = model.ask_emit(&view_ref, DEFAULT_BUDGET, 24);
+    let out_ren = model.ask_emit(&view_ren, DEFAULT_BUDGET, 24);
     let out_ren_inv: Vec<u8> = out_ren.iter().map(|&b| inv_bij[b as usize]).collect();
-    let ask_exact_match = out_orig == out_ren_inv;
+    let ask_exact = out_orig == out_ren_inv;
 
     println!("--- Témoins négatifs ---");
-    println!("  Octets aléatoires          : φ_sharp = {:.4}", rand_phi);
-    println!("  H := E (sans intégration)  : φ_sharp = {:.4}", h_eq_e_phi);
-    println!("  Cause sur-générale         : φ_sharp = {:.4}", overgen_phi);
-    println!("  E permuté / découplé       : φ_sharp = {:.4}", phi_decoupled);
+    println!("  Octets aléatoires (10x)       : φ_sharp = {:.4}", rand_phi);
+    println!("  H := E (sans intégration)     : φ_sharp = {:.4}", h_eq_e_phi);
+    println!("  Cause sur-générale            : φ_sharp = {:.4}", overgen_phi);
     println!(
-        "  Branche épiphénoménale     : propre={:.4} -> avec branche={:.4}",
-        phi_clean, phi_epiph
+        "  E permuté à marginales égales : moy={:.4} | max={:.4}",
+        perm_mean, perm_max
     );
     println!(
-        "  Invariance bijective       : max|Δφ(t)|={:.2e} | ask(π(E))==π(ask(E)) : {}",
-        max_phi_diff, ask_exact_match
+        "  Branches épiphénoménales      : propre={:.4} -> L1_morte={:.4} | L1_clone={:.4} | L2_clone={:.4}",
+        phi_clean, phi_l1_dead, phi_l1_clone, phi_l2_clone
+    );
+    println!(
+        "  Invariance bijective          : max|Δφ(t)|={:.2e} | ask(π(E))==π(ask(E)) : {}",
+        max_phi_diff, ask_exact
     );
 
-    let pass_corr = corr_phi > corr_ll && corr_phi > corr_mdl && corr_phi > 0.25;
-    let pass_neg = rand_phi < 0.05
-        && overgen_phi < 0.02
-        && phi_decoupled < 0.05
-        && phi_epiph <= phi_clean + 1e-9;
-    let pass_inv = max_phi_diff < 1e-9 && ask_exact_match;
+    let pass_corr = (r_phi > r_ll && r_phi > r_mdl && r_phi > 0.35_f64)
+        || (s_phi > s_ll && s_phi > s_mdl && s_phi > 0.40_f64 && r_phi > 0.30_f64);
+    let pass_neg = rand_phi < 0.03_f64
+        && h_eq_e_phi < 1e-9_f64
+        && overgen_phi < 0.02_f64
+        && perm_mean < 0.03_f64
+        && perm_max < 0.08_f64
+        && phi_l1_dead <= phi_clean + 1e-9_f64
+        && phi_l1_clone <= phi_clean + 1e-9_f64
+        && phi_l2_clone <= phi_clean + 1e-9_f64;
+    let pass_inv = max_phi_diff < 1e-9_f64 && ask_exact;
 
-    println!("--- VERDICT ÉTALONNAGE ---");
+    println!("--- VERDICT ÉTALONNAGE V2 ---");
     if pass_corr && pass_neg && pass_inv {
-        println!("PASS : A est lisible. Passage au barreau 1 (OOD) autorisé.");
+        println!("PASS : A est lisible. Passage au barreau 1 (OOD) et à la rupture de générateur autorisé.");
     } else {
         println!(
             "ARRÊT : Étalonnage échoué (corr_ok={}, neg_ok={}, inv_ok={}). A non lisible.",
@@ -1401,50 +2086,62 @@ fn run_calibration(model: &PhisharpModel, seed: u64) {
 }
 
 // ============================================================================
-// 8. Évaluation Barreau 1 (OOD, courbe anytime, ablations, test du résidu)
+// 8. Barreau 1 : PTGRS OOD, courbe anytime t=0..10, ablations, triple résidu
 // ============================================================================
 
 fn run_eval_ood(model: &PhisharpModel, seed: u64) {
     let mut rng = Rng::new(seed);
-    println!("=== ÉVALUATION BARREAU 1 (PTGRS OOD : profondeurs d=2, 4, 8) ===");
+    println!("=== ÉVALUATION BARREAU 1 V2 (PTGRS OOD : profondeurs d=2, 4, 8) ===");
+
+    let max_t = 10usize;
+    let all_snaps: Vec<usize> = (0..=max_t).collect();
 
     for &depth in &[2usize, 4, 8] {
-        let mut curves = vec![0.0; 10]; // budgets 0..=9 (au-delà de TRAIN_BUDGET=6)
-        let mut no_refute_sum = 0.0;
-        let trials = 12;
+        let mut curves = vec![0.0_f64; max_t + 1];
+        let mut no_ref_sum = 0.0_f64;
+        let trials = 12usize;
 
         for _ in 0..trials {
             let cause = PtgrsCause::sample_ood(&mut rng, depth);
             let bytes = cause.emit_effect(&mut rng, depth, 180);
             let view = RelationalView::from_bytes(&bytes);
 
-            for (b, slot) in curves.iter_mut().enumerate() {
-                *slot += model.evaluate_phi(&view, b, true).phi_sharp;
+            let tr = model.run_abduction(&view, max_t, true, &all_snaps, false);
+            for (step, st) in &tr.snapshots {
+                curves[*step] += model.evaluate_phi_state(&view, st, *step, true).phi_sharp;
             }
-            no_refute_sum += model.evaluate_phi(&view, TRAIN_BUDGET, false).phi_sharp;
+            no_ref_sum += model.evaluate_phi(&view, DEFAULT_BUDGET, false).phi_sharp;
         }
 
-        for v in &mut curves {
-            *v /= trials as f64;
+        for val in &mut curves {
+            *val /= trials as f64;
         }
-        no_refute_sum /= trials as f64;
+        no_ref_sum /= trials as f64;
 
-        print!("Profondeur d={} | Anytime φ(t=0..9): ", depth);
+        print!("Profondeur d={} | Anytime φ(t=0..10): ", depth);
         for (b, val) in curves.iter().enumerate() {
             print!("t{}={:.3} ", b, val);
         }
         println!();
+        let retention = if curves[DEFAULT_BUDGET] > 1e-6_f64 {
+            curves[max_t] / curves[DEFAULT_BUDGET]
+        } else {
+            0.0_f64
+        };
         println!(
-            "  Ablations (d={}) : budget=0 -> {:.4} | sans réfutation (t={}) -> {:.4} vs avec -> {:.4}",
-            depth, curves[0], TRAIN_BUDGET, no_refute_sum, curves[TRAIN_BUDGET]
+            "  Ablations (d={}) : budget=0 -> {:.4} | sans réfutation (t={}) -> {:.4} vs avec -> {:.4} | maintien t10/t6 = {:.2}x",
+            depth, curves[0], DEFAULT_BUDGET, no_ref_sum, curves[DEFAULT_BUDGET], retention
         );
     }
 
-    // Test du résidu avec double témoin (vrai segment manquant vs segment étranger C')
-    println!("--- Test du résidu (double témoin) ---");
-    let mut gain_true = 0.0;
-    let mut gain_foreign = 0.0;
-    for _ in 0..15 {
+    // Test du résidu : vrai complément vs complément étranger C' vs simple écho de E
+    println!("--- Test du résidu (vrai complément vs étranger C' vs écho) ---");
+    let mut gain_true = 0.0_f64;
+    let mut gain_foreign = 0.0_f64;
+    let mut gain_echo = 0.0_f64;
+    let trials_r = 15usize;
+
+    for _ in 0..trials_r {
         let c_true = PtgrsCause::sample_ood(&mut rng, 4);
         let c_other = PtgrsCause::sample_ood(&mut rng, 4);
 
@@ -1454,31 +2151,246 @@ fn run_eval_ood(model: &PhisharpModel, seed: u64) {
         let partial = &full_true[0..120];
         let mut with_true = partial.to_vec();
         with_true.extend_from_slice(&full_true[120..180]);
+
         let mut with_foreign = partial.to_vec();
         with_foreign.extend_from_slice(&foreign_chunk);
 
+        let mut with_echo = partial.to_vec();
+        with_echo.extend_from_slice(&partial[0..60]);
+
         let phi_partial = model
-            .evaluate_phi(&RelationalView::from_bytes(partial), TRAIN_BUDGET, true)
+            .evaluate_phi(&RelationalView::from_bytes(partial), DEFAULT_BUDGET, true)
             .phi_sharp;
         let phi_true = model
-            .evaluate_phi(&RelationalView::from_bytes(&with_true), TRAIN_BUDGET, true)
+            .evaluate_phi(&RelationalView::from_bytes(&with_true), DEFAULT_BUDGET, true)
             .phi_sharp;
         let phi_foreign = model
-            .evaluate_phi(&RelationalView::from_bytes(&with_foreign), TRAIN_BUDGET, true)
+            .evaluate_phi(&RelationalView::from_bytes(&with_foreign), DEFAULT_BUDGET, true)
+            .phi_sharp;
+        let phi_echo = model
+            .evaluate_phi(&RelationalView::from_bytes(&with_echo), DEFAULT_BUDGET, true)
             .phi_sharp;
 
         gain_true += phi_true - phi_partial;
         gain_foreign += phi_foreign - phi_partial;
+        gain_echo += phi_echo - phi_partial;
     }
+
     println!(
-        "Δφ_sharp moyen : ajout vrai complément={:+.4} | ajout complément étranger C'={:+.4}",
-        gain_true / 15.0,
-        gain_foreign / 15.0
+        "Δφ_sharp moyen : vrai complément={:+.4} | étranger C'={:+.4} | écho={:+.4}",
+        gain_true / (trials_r as f64),
+        gain_foreign / (trials_r as f64),
+        gain_echo / (trials_r as f64)
     );
 }
 
 // ============================================================================
-// 9. Interface CLI stricte (dont `ask --model out/sharp.phis --file perceived.eff`)
+// 9. Test de RUPTURE DE GÉNÉRATEUR (hors-PTGRS : Automates Cellulaires & Algo)
+//    Valide le transfert pur de l'opérateur « abduire » hors de sa classe.
+// ============================================================================
+
+/// Génère une trace d'automate cellulaire 1D (règle de Wolfram 0..255) sérialisée
+/// par blocs spatiaux de 3 cellules (alphabet de 8 symboles).
+fn gen_elementary_ca(rule: u8, seed: u64, target_len: usize) -> Vec<u8> {
+    let width = 12usize; // 4 blocs de 3 bits par génération
+    let mut cells = vec![0u8; width];
+    let mut rng = Rng::new(seed);
+    for c in &mut cells {
+        *c = (rng.next_u64() & 1) as u8;
+    }
+    if cells.iter().all(|&x| x == 0) {
+        cells[width / 2] = 1;
+    }
+
+    // Chauffe courte pour entrer sur l'attracteur de l'automate
+    for _ in 0..6 {
+        let mut next = vec![0u8; width];
+        for i in 0..width {
+            let l = cells[(i + width - 1) % width];
+            let m = cells[i];
+            let r = cells[(i + 1) % width];
+            let pat = (l << 2) | (m << 1) | r;
+            next[i] = (rule >> pat) & 1;
+        }
+        cells = next;
+    }
+
+    let mut out = Vec::with_capacity(target_len + 4);
+    while out.len() < target_len {
+        for blk in 0..(width / 3) {
+            let sym = (cells[3 * blk] << 2) | (cells[3 * blk + 1] << 1) | cells[3 * blk + 2];
+            out.push(sym);
+        }
+        let mut next = vec![0u8; width];
+        for i in 0..width {
+            let l = cells[(i + width - 1) % width];
+            let m = cells[i];
+            let r = cells[(i + 1) % width];
+            let pat = (l << 2) | (m << 1) | r;
+            next[i] = (rule >> pat) & 1;
+        }
+        cells = next;
+    }
+    out.truncate(target_len);
+    out
+}
+
+/// Fibonacci modulaire (récurrence arithmétique d'ordre 2, totalement hors PTGRS).
+fn gen_fibonacci_mod(modulus: u8, seed: u64, target_len: usize) -> Vec<u8> {
+    let mut rng = Rng::new(seed);
+    let mut a = (1 + (rng.next_u64() as u8) % (modulus - 1)) % modulus;
+    let mut b = (1 + (rng.next_u64() as u8) % (modulus - 1)) % modulus;
+    let mut out = Vec::with_capacity(target_len);
+    for _ in 0..target_len {
+        out.push(a);
+        let c = (a.wrapping_add(b)) % modulus;
+        a = b;
+        b = c;
+    }
+    out
+}
+
+/// Traces dynamiques de Collatz (résidus mod 8 le long de trajectoires enchaînées).
+fn gen_collatz_trace(seed: u64, target_len: usize) -> Vec<u8> {
+    let mut rng = Rng::new(seed);
+    let mut n = 27u64 + (rng.next_u64() % 500);
+    let mut out = Vec::with_capacity(target_len);
+    while out.len() < target_len {
+        out.push((n % 8) as u8);
+        if n <= 1 {
+            n = 27u64 + (rng.next_u64() % 500);
+        } else if n % 2 == 0 {
+            n /= 2;
+        } else {
+            n = 3 * n + 1;
+        }
+    }
+    out
+}
+
+/// Suite de Thue-Morse (non périodique, purement algorithmique) par blocs de 3 bits.
+fn gen_thue_morse_blocks(offset: u64, target_len: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(target_len);
+    for i in 0..target_len {
+        let idx = offset + (i as u64);
+        let b0 = (idx.count_ones() & 1) as u8;
+        let b1 = ((idx + 1).count_ones() & 1) as u8;
+        let b2 = ((idx + 2).count_ones() & 1) as u8;
+        out.push((b0 << 2) | (b1 << 1) | b2);
+    }
+    out
+}
+
+/// Trames structurées de protocole / log : [delim, champ, (compteur + champ) % 5, checksum % 5].
+fn gen_structured_frames(seed: u64, target_len: usize) -> Vec<u8> {
+    let mut rng = Rng::new(seed);
+    let mut counter = (rng.next_u64() % 5) as u8;
+    let mut out = Vec::with_capacity(target_len + 4);
+    while out.len() < target_len {
+        let field = (counter % 3) + 1; // champs 1..3
+        let val = (counter + field) % 5; // valeurs 0..4
+        let chk = (field + val + 2) % 5;
+        out.push(9u8); // délimiteur de trame
+        out.push(5u8 + field); // identifiant de champ (6..8)
+        out.push(val);
+        out.push(chk);
+        counter = (counter + 1) % 5;
+    }
+    out.truncate(target_len);
+    out
+}
+
+fn run_eval_transfer(model: &PhisharpModel, seed: u64) {
+    let mut rng = Rng::new(seed);
+    println!("=== TEST DE RUPTURE DE GÉNÉRATEUR V2 (HORS-PTGRS : CA 1D & ALGORITHMIQUE) ===");
+    println!(
+        "{:<24} | {:>7} | {:>7} | {:>5} {:>5} {:>5} {:>5} | {:>7} | {:>6}",
+        "Générateur hors-PTGRS", "φ_réel", "φ_perm", "G", "D", "P", "MIP", "no_ref", "t10/t6"
+    );
+    println!("{}", "-".repeat(92));
+
+    let families: Vec<(&str, fn(&mut Rng) -> Vec<u8>, bool)> = vec![
+        ("CA 1D Rule 110 (Turing)", |r| gen_elementary_ca(110, r.next_u64(), 180), true),
+        ("CA 1D Rule 54 (Gliders)", |r| gen_elementary_ca(54, r.next_u64(), 180), true),
+        ("CA 1D Rule 90 (Fractal)", |r| gen_elementary_ca(90, r.next_u64(), 180), true),
+        ("CA 1D Rule 30 (Chaos)",   |r| gen_elementary_ca(30, r.next_u64(), 180), false),
+        ("Fibonacci mod 11",        |r| gen_fibonacci_mod(11, r.next_u64(), 180), true),
+        ("Collatz mod 8",           |r| gen_collatz_trace(r.next_u64(), 180), true),
+        ("Thue-Morse (blocs 3b)",   |r| gen_thue_morse_blocks(r.next_u64() % 1024, 180), true),
+        ("Trames protocole/log",    |r| gen_structured_frames(r.next_u64(), 180), true),
+    ];
+
+    let mut structured_passed = 0usize;
+    let mut structured_total = 0usize;
+    let snaps = [DEFAULT_BUDGET, 10];
+
+    for (name, sampler, expect_structure) in families {
+        let trials = 8usize;
+        let mut phi_real = 0.0_f64;
+        let mut phi_perm = 0.0_f64;
+        let mut g_sum = 0.0_f64;
+        let mut d_sum = 0.0_f64;
+        let mut p_sum = 0.0_f64;
+        let mut mip_sum = 0.0_f64;
+        let mut phi_noref = 0.0_f64;
+        let mut phi_t10 = 0.0_f64;
+
+        for _ in 0..trials {
+            let bytes = sampler(&mut rng);
+            let view = RelationalView::from_bytes(&bytes);
+            let tr = model.run_abduction(&view, 10, true, &snaps, false);
+            let r6 = model.evaluate_phi_state(&view, &tr.snapshots[0].1, DEFAULT_BUDGET, true);
+            let r10 = model.evaluate_phi_state(&view, &tr.snapshots[1].1, 10, true);
+            let rn = model.evaluate_phi(&view, DEFAULT_BUDGET, false);
+
+            let mut perm_bytes = bytes.clone();
+            rng.shuffle(&mut perm_bytes);
+            let vp = RelationalView::from_bytes(&perm_bytes);
+            let rp = model.evaluate_phi(&vp, DEFAULT_BUDGET, true);
+
+            phi_real += r6.phi_sharp;
+            phi_perm += rp.phi_sharp;
+            g_sum += r6.generativity;
+            d_sum += r6.discrimination;
+            p_sum += r6.projection;
+            mip_sum += r6.mip_integration;
+            phi_noref += rn.phi_sharp;
+            phi_t10 += r10.phi_sharp;
+        }
+
+        let n = trials as f64;
+        phi_real /= n;
+        phi_perm /= n;
+        g_sum /= n;
+        d_sum /= n;
+        p_sum /= n;
+        mip_sum /= n;
+        phi_noref /= n;
+        phi_t10 /= n;
+
+        let ret = if phi_real > 1e-6_f64 { phi_t10 / phi_real } else { 0.0_f64 };
+        println!(
+            "{:<24} | {:>7.4} | {:>7.4} | {:>5.3} {:>5.3} {:>5.3} {:>5.3} | {:>7.4} | {:>5.2}x",
+            name, phi_real, phi_perm, g_sum, d_sum, p_sum, mip_sum, phi_noref, ret
+        );
+
+        if expect_structure {
+            structured_total += 1;
+            if phi_real > 0.04_f64 && phi_real > phi_perm + 0.03_f64 && ret >= 0.75_f64 {
+                structured_passed += 1;
+            }
+        }
+    }
+
+    println!("{}", "-".repeat(92));
+    println!(
+        "VERDICT RUPTURE DE GÉNÉRATEUR : {}/{} familles structurées hors-PTGRS transférées (Rule 30 = témoin chaotique).",
+        structured_passed, structured_total
+    );
+}
+
+// ============================================================================
+// 10. Interface CLI stricte (`ask --model out/sharp_v2.phis --file perceived.eff`)
 // ============================================================================
 
 fn get_arg(args: &[String], flag: &str) -> Option<String> {
@@ -1489,19 +2401,20 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         eprintln!("Usage:");
-        eprintln!("  phisharp train     --out out/sharp.phis [--steps 250] [--seed 42]");
-        eprintln!("  phisharp calibrate --model out/sharp.phis [--seed 101]");
-        eprintln!("  phisharp eval-ood  --model out/sharp.phis [--seed 202]");
-        eprintln!("  phisharp ask       --model out/sharp.phis --file perceived.eff");
+        eprintln!("  phisharp train         --out out/sharp_v2.phis [--steps 300] [--seed 42]");
+        eprintln!("  phisharp calibrate     --model out/sharp_v2.phis [--seed 101]");
+        eprintln!("  phisharp eval-ood      --model out/sharp_v2.phis [--seed 202]");
+        eprintln!("  phisharp eval-transfer --model out/sharp_v2.phis [--seed 303]");
+        eprintln!("  phisharp ask           --model out/sharp_v2.phis --file perceived.eff");
         std::process::exit(1);
     }
 
     match args[1].as_str() {
         "train" => {
-            let out = get_arg(&args, "--out").unwrap_or_else(|| "out/sharp.phis".to_string());
+            let out = get_arg(&args, "--out").unwrap_or_else(|| "out/sharp_v2.phis".to_string());
             let steps: usize = get_arg(&args, "--steps")
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(250);
+                .unwrap_or(300);
             let seed: u64 = get_arg(&args, "--seed")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(42);
@@ -1509,29 +2422,38 @@ fn main() {
         }
         "calibrate" => {
             let model_path =
-                get_arg(&args, "--model").unwrap_or_else(|| "out/sharp.phis".to_string());
+                get_arg(&args, "--model").unwrap_or_else(|| "out/sharp_v2.phis".to_string());
             let seed: u64 = get_arg(&args, "--seed")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(101);
-            let model = PhisharpModel::load(Path::new(&model_path)).expect("Chargement modèle");
+            let model = PhisharpModel::load(Path::new(&model_path)).expect("Chargement modèle V2");
             run_calibration(&model, seed);
         }
         "eval-ood" => {
             let model_path =
-                get_arg(&args, "--model").unwrap_or_else(|| "out/sharp.phis".to_string());
+                get_arg(&args, "--model").unwrap_or_else(|| "out/sharp_v2.phis".to_string());
             let seed: u64 = get_arg(&args, "--seed")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(202);
-            let model = PhisharpModel::load(Path::new(&model_path)).expect("Chargement modèle");
+            let model = PhisharpModel::load(Path::new(&model_path)).expect("Chargement modèle V2");
             run_eval_ood(&model, seed);
+        }
+        "eval-transfer" => {
+            let model_path =
+                get_arg(&args, "--model").unwrap_or_else(|| "out/sharp_v2.phis".to_string());
+            let seed: u64 = get_arg(&args, "--seed")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(303);
+            let model = PhisharpModel::load(Path::new(&model_path)).expect("Chargement modèle V2");
+            run_eval_transfer(&model, seed);
         }
         "ask" => {
             let model_path = get_arg(&args, "--model").expect("--model requis");
             let file_path = get_arg(&args, "--file").expect("--file requis");
-            let model = PhisharpModel::load(Path::new(&model_path)).expect("Chargement modèle");
+            let model = PhisharpModel::load(Path::new(&model_path)).expect("Chargement modèle V2");
             let raw = fs::read(&file_path).expect("Lecture perceived.eff");
             let view = RelationalView::from_bytes(&raw);
-            let out_bytes = model.ask_emit(&view, TRAIN_BUDGET + 2, 64);
+            let out_bytes = model.ask_emit(&view, DEFAULT_BUDGET + 2, 48);
             let mut stdout = std::io::stdout().lock();
             stdout.write_all(&out_bytes).expect("Écriture stdout");
         }
