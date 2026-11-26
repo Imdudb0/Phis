@@ -86,17 +86,26 @@ fn eval_batch(
     graph: &PhiGraph,
     singles: &[PreparedEpisode],
     composites: &[PreparedComposite],
+    comp_w: f32,
 ) -> f32 {
     let mut sum_phi = 0.0f32;
+    let mut sum_gate_c = 0.0f32;
+    let mut min_gate_c = 1.0f32;
     let mut states = Vec::with_capacity(singles.len());
     let mut residuals = Vec::with_capacity(singles.len());
     for ep in singles {
         let rep = compute_phi_sharp_prepared(graph, ep, false);
         sum_phi += rep.phi_sharp;
+        sum_gate_c += rep.gate_contrast;
+        if rep.gate_contrast < min_gate_c {
+            min_gate_c = rep.gate_contrast;
+        }
         states.push(rep.trace.final_state);
         residuals.push(rep.residual);
     }
-    let mean_phi = sum_phi / (singles.len() as f32);
+    let n = singles.len() as f32;
+    let mean_phi = sum_phi / n;
+    let mean_gate_c = sum_gate_c / n;
     let collapse = batch_collapse_penalty(&states);
     let spec = cross_specificity(graph, singles, &states, &residuals);
 
@@ -110,7 +119,12 @@ fn eval_batch(
         comp_sum / (composites.len() as f32)
     };
 
-    mean_phi + 0.35 * spec - 0.40 * collapse + 0.55 * mean_comp
+    mean_phi
+        + 0.55 * spec
+        + 0.20 * mean_gate_c
+        + 0.30 * min_gate_c
+        - 0.40 * collapse
+        + comp_w * mean_comp
 }
 
 pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
@@ -130,11 +144,12 @@ pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
         .min(cfg.pop_pairs.max(1));
 
     println!(
-        "Entraînement Phisharp v0.5 ({} paramètres : capteur + porte causale + graphe, {} étapes, {} paires ES, {} threads)...",
+        "Entraînement Phisharp v0.5.1 ({} paramètres : capteur + porte causale + graphe, {} étapes, {} paires ES, {} threads)...",
         NUM_PARAMS, cfg.steps, cfg.pop_pairs, n_threads
     );
 
     for step in 1..=cfg.steps {
+        let comp_w = 0.10 + 0.45 * ((step as f32) / 120.0).min(1.0);
         let mut prep_rng = Rng::new(rng.next_u64());
         let singles: Vec<PreparedEpisode> = CauseFamily::ALL
             .iter()
@@ -144,7 +159,6 @@ pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
             })
             .collect();
 
-        // 2 flux continus bruts : 1 collé SANS séparateur, 1 étiqueté à séparateur aléatoire
         let composites = vec![
             PreparedComposite::from_bytes(
                 &sample_composite_episode(&mut rng, 3, false, false, false, SepMode::None).effect,
@@ -179,11 +193,13 @@ pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
                             &PhiGraph::from_weights(w_pos),
                             singles_ref,
                             comp_ref,
+                            comp_w,
                         );
                         let f_neg = eval_batch(
                             &PhiGraph::from_weights(w_neg),
                             singles_ref,
                             comp_ref,
+                            comp_w,
                         );
                         local.push((pseed, f_pos, f_neg));
                     }
@@ -226,22 +242,24 @@ pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
         if step == 1 || step % 25 == 0 || step == cfg.steps {
             let model = PhiGraph::from_weights(theta.clone());
             let mut phi = 0.0;
-            let mut gen_sum = 0.0;
+            let mut gen = 0.0;
             let mut disc = 0.0;
-            let mut proj = 0.0;
             let mut integ = 0.0;
             let mut gate_c = 0.0;
+            let mut min_gate_c = 1.0f32;
             let mut res = 0.0;
             let mut states = Vec::with_capacity(singles.len());
             let mut residuals = Vec::with_capacity(singles.len());
             for ep in &singles {
                 let r = compute_phi_sharp_prepared(&model, ep, false);
                 phi += r.phi_sharp;
-                gen_sum += r.generativity;
+                gen += r.generativity;
                 disc += r.discrimination;
-                proj += r.projection;
                 integ += r.integration;
                 gate_c += r.gate_contrast;
+                if r.gate_contrast < min_gate_c {
+                    min_gate_c = r.gate_contrast;
+                }
                 res += r.residual;
                 states.push(r.trace.final_state);
                 residuals.push(r.residual);
@@ -255,21 +273,21 @@ pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
                 .sum::<f32>()
                 / (composites.len() as f32);
             println!(
-                "step {:>4}/{:<4} | φ={:+.4} | Gen={:.3} Disc={:.3} Spec={:.3} Gate={:.3} IIT={:.3} RefSel={:.3} | res={:.3} coll={:.3} ({:.1}s)",
+                "step {:>4}/{:<4} | φ={:+.4} | Gen={:.3} Disc={:.3} Spec={:.3} Gate={:.2}/{:.2} IIT={:.3} RefSel={:.3} | res={:.3} coll={:.3} ({:.1}s)",
                 step,
                 cfg.steps,
                 phi / n,
-                gen_sum / n,
+                gen / n,
                 disc / n,
                 spec,
                 gate_c / n,
+                min_gate_c,
                 integ / n,
                 sel,
                 res / n,
                 coll,
                 start.elapsed().as_secs_f32()
             );
-            let _ = proj;
         }
     }
 
@@ -281,7 +299,6 @@ pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
 fn evaluate_post_hoc(model: &PhiGraph, seed: u64) {
     let mut rng = Rng::new(seed);
 
-    // 1. Abstraction Méta-relationnelle
     let mut same_sum = 0.0f32;
     let mut diff_sum = 0.0f32;
     let trials = 48;
@@ -305,7 +322,6 @@ fn evaluate_post_hoc(model: &PhiGraph, seed: u64) {
     let same_avg = same_sum / (trials as f32);
     let diff_avg = diff_sum / (trials as f32);
 
-    // 2. Projection Référentielle sur flux continus (découpe 100% auto-découverte)
     let proj_trials = 50;
     let mut hits_glued = 0usize;
     let mut hits_tagged = 0usize;
@@ -313,7 +329,6 @@ fn evaluate_post_hoc(model: &PhiGraph, seed: u64) {
     let mut avg_margin = 0.0f32;
 
     for _ in 0..proj_trials {
-        // A. Flux continu collé SANS séparateur (4 moules + requête collés bout à bout)
         let ep_raw = sample_composite_episode(&mut rng, 4, false, false, true, SepMode::None);
         let regs_raw = discover_causal_regimes(model, &ep_raw.effect, true);
         if regs_raw.len() >= 2 {
@@ -331,7 +346,6 @@ fn evaluate_post_hoc(model: &PhiGraph, seed: u64) {
             }
         }
 
-        // B. Flux continu étiqueté à séparateur aléatoire ("", "\n", " | ", "; ")
         let ep_tag = sample_composite_episode(&mut rng, 4, true, true, true, SepMode::Random);
         let regs_tag = discover_causal_regimes(model, &ep_tag.effect, true);
         if regs_tag.len() >= 2 {
