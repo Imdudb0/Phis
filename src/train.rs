@@ -1,10 +1,12 @@
 use crate::graph::{NUM_PARAMS, PhiGraph, STATE_DIM};
+use crate::multihop::analyze_multihop;
 use crate::phi::{
     PreparedComposite, PreparedEpisode, compute_composite_phi_prepared,
     compute_phi_sharp_prepared, cosine_sim, discover_causal_regimes, project_query_to_regimes,
 };
 use crate::ptgrs::{
     CauseFamily, SepMode, sample_composite_episode, sample_episode, sample_episode_in_range,
+    sample_multihop_episode,
 };
 use crate::rng::Rng;
 use std::thread;
@@ -144,7 +146,7 @@ pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
         .min(cfg.pop_pairs.max(1));
 
     println!(
-        "Entraînement Phisharp v0.5.1 ({} paramètres : capteur + porte causale + graphe, {} étapes, {} paires ES, {} threads)...",
+        "Entraînement Phisharp v0.6 ({} paramètres, {} étapes, {} paires ES, {} threads)...",
         NUM_PARAMS, cfg.steps, cfg.pop_pairs, n_threads
     );
 
@@ -299,6 +301,7 @@ pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
 fn evaluate_post_hoc(model: &PhiGraph, seed: u64) {
     let mut rng = Rng::new(seed);
 
+    // 1. Abstraction Méta-relationnelle
     let mut same_sum = 0.0f32;
     let mut diff_sum = 0.0f32;
     let trials = 48;
@@ -322,11 +325,11 @@ fn evaluate_post_hoc(model: &PhiGraph, seed: u64) {
     let same_avg = same_sum / (trials as f32);
     let diff_avg = diff_sum / (trials as f32);
 
+    // 2. Projection 1-saut sur flux continus auto-segmentés
     let proj_trials = 50;
     let mut hits_glued = 0usize;
     let mut hits_tagged = 0usize;
     let mut ref_hits = 0usize;
-    let mut avg_margin = 0.0f32;
 
     for _ in 0..proj_trials {
         let ep_raw = sample_composite_episode(&mut rng, 4, false, false, true, SepMode::None);
@@ -356,20 +359,49 @@ fn evaluate_post_hoc(model: &PhiGraph, seed: u64) {
             let true_tag = ep_tag.hidden_tag_spans[ep_tag.hidden_match_idx];
             if span_iou((q_reg.core_start, q_reg.core_end), true_q) >= 0.45 {
                 let matches = project_query_to_regimes(model, &ep_tag.effect, &regs_tag, q_idx);
-                if let Some(top) = matches.first() {
-                    if span_iou((top.core_start, top.core_end), true_m) >= 0.45 {
-                        hits_tagged += 1;
-                        if let (Some(ext_ref), Some(gt_tag)) = (top.referent, true_tag)
-                            && span_iou(ext_ref, gt_tag) >= 0.50
-                        {
-                            ref_hits += 1;
-                        }
-                    }
-                    if matches.len() >= 2 {
-                        avg_margin += matches[0].score - matches[1].score;
+                if let Some(top) = matches.first()
+                    && span_iou((top.core_start, top.core_end), true_m) >= 0.45
+                {
+                    hits_tagged += 1;
+                    if let (Some(ext_ref), Some(gt_tag)) = (top.referent, true_tag)
+                        && span_iou(ext_ref, gt_tag) >= 0.50
+                    {
+                        ref_hits += 1;
                     }
                 }
             }
+        }
+    }
+
+    // 3. Projection Multi-Sauts sur Définitions Composées (4 concepts, hasard = 25%, 0 octet commun)
+    let mh_trials = 50;
+    let mut mh_decomposed = 0usize;
+    let mut mh_hits = 0usize;
+    let mut mh_flat_hits = 0usize;
+    let mut mh_margin = 0.0f32;
+
+    for _ in 0..mh_trials {
+        let ep = sample_multihop_episode(&mut rng, false, false);
+        if let Some(ana) = analyze_multihop(model, &ep.effect) {
+            if ana.target_spans.len() >= 2 {
+                mh_decomposed += 1;
+            }
+            if let Some(top) = ana.hop2_matches.first()
+                && top.concept.name_bytes == ep.hidden_concept_name
+            {
+                mh_hits += 1;
+                if ana.hop2_matches.len() >= 2 {
+                    mh_margin += top.score - ana.hop2_matches[1].score;
+                }
+            }
+        }
+
+        let ep_flat = sample_multihop_episode(&mut rng, true, false);
+        if let Some(ana) = analyze_multihop(model, &ep_flat.effect)
+            && let Some(top) = ana.hop2_matches.first()
+            && top.concept.name_bytes == ep_flat.hidden_concept_name
+        {
+            mh_flat_hits += 1;
         }
     }
 
@@ -378,7 +410,7 @@ fn evaluate_post_hoc(model: &PhiGraph, seed: u64) {
     println!("  Causes différentes: cos = {:+.4}", diff_avg);
     println!("  Marge             : {:+.4}", same_avg - diff_avg);
 
-    println!("\n--- Évaluation post-hoc 2 : Flux continu 100% auto-segmenté (4 moules, hasard = 25%) ---");
+    println!("\n--- Évaluation post-hoc 2 : Flux continu 1-saut auto-segmenté (4 moules, hasard = 25%) ---");
     println!(
         "  Moules collés SANS séparateur (0 octet commun)     : {}/{} ({:.1}%)",
         hits_glued,
@@ -386,12 +418,36 @@ fn evaluate_post_hoc(model: &PhiGraph, seed: u64) {
         100.0 * (hits_glued as f32) / (proj_trials as f32)
     );
     println!(
-        "  Moules étiquetés, sép. aléatoire (0 octet commun)  : {}/{} ({:.1}%)  [marge={:+.4}, référent exact={}/{}]",
+        "  Moules étiquetés, sép. aléatoire (0 octet commun)  : {}/{} ({:.1}%)  [référent exact={}/{}]",
         hits_tagged,
         proj_trials,
         100.0 * (hits_tagged as f32) / (proj_trials as f32),
-        avg_margin / (proj_trials as f32),
         ref_hits,
         hits_tagged
+    );
+
+    println!("\n--- Évaluation post-hoc 3 : Multi-Sauts sur Définitions Composées (4 concepts, hasard = 25%) ---");
+    println!(
+        "  Décomposition 2 causes (cible hybride)             : {}/{} ({:.1}%)",
+        mh_decomposed,
+        mh_trials,
+        100.0 * (mh_decomposed as f32) / (mh_trials as f32)
+    );
+    println!(
+        "  Concept composé exact (multiligne, 0 octet commun) : {}/{} ({:.1}%)  [marge Top1-Top2 = {:+.4}]",
+        mh_hits,
+        mh_trials,
+        100.0 * (mh_hits as f32) / (mh_trials as f32),
+        if mh_hits > 0 {
+            mh_margin / (mh_hits as f32)
+        } else {
+            0.0
+        }
+    );
+    println!(
+        "  Concept composé exact (flux plat, 0 octet commun)  : {}/{} ({:.1}%)",
+        mh_flat_hits,
+        mh_trials,
+        100.0 * (mh_flat_hits as f32) / (mh_trials as f32)
     );
 }
