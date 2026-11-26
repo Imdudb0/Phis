@@ -12,16 +12,8 @@
 
 [1m[33mwarning[0m: `phisharp` (bin "phisharp") generated 1 warning
 [1m[92m    Finished[0m `release` profile [optimized] target(s) in 0.01s
-[1m[92m     Running[0m `target/release/phisharp sample --out out/mh.eff --family multihop --seed 17`
-Scène multi-sauts générée dans 'out/mh.eff' (351 octets, concept caché = SOLAR [substitution + shared])
-  Moules : HELIX, WEAVE, CHORD, ORBIT
+[1m[92m     Running[0m `target/release/phisharp sample --out out/mh_flat.eff --family multihop_flat --seed 23`
+Scène multi-sauts (flux plat) générée dans 'out/mh_flat.eff' (350 octets, concept caché = LUNAR [shared + grammar])
+  Moules : PRISM, WEAVE, HELIX, CHORD
 
-HELIX: ,:)(",:),:)(",:)(",:),:)(",:),:)(",:)(",:),:
-WEAVE: +/>/,+/>/1+/>/.+/>/!+/>/&+/>
-CHORD: 780!<3/.<780(<3/.<9-><780!<780!<3/.<780(
-ORBIT: =7'=7'=7'=7'=7'=7'=7'=7'=7'=7'=7'=7'=7'
-FLARE -> WEAVE + ORBIT
-SOLAR -> HELIX + WEAVE
-SPARK -> HELIX + ORBIT
-SHARD -> CHORD + ORBIT
-sflposflsflposflposflsflposflsflposflposflsflpoznonpznonuznonkznoniznonxznon
+PRISM: <8180<8182<8185<818!<818><818 | WEAVE: "097$,5*$"09($,5*$'<3$"097$"097$,5*$"09( | HELIX: 9$!#)9$!9$!#)9$!#)9$!9$!#)9$!9$!#)9$!#)9$!9 | CHORD: $2>1-+-5;<7$2>1-+-5;<7$2>1-+-5;<7 | ORBIT = PRISM , HELIX | DRIFT = HELIX , CHORD | LUNAR = PRISM , WEAVE | QUARK = WEAVE , CHORD | fmrmxfmrmdfmrmefmrmofmrmnfmrmzqpsfyehfzqpbfyehframfzqpsfzqpsfyehfzqpb
