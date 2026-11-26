@@ -1,12 +1,12 @@
 [1m[33mwarning[0m[1m: fields `mean_residual` and `regimes_found` are never read[0m
-  [1m[94m--> [0msrc/phi.rs:70:9
+  [1m[94m--> [0msrc/phi.rs:69:9
    [1m[94m|[0m
-[1m[94m65[0m [1m[94m|[0m pub struct CompositePhi {
+[1m[94m64[0m [1m[94m|[0m pub struct CompositePhi {
    [1m[94m|[0m            [1m[94m------------[0m [1m[94mfields in this struct[0m
 [1m[94m...[0m
-[1m[94m70[0m [1m[94m|[0m     pub mean_residual: f32,
+[1m[94m69[0m [1m[94m|[0m     pub mean_residual: f32,
    [1m[94m|[0m         [1m[33m^^^^^^^^^^^^^[0m
-[1m[94m71[0m [1m[94m|[0m     pub regimes_found: usize,
+[1m[94m70[0m [1m[94m|[0m     pub regimes_found: usize,
    [1m[94m|[0m         [1m[33m^^^^^^^^^^^^^[0m
    [1m[94m|[0m
    [1m[94m= [0m[1mnote[0m: `CompositePhi` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
@@ -24,30 +24,30 @@
    [1m[94m= [0m[1mnote[0m: `SepMode` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
 
 [1m[33mwarning[0m: `phisharp` (bin "phisharp") generated 2 warnings
-[1m[92m    Finished[0m `release` profile [optimized] target(s) in 0.01s
+[1m[92m    Finished[0m `release` profile [optimized] target(s) in 0.02s
 [1m[92m     Running[0m `target/release/phisharp train --out out/sharp.phis --steps 300`
-Entraînement Phisharp v0.5 (1541 paramètres : capteur + porte causale + graphe, 300 étapes, 24 paires ES, 4 threads)...
-step    1/300  | φ=+0.0477 | Gen=0.305 Disc=0.037 Spec=0.008 Gate=0.250 IIT=0.097 RefSel=0.268 | res=0.541 coll=0.917 (0.1s)
-step   25/300  | φ=+0.4089 | Gen=0.506 Disc=0.527 Spec=0.015 Gate=0.254 IIT=0.202 RefSel=0.124 | res=0.316 coll=0.635 (1.7s)
-step   50/300  | φ=+0.4394 | Gen=0.586 Disc=0.467 Spec=0.033 Gate=0.258 IIT=0.179 RefSel=0.300 | res=0.250 coll=0.474 (3.2s)
-step   75/300  | φ=+0.4830 | Gen=0.659 Disc=0.570 Spec=0.121 Gate=0.254 IIT=0.139 RefSel=0.343 | res=0.197 coll=0.493 (4.8s)
-step  100/300  | φ=+0.5842 | Gen=0.760 Disc=0.636 Spec=0.120 Gate=0.301 IIT=0.187 RefSel=0.222 | res=0.131 coll=0.522 (6.3s)
-step  125/300  | φ=+0.6033 | Gen=0.778 Disc=0.685 Spec=0.101 Gate=0.300 IIT=0.230 RefSel=0.492 | res=0.120 coll=0.620 (7.9s)
-step  150/300  | φ=+0.6456 | Gen=0.776 Disc=0.755 Spec=0.035 Gate=0.345 IIT=0.258 RefSel=0.429 | res=0.125 coll=0.508 (9.5s)
-step  175/300  | φ=+0.5845 | Gen=0.718 Disc=0.705 Spec=0.087 Gate=0.357 IIT=0.231 RefSel=0.664 | res=0.164 coll=0.331 (11.1s)
-step  200/300  | φ=+0.5944 | Gen=0.753 Disc=0.737 Spec=0.124 Gate=0.480 IIT=0.146 RefSel=0.282 | res=0.141 coll=0.446 (12.6s)
-step  225/300  | φ=+0.6689 | Gen=0.766 Disc=0.801 Spec=0.132 Gate=0.485 IIT=0.298 RefSel=0.188 | res=0.134 coll=0.456 (14.2s)
-step  250/300  | φ=+0.6208 | Gen=0.774 Disc=0.733 Spec=0.161 Gate=0.431 IIT=0.208 RefSel=0.430 | res=0.124 coll=0.277 (15.6s)
-step  275/300  | φ=+0.6517 | Gen=0.752 Disc=0.769 Spec=0.169 Gate=0.532 IIT=0.312 RefSel=0.127 | res=0.134 coll=0.244 (17.2s)
-step  300/300  | φ=+0.6253 | Gen=0.740 Disc=0.747 Spec=0.177 Gate=0.565 IIT=0.234 RefSel=0.207 | res=0.147 coll=0.201 (18.7s)
+Entraînement Phisharp v0.5.1 (1541 paramètres : capteur + porte causale + graphe, 300 étapes, 24 paires ES, 4 threads)...
+step    1/300  | φ=+0.0583 | Gen=0.319 Disc=0.044 Spec=0.002 Gate=0.25/0.25 IIT=0.067 RefSel=0.260 | res=0.519 coll=0.869 (0.1s)
+step   25/300  | φ=+0.4847 | Gen=0.665 Disc=0.592 Spec=0.008 Gate=0.27/0.26 IIT=0.096 RefSel=0.324 | res=0.191 coll=0.743 (2.0s)
+step   50/300  | φ=+0.6068 | Gen=0.798 Disc=0.708 Spec=0.026 Gate=0.30/0.29 IIT=0.130 RefSel=0.231 | res=0.107 coll=0.604 (4.0s)
+step   75/300  | φ=+0.6414 | Gen=0.800 Disc=0.723 Spec=0.100 Gate=0.39/0.34 IIT=0.187 RefSel=0.356 | res=0.103 coll=0.493 (5.8s)
+step  100/300  | φ=+0.6963 | Gen=0.792 Disc=0.790 Spec=0.159 Gate=0.59/0.47 IIT=0.228 RefSel=0.387 | res=0.108 coll=0.349 (7.7s)
+step  125/300  | φ=+0.7428 | Gen=0.800 Disc=0.827 Spec=0.133 Gate=0.79/0.70 IIT=0.298 RefSel=0.430 | res=0.105 coll=0.486 (9.7s)
+step  150/300  | φ=+0.7357 | Gen=0.798 Disc=0.825 Spec=0.206 Gate=0.88/0.74 IIT=0.247 RefSel=0.436 | res=0.106 coll=0.166 (11.9s)
+step  175/300  | φ=+0.7322 | Gen=0.813 Disc=0.758 Spec=0.285 Gate=0.89/0.77 IIT=0.245 RefSel=0.495 | res=0.097 coll=0.211 (13.7s)
+step  200/300  | φ=+0.7365 | Gen=0.779 Disc=0.823 Spec=0.299 Gate=0.94/0.84 IIT=0.274 RefSel=0.308 | res=0.115 coll=0.253 (15.5s)
+step  225/300  | φ=+0.7989 | Gen=0.807 Disc=0.880 Spec=0.272 Gate=0.96/0.93 IIT=0.367 RefSel=0.399 | res=0.099 coll=0.386 (17.3s)
+step  250/300  | φ=+0.7775 | Gen=0.793 Disc=0.885 Spec=0.342 Gate=0.96/0.91 IIT=0.292 RefSel=0.486 | res=0.109 coll=0.203 (19.1s)
+step  275/300  | φ=+0.7758 | Gen=0.793 Disc=0.826 Spec=0.298 Gate=0.94/0.89 IIT=0.358 RefSel=0.411 | res=0.106 coll=0.138 (20.9s)
+step  300/300  | φ=+0.7681 | Gen=0.801 Disc=0.817 Spec=0.300 Gate=0.96/0.92 IIT=0.328 RefSel=0.351 | res=0.103 coll=0.121 (22.7s)
 
 --- Évaluation post-hoc 1 : Abstraction Méta-relationnelle (0 octet commun) ---
-  Même cause cachée : cos = +0.9511
-  Causes différentes: cos = +0.2039
-  Marge             : +0.7473
+  Même cause cachée : cos = +0.9643
+  Causes différentes: cos = -0.0264
+  Marge             : +0.9907
 
 --- Évaluation post-hoc 2 : Flux continu 100% auto-segmenté (4 moules, hasard = 25%) ---
-  Moules collés SANS séparateur (0 octet commun)     : 16/50 (32.0%)
-  Moules étiquetés, sép. aléatoire (0 octet commun)  : 25/50 (50.0%)  [marge=+0.1529, référent exact=20/25]
+  Moules collés SANS séparateur (0 octet commun)     : 44/50 (88.0%)
+  Moules étiquetés, sép. aléatoire (0 octet commun)  : 39/50 (78.0%)  [marge=+0.2114, référent exact=28/39]
 
 Modèle sauvegardé dans 'out/sharp.phis'.
