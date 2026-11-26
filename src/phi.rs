@@ -1390,14 +1390,14 @@ fn run_wm_core(
     } else {
         af_margin
     };
-
+    
     // 7. Tête de lecture connexionniste P(t) + saillance non-supervisée + contrefactuel (-z_query)
-    let p_field = graph.readout_explanation(sub, &gates_pt, &z_full, &z_cut, &z_query);
+    let p_field = graph.readout_explanation(sub, &gates_pt, &z_full, &z_cut, &z_query, delta_peak);
     let mut neg_q = [0.0f32; WM_DIM];
     for d in 0..WM_DIM {
         neg_q[d] = -z_query[d];
     }
-    let p_neg = graph.readout_explanation(sub, &gates_pt, &z_full, &z_cut, &neg_q);
+    let p_neg = graph.readout_explanation(sub, &gates_pt, &z_full, &z_cut, &neg_q, delta_peak);
 
     let all_mask = vec![true; context_end];
     let (top_p, p_center) = best_window_excl(&p_field[..context_end], &all_mask, context_end, 5, None);
@@ -1426,8 +1426,8 @@ fn run_wm_core(
     let readout_sel = 0.5 * top_p * (1.0 - bg_p) + 0.5 * (top_p - second_p).max(0.0);
     let readout_disc = (top_p - top_p_neg).max(0.0);
 
-    // Saillance non-supervisée `sal[t]` : aligne lissement P(t) sur le sommet causal (Hop-2/3 ou Hop-1)
-    let use_echo_sal = has_long_echo && (target_causes >= 2 || delta_peak > 0.12);
+    // Saillance non-supervisée `sal[t]` : distingue proprement Hop-2/3 vs Hop-1 (ex: comp.eff)
+    let use_echo_sal = has_long_echo && (target_causes >= 2 || delta_peak > 0.25);
     let mut p_sal_num = 0.0f32;
     let mut p_mass = 0.0f32;
     for t in 0..context_end {
