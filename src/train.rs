@@ -132,24 +132,27 @@ fn eval_hop1_batch(
     } else {
         comp_sum / (composites.len() as f32)
     };
-
+    
     mean_phi
-        + 0.55 * spec
-        + 0.25 * mean_gate_c
-        + 0.40 * min_gate_c
-        - 0.40 * collapse
-        + comp_w * mean_comp
+    + 0.55 * spec
+    + 0.30 * mean_gate_c
+    + 0.55 * min_gate_c
+    - 0.40 * collapse
+    + comp_w * mean_comp
 }
 
 fn eval_wm_batch(graph: &PhiGraph, multihops: &[PreparedMultiHop]) -> f32 {
     if multihops.is_empty() {
         return 0.0;
     }
-    let sum: f32 = multihops
-        .iter()
-        .map(|mh| compute_wm_phi_prepared(graph, mh))
-        .sum();
-    sum / (multihops.len() as f32)
+    let mut sum = 0.0f32;
+    let mut w_tot = 0.0f32;
+    for (i, mh) in multihops.iter().enumerate() {
+        let w = if i == 0 { 1.2 } else { 1.0 };
+        sum += w * compute_wm_phi_prepared(graph, mh);
+        w_tot += w;
+    }
+    sum / w_tot
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -177,11 +180,11 @@ pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
         .min(cfg.pop_pairs.max(1));
 
     // Une séance fluide : Hop-1 (55%) -> Mémoire de Travail (35%) -> Joint (10%)
-    let p1_end = ((cfg.steps * 55) / 100).max(1);
+    let p1_end = ((cfg.steps * 60) / 100).max(1);
     let p2_end = ((cfg.steps * 90) / 100).max(p1_end);
 
     println!(
-        "Entraînement Phisharp v0.7.1 ({} params = {} Hop-1 + {} Mémoire de Travail, {} étapes, {} paires ES, {} threads)...",
+        "Entraînement Phisharp v0.7.2 ({} params = {} Hop-1 + {} Mémoire de Travail, {} étapes, {} paires ES, {} threads)...",
         NUM_PARAMS,
         WM_PARAM_START,
         NUM_PARAMS - WM_PARAM_START,
