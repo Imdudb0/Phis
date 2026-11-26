@@ -1,46 +1,32 @@
-[1m[33mwarning[0m[1m: field `t_bwd` is never read[0m
-   [1m[94m--> [0msrc/main.rs:226:5
-    [1m[94m|[0m
-[1m[94m221[0m [1m[94m|[0m struct RelationalView {
-    [1m[94m|[0m        [1m[94m--------------[0m [1m[94mfield in this struct[0m
-[1m[94m...[0m
-[1m[94m226[0m [1m[94m|[0m     t_bwd: Vec<f64>,  // v_size * v_size
-    [1m[94m|[0m     [1m[33m^^^^^[0m
-    [1m[94m|[0m
-    [1m[94m= [0m[1mnote[0m: `RelationalView` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
-    [1m[94m= [0m[1mnote[0m: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
-
 [1m[33mwarning[0m[1m: fields `diff_stability` and `residual_norm` are never read[0m
-   [1m[94m--> [0msrc/main.rs:420:5
+   [1m[94m--> [0msrc/main.rs:558:5
     [1m[94m|[0m
-[1m[94m415[0m [1m[94m|[0m struct PhiReport {
+[1m[94m553[0m [1m[94m|[0m struct PhiReport {
     [1m[94m|[0m        [1m[94m---------[0m [1m[94mfields in this struct[0m
 [1m[94m...[0m
-[1m[94m420[0m [1m[94m|[0m     diff_stability: f64,
+[1m[94m558[0m [1m[94m|[0m     diff_stability: f64,
     [1m[94m|[0m     [1m[33m^^^^^^^^^^^^^^[0m
-[1m[94m421[0m [1m[94m|[0m     residual_norm: f64,
+[1m[94m559[0m [1m[94m|[0m     residual_norm: f64,
     [1m[94m|[0m     [1m[33m^^^^^^^^^^^^^[0m
     [1m[94m|[0m
     [1m[94m= [0m[1mnote[0m: `PhiReport` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+    [1m[94m= [0m[1mnote[0m: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
 
-[1m[33mwarning[0m: `phisharp` (bin "phisharp") generated 2 warnings
+[1m[33mwarning[0m: `phisharp` (bin "phisharp") generated 1 warning
 [1m[92m    Finished[0m `release` profile [optimized] target(s) in 0.00s
 [1m[92m     Running[0m `target/release/phisharp train --out out/sharp.phis --steps 300 --seed 42`
-=== ENTRAÎNEMENT FERMÉ PHISHARP (PTGRS + φ_sharp uniquement, 428 params) ===
-step    1/300 | φ_sharp=0.0000 | G=0.002 D=0.002 P=0.001 MIP=0.000
-step   20/300 | φ_sharp=0.0043 | G=0.149 D=0.625 P=0.140 MIP=0.046
-step   40/300 | φ_sharp=0.0135 | G=0.219 D=0.701 P=0.204 MIP=0.090
-step   60/300 | φ_sharp=0.0318 | G=0.204 D=0.696 P=0.198 MIP=0.200
-step   80/300 | φ_sharp=0.0467 | G=0.243 D=0.619 P=0.225 MIP=0.260
-step  100/300 | φ_sharp=0.0701 | G=0.283 D=0.759 P=0.287 MIP=0.322
-step  120/300 | φ_sharp=0.1083 | G=0.291 D=0.699 P=0.284 MIP=0.483
-step  140/300 | φ_sharp=0.0302 | G=0.182 D=0.644 P=0.176 MIP=0.265
-step  160/300 | φ_sharp=0.0839 | G=0.388 D=0.881 P=0.352 MIP=0.340
-step  180/300 | φ_sharp=0.0745 | G=0.234 D=0.609 P=0.213 MIP=0.440
-step  200/300 | φ_sharp=0.1059 | G=0.342 D=0.715 P=0.333 MIP=0.422
-step  220/300 | φ_sharp=0.1344 | G=0.306 D=0.808 P=0.328 MIP=0.569
-step  240/300 | φ_sharp=0.0473 | G=0.164 D=0.440 P=0.138 MIP=0.509
-step  260/300 | φ_sharp=0.2331 | G=0.417 D=0.659 P=0.495 MIP=0.637
-step  280/300 | φ_sharp=0.1277 | G=0.291 D=0.632 P=0.283 MIP=0.592
-step  300/300 | φ_sharp=0.1469 | G=0.300 D=0.706 P=0.256 MIP=0.611
-Modèle figé sauvegardé : out/sharp.phis
+=== ENTRAÎNEMENT FERMÉ PHISHARP V2 (PTGRS générique + top-down hiérarchique, 933 params) ===
+step    1/300 (T=6,8) | φ(T)=0.0000 φ(T+2)=0.0000 | G=0.000 D=0.004 P=0.000 MIP=0.016
+step   25/300 (T=5,7) | φ(T)=0.0000 φ(T+2)=0.0000 | G=0.000 D=0.003 P=0.000 MIP=0.096
+step   50/300 (T=7,9) | φ(T)=0.0000 φ(T+2)=0.0000 | G=0.000 D=0.008 P=0.000 MIP=0.233
+step   75/300 (T=3,5) | φ(T)=0.0000 φ(T+2)=0.0000 | G=0.000 D=0.001 P=0.000 MIP=0.276
+step  100/300 (T=4,6) | φ(T)=0.0000 φ(T+2)=0.0000 | G=0.000 D=0.007 P=0.000 MIP=0.242
+step  125/300 (T=6,8) | φ(T)=0.0000 φ(T+2)=0.0000 | G=0.000 D=0.005 P=0.000 MIP=0.451
+step  150/300 (T=7,9) | φ(T)=0.0000 φ(T+2)=0.0000 | G=0.000 D=0.004 P=0.000 MIP=0.351
+step  175/300 (T=7,9) | φ(T)=0.0000 φ(T+2)=0.0000 | G=0.000 D=0.006 P=0.000 MIP=0.510
+step  200/300 (T=3,5) | φ(T)=0.0000 φ(T+2)=0.0000 | G=0.000 D=0.033 P=0.000 MIP=0.400
+step  225/300 (T=6,8) | φ(T)=0.0000 φ(T+2)=0.0000 | G=0.000 D=0.024 P=0.000 MIP=0.454
+step  250/300 (T=3,5) | φ(T)=0.0000 φ(T+2)=0.0000 | G=0.000 D=0.014 P=0.000 MIP=0.622
+step  275/300 (T=6,8) | φ(T)=0.0000 φ(T+2)=0.0000 | G=0.000 D=0.012 P=0.000 MIP=0.611
+step  300/300 (T=3,5) | φ(T)=0.0000 φ(T+2)=0.0000 | G=0.000 D=0.014 P=0.000 MIP=0.609
+Modèle V2 figé sauvegardé : out/sharp.phis
