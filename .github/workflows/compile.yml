@@ -32,7 +32,6 @@ jobs:
           #cargo run --release -- ask --model out/sharp.phis --file out/mh.eff
           #cargo run --release -- ask --model out/sharp.phis --file out/mh_flat.eff
           sed -i 's/pqrsrqpqrsrqpqrsrqpqrsrqp/pqrsrqppqrsrqppqrsrqppqrsrqp/' out/defs_fr.eff
-carg
           cargo run --release -- ask --model out/sharp.phis --file out/defs_fr.eff
           cp out/defs_fr.eff out/defs_hop3.eff
           printf 'vwxwmvwxwqvwxwtvwxwavwxwbvwxw' >> out/defs_hop3.eff
