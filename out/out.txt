@@ -1,32 +1,32 @@
 [1m[33mwarning[0m[1m: fields `diff_stability` and `residual_norm` are never read[0m
-   [1m[94m--> [0msrc/main.rs:558:5
+   [1m[94m--> [0msrc/main.rs:672:5
     [1m[94m|[0m
-[1m[94m553[0m [1m[94m|[0m struct PhiReport {
+[1m[94m667[0m [1m[94m|[0m struct PhiReport {
     [1m[94m|[0m        [1m[94m---------[0m [1m[94mfields in this struct[0m
 [1m[94m...[0m
-[1m[94m558[0m [1m[94m|[0m     diff_stability: f64,
+[1m[94m672[0m [1m[94m|[0m     diff_stability: f64,
     [1m[94m|[0m     [1m[33m^^^^^^^^^^^^^^[0m
-[1m[94m559[0m [1m[94m|[0m     residual_norm: f64,
+[1m[94m673[0m [1m[94m|[0m     residual_norm: f64,
     [1m[94m|[0m     [1m[33m^^^^^^^^^^^^^[0m
     [1m[94m|[0m
     [1m[94m= [0m[1mnote[0m: `PhiReport` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
     [1m[94m= [0m[1mnote[0m: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
 
 [1m[33mwarning[0m: `phisharp` (bin "phisharp") generated 1 warning
-[1m[92m    Finished[0m `release` profile [optimized] target(s) in 0.00s
+[1m[92m    Finished[0m `release` profile [optimized] target(s) in 0.01s
 [1m[92m     Running[0m `target/release/phisharp train --out out/sharp.phis --steps 300 --seed 42`
-=== ENTRAÎNEMENT FERMÉ PHISHARP V2 (PTGRS générique + top-down hiérarchique, 933 params) ===
-step    1/300 (T=6,8) | φ(T)=0.0000 φ(T+2)=0.0000 | G=0.000 D=0.004 P=0.000 MIP=0.016
-step   25/300 (T=5,7) | φ(T)=0.0000 φ(T+2)=0.0000 | G=0.000 D=0.003 P=0.000 MIP=0.096
-step   50/300 (T=7,9) | φ(T)=0.0000 φ(T+2)=0.0000 | G=0.000 D=0.008 P=0.000 MIP=0.233
-step   75/300 (T=3,5) | φ(T)=0.0000 φ(T+2)=0.0000 | G=0.000 D=0.001 P=0.000 MIP=0.276
-step  100/300 (T=4,6) | φ(T)=0.0000 φ(T+2)=0.0000 | G=0.000 D=0.007 P=0.000 MIP=0.242
-step  125/300 (T=6,8) | φ(T)=0.0000 φ(T+2)=0.0000 | G=0.000 D=0.005 P=0.000 MIP=0.451
-step  150/300 (T=7,9) | φ(T)=0.0000 φ(T+2)=0.0000 | G=0.000 D=0.004 P=0.000 MIP=0.351
-step  175/300 (T=7,9) | φ(T)=0.0000 φ(T+2)=0.0000 | G=0.000 D=0.006 P=0.000 MIP=0.510
-step  200/300 (T=3,5) | φ(T)=0.0000 φ(T+2)=0.0000 | G=0.000 D=0.033 P=0.000 MIP=0.400
-step  225/300 (T=6,8) | φ(T)=0.0000 φ(T+2)=0.0000 | G=0.000 D=0.024 P=0.000 MIP=0.454
-step  250/300 (T=3,5) | φ(T)=0.0000 φ(T+2)=0.0000 | G=0.000 D=0.014 P=0.000 MIP=0.622
-step  275/300 (T=6,8) | φ(T)=0.0000 φ(T+2)=0.0000 | G=0.000 D=0.012 P=0.000 MIP=0.611
-step  300/300 (T=3,5) | φ(T)=0.0000 φ(T+2)=0.0000 | G=0.000 D=0.014 P=0.000 MIP=0.609
-Modèle V2 figé sauvegardé : out/sharp.phis
+=== ENTRAÎNEMENT FERMÉ PHISHARP V2.1 (PTGRS générique + A/E/G dynamiques, 1065 params) ===
+step    1/300 (T=3,5) | φ(T)=0.0000 φ(T+2)=0.0000 | G=0.000 D=0.002 P=0.000 MIP=0.011
+step   25/300 (T=6,8) | φ(T)=0.0009 φ(T+2)=0.0026 | G=0.010 D=0.023 P=0.008 MIP=0.036
+step   50/300 (T=5,7) | φ(T)=0.0134 φ(T+2)=0.0220 | G=0.078 D=0.129 P=0.057 MIP=0.093
+step   75/300 (T=3,5) | φ(T)=0.0041 φ(T+2)=0.0116 | G=0.018 D=0.054 P=0.011 MIP=0.220
+step  100/300 (T=5,7) | φ(T)=0.0384 φ(T+2)=0.0547 | G=0.099 D=0.186 P=0.079 MIP=0.433
+step  125/300 (T=3,5) | φ(T)=0.0272 φ(T+2)=0.0581 | G=0.073 D=0.154 P=0.065 MIP=0.317
+step  150/300 (T=7,9) | φ(T)=0.1095 φ(T+2)=0.1066 | G=0.183 D=0.313 P=0.159 MIP=0.656
+step  175/300 (T=5,7) | φ(T)=0.0669 φ(T+2)=0.0896 | G=0.123 D=0.229 P=0.108 MIP=0.666
+step  200/300 (T=5,7) | φ(T)=0.0331 φ(T+2)=0.0507 | G=0.094 D=0.180 P=0.052 MIP=0.567
+step  225/300 (T=5,7) | φ(T)=0.0321 φ(T+2)=0.0705 | G=0.107 D=0.201 P=0.054 MIP=0.679
+step  250/300 (T=7,9) | φ(T)=0.1333 φ(T+2)=0.1380 | G=0.230 D=0.439 P=0.195 MIP=0.724
+step  275/300 (T=4,6) | φ(T)=0.0292 φ(T+2)=0.0617 | G=0.068 D=0.126 P=0.050 MIP=0.673
+step  300/300 (T=3,5) | φ(T)=0.0152 φ(T+2)=0.0594 | G=0.039 D=0.108 P=0.035 MIP=0.488
+Modèle V2.1 figé sauvegardé : out/sharp.phis
