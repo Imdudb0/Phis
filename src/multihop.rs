@@ -64,8 +64,6 @@ fn contains_slice(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
 
-/// Recherche des occurrences autonomes de `needle` dans `haystack` (respecte les frontières
-/// alphanumériques pour éviter qu'une clé comme `miroir` ne matche dans `oscillation_miroir`).
 fn find_standalone_positions(haystack: &[u8], needle: &[u8]) -> Vec<usize> {
     let mut out = Vec::new();
     if needle.is_empty() || needle.len() > haystack.len() {
@@ -90,9 +88,6 @@ fn find_standalone_positions(haystack: &[u8], needle: &[u8]) -> Vec<usize> {
     out
 }
 
-/// Décomposition multi-causes guidée par le résidu sur un bloc cible `bytes` :
-/// si H_1 laisse un résidu localisé ou un compromis entre deux régimes distincts,
-/// extrait H_1' et H_2 qui réduisent le résidu et sont orthogonalement séparés.
 pub fn decompose_by_residual(graph: &PhiGraph, bytes: &[u8]) -> ResidualSplit {
     let n = bytes.len();
     let sub = RawSubstrate::from_bytes(bytes);
@@ -114,7 +109,6 @@ pub fn decompose_by_residual(graph: &PhiGraph, bytes: &[u8]) -> ResidualSplit {
         pref_err[t + 1] = pref_err[t] + tr0.final_pos_err[t];
     }
 
-    // 1. Propositions de coupe guidées par le saut de résidu + connectivité + discontinuité abductive
     let mut proposals: Vec<(usize, f32)> = Vec::new();
     let mut p = 14usize;
     while p + 14 <= n {
@@ -147,7 +141,6 @@ pub fn decompose_by_residual(graph: &PhiGraph, bytes: &[u8]) -> ResidualSplit {
         cands.push(n / 2);
     }
 
-    // 2. Évaluation complète des coupes candidates et raffinement ±2 autour de la meilleure
     let eval_cut = |cp: usize| -> (f32, f32, f32, f32) {
         let rl = graph.encode_bytes(&bytes[0..cp]);
         let rr = graph.encode_bytes(&bytes[cp..n]);
@@ -210,7 +203,6 @@ pub fn decompose_by_residual(graph: &PhiGraph, bytes: &[u8]) -> ResidualSplit {
     }
 }
 
-/// Extrait les mots-tokens alphanumériques (longueur >= 3) d'une zone passive.
 fn extract_word_tokens(slice: &[u8]) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
     let mut i = 0usize;
@@ -232,8 +224,6 @@ fn extract_word_tokens(slice: &[u8]) -> Vec<Vec<u8>> {
     out
 }
 
-/// Distingue méta-langage (définitions qui ne font que citer les noms de moules antérieurs)
-/// et vrais moules causaux.
 fn demote_metalanguage_regimes(
     bytes: &[u8],
     raw: &[DiscoveredRegime],
@@ -254,22 +244,29 @@ fn demote_metalanguage_regimes(
         };
         let core_slice = &bytes[reg.core_start..reg.core_end];
 
-        // Vérifie si ce noyau cite des tokens uniques appartenant aux référents de >= 2 moules déjà retenus
         let mut echoed_molds = 0usize;
+        let mut echoed_bytes = 0usize;
         if kept.len() >= 2 && idx + 1 < raw.len() {
             for m_i in 0..kept.len() {
-                let unique_hit = kept_tag_tokens[m_i].iter().any(|tok| {
+                let mut hit_len = 0usize;
+                for tok in &kept_tag_tokens[m_i] {
                     let unique_to_mi = (0..kept.len())
                         .all(|m_j| m_j == m_i || !kept_tag_tokens[m_j].contains(tok));
-                    unique_to_mi && !find_standalone_positions(core_slice, tok).is_empty()
-                });
-                if unique_hit {
+                    if unique_to_mi {
+                        let cnt = find_standalone_positions(core_slice, tok).len();
+                        if cnt > 0 {
+                            hit_len += cnt * tok.len();
+                        }
+                    }
+                }
+                if hit_len > 0 {
                     echoed_molds += 1;
+                    echoed_bytes += hit_len;
                 }
             }
         }
 
-        if echoed_molds >= 2 {
+        if echoed_molds >= 2 || (echoed_molds >= 1 && echoed_bytes * 4 >= core_slice.len()) {
             demoted += 1;
             continue;
         }
@@ -280,7 +277,6 @@ fn demote_metalanguage_regimes(
         kept.push(reg);
     }
 
-    // Recalcule les référents passifs après démotion
     let k = kept.len();
     if k == 0 {
         return (raw.to_vec(), 0);
@@ -353,8 +349,6 @@ fn project_span_to_molds(
     matches
 }
 
-/// Trouve la clé la plus longue et uniquement discriminante dans `tag_i` qui réapparaît
-/// dans les zones définitionnelles passives `def_zones` (sans jamais parser `:` ou `=`).
 fn find_discriminative_key(
     bytes: &[u8],
     tag_spans: &[(usize, usize)],
@@ -367,7 +361,7 @@ fn find_discriminative_key(
         return None;
     }
 
-    let mut best: Option<(usize, usize, Vec<u8>)> = None; // (len, hits, key)
+    let mut best: Option<(usize, usize, Vec<u8>)> = None;
     for s in 0..tag.len() {
         if tag[s] <= b' ' {
             continue;
@@ -380,7 +374,6 @@ fn find_discriminative_key(
             if cand.iter().any(|&b| b < 32) {
                 continue;
             }
-            // Doit être propre à ce moule (absent des autres référents de moules)
             let unique = tag_spans.iter().enumerate().all(|(j, &(os, oe))| {
                 j == mold_idx || !contains_slice(&bytes[os..oe], cand)
             });
@@ -413,6 +406,7 @@ struct KeyEntry {
     key: Vec<u8>,
     molds: Vec<usize>,
     hop: usize,
+    defined_in: Option<(usize, usize)>,
 }
 
 #[derive(Clone, Debug)]
@@ -422,7 +416,7 @@ struct KeyHit {
     entry_idx: usize,
 }
 
-/// Nettoie automatiquement les affixes boilerplate partagés entre les en-têtes de définitions
+/// Nettoie automatiquement les affixes boilerplate partagés entre en-têtes de définitions
 /// (ex: `" = "`, `": "`, `" -> "`, `" | "`, `"; "`) sans aucun séparateur codé en dur.
 fn strip_common_head_affixes(raw_heads: &[&[u8]]) -> Vec<Vec<u8>> {
     let mut cleaned: Vec<Vec<u8>> = raw_heads.iter().map(|h| trim_edge_ws(h).to_vec()).collect();
@@ -430,7 +424,7 @@ fn strip_common_head_affixes(raw_heads: &[&[u8]]) -> Vec<Vec<u8>> {
         return cleaned;
     }
 
-    // 1. Suffixe commun à tous les en-têtes (ex: `" ="`, `":"`, `" ->"`)
+    // 1. Suffixe commun à tous les en-têtes non vides (ex: `" ="`, `":"`, `" ->"`)
     let min_len = cleaned.iter().map(|h| h.len()).min().unwrap_or(0);
     let mut suf = 0usize;
     while suf + 2 < min_len {
@@ -449,7 +443,7 @@ fn strip_common_head_affixes(raw_heads: &[&[u8]]) -> Vec<Vec<u8>> {
         }
     }
 
-    // 2. Préfixe commun aux en-têtes 1..k (ex: `"| "`, `"; "`, `". "` entre clauses en flux plat)
+    // 2. Préfixe commun aux en-têtes 1..k (ex: `"| "`, `"; "`), étendu à 0 s'il le partage aussi
     let tail_min = cleaned[1..].iter().map(|h| h.len()).min().unwrap_or(0);
     let mut pre = 0usize;
     while pre + 2 < tail_min {
@@ -461,12 +455,16 @@ fn strip_common_head_affixes(raw_heads: &[&[u8]]) -> Vec<Vec<u8>> {
         }
     }
     if pre > 0 {
+        let prefix = cleaned[1][0..pre].to_vec();
+        if cleaned[0].len() > pre + 1 && cleaned[0].starts_with(&prefix) {
+            cleaned[0] = trim_edge_ws(&cleaned[0][pre..]).to_vec();
+        }
         for h in &mut cleaned[1..] {
             *h = trim_edge_ws(&h[pre..]).to_vec();
         }
     }
 
-    // 3. Préfixe commun à TOUS les en-têtes seulement si non-alphanumérique (ex: `"- "`)
+    // 3. Préfixe résiduel non-alphanumérique commun à tous (ex: `"- "`)
     let all_min = cleaned.iter().map(|h| h.len()).min().unwrap_or(0);
     let mut ap = 0usize;
     while ap + 2 < all_min {
@@ -486,14 +484,11 @@ fn strip_common_head_affixes(raw_heads: &[&[u8]]) -> Vec<Vec<u8>> {
     cleaned
 }
 
-/// Découvre des clauses de définitions composées dans une zone passive `zone_bytes`
-/// uniquement à partir des positions des clés référentielles et de la géométrie des connecteurs.
 fn extract_definitions_in_zone(
     zone_bytes: &[u8],
     zone_offset: usize,
     entries: &[KeyEntry],
 ) -> Vec<ComposedConcept> {
-    // 1. Collecte de tous les hits non chevauchants (priorité aux clés les plus longues)
     let mut order: Vec<usize> = (0..entries.len()).collect();
     order.sort_by(|&a, &b| entries[b].key.len().cmp(&entries[a].key.len()));
 
@@ -501,8 +496,18 @@ fn extract_definitions_in_zone(
     let mut hits: Vec<KeyHit> = Vec::new();
     for ei in order {
         let key = &entries[ei].key;
+        let def_in = entries[ei].defined_in;
         for pos in find_standalone_positions(zone_bytes, key) {
             let end = pos + key.len();
+            let abs_pos = zone_offset + pos;
+            let abs_end = zone_offset + end;
+            // Évite l'auto-référence d'un concept Hop-2 à l'intérieur de sa propre clause
+            if let Some((ds, de)) = def_in
+                && abs_pos >= ds
+                && abs_end <= de
+            {
+                continue;
+            }
             if used[pos..end].iter().any(|&u| u) {
                 continue;
             }
@@ -521,14 +526,12 @@ fn extract_definitions_in_zone(
         return Vec::new();
     }
 
-    // 2. Analyse des intervalles entre hits consécutifs : connecteur interne vs frontière de définition
     let mut gaps: Vec<&[u8]> = Vec::with_capacity(hits.len() - 1);
     for w in hits.windows(2) {
         gaps.push(&zone_bytes[w[0].end..w[1].pos]);
     }
     let min_gap = gaps.iter().map(|g| g.len()).min().unwrap_or(0);
 
-    // Connecteur dominant : motif court (<= 8 octets) répété le plus souvent
     let mut dom_conn: Option<&[u8]> = None;
     let mut dom_count = 1usize;
     for &g in &gaps {
@@ -568,47 +571,26 @@ fn extract_definitions_in_zone(
     }
     clusters.push(cur);
 
-    // 3. Extrait les en-têtes bruts de chaque clause (préfixe ou suffixe)
     let first_pos = hits[clusters[0][0]].pos;
     let last_end = hits[*clusters.last().unwrap().last().unwrap()].end;
     let lead_len = trim_edge_ws(&zone_bytes[0..first_pos]).len();
     let trail_len = trim_edge_ws(&zone_bytes[last_end..]).len();
     let suffix_mode = trail_len >= 3 && lead_len < 3;
 
-    let mut raw_heads: Vec<&[u8]> = Vec::with_capacity(clusters.len());
-    let mut clause_spans: Vec<(usize, usize)> = Vec::with_capacity(clusters.len());
-
-    for (ci, cl) in clusters.iter().enumerate() {
-        let c_start = hits[cl[0]].pos;
-        let c_end = hits[*cl.last().unwrap()].end;
-        let prev_end = if ci == 0 {
-            0
-        } else {
-            hits[*clusters[ci - 1].last().unwrap()].end
-        };
-        let next_start = if ci + 1 == clusters.len() {
-            zone_bytes.len()
-        } else {
-            hits[clusters[ci + 1][0]].pos
-        };
-
-        if suffix_mode {
-            raw_heads.push(&zone_bytes[c_end..next_start]);
-            clause_spans.push((zone_offset + c_start, zone_offset + next_start));
-        } else {
-            raw_heads.push(&zone_bytes[prev_end..c_start]);
-            clause_spans.push((zone_offset + prev_end, zone_offset + c_end));
-        }
+    // Ne garde que les clusters qui référencent >= 2 causes distinctes avant le nettoyage d'affixes
+    struct ValidCluster<'a> {
+        raw_head: &'a [u8],
+        clause_span: (usize, usize),
+        mold_set: Vec<usize>,
+        hop_depth: usize,
+        ref_labels: Vec<Vec<u8>>,
     }
 
-    let clean_heads = strip_common_head_affixes(&raw_heads);
-
-    let mut out = Vec::new();
+    let mut valid: Vec<ValidCluster<'_>> = Vec::new();
     for (ci, cl) in clusters.iter().enumerate() {
         let mut mold_set: Vec<usize> = Vec::new();
         let mut max_child_hop = 1usize;
         let mut ref_labels: Vec<Vec<u8>> = Vec::new();
-
         for &hi in cl {
             let entry = &entries[hits[hi].entry_idx];
             if entry.hop > max_child_hop {
@@ -622,26 +604,67 @@ fn extract_definitions_in_zone(
             }
         }
         mold_set.sort_unstable();
+        if mold_set.len() < 2 {
+            continue;
+        }
 
-        // Une définition composée doit relier au moins 2 causes distinctes et porter un nom non vide
-        if mold_set.len() >= 2 && clean_heads[ci].len() >= 2 {
-            out.push(ComposedConcept {
-                name_bytes: clean_heads[ci].clone(),
-                clause_span: clause_spans[ci],
+        let c_start = hits[cl[0]].pos;
+        let c_end = hits[*cl.last().unwrap()].end;
+        let prev_end = if ci == 0 {
+            0
+        } else {
+            hits[*clusters[ci - 1].last().unwrap()].end
+        };
+        let next_start = if ci + 1 == clusters.len() {
+            zone_bytes.len()
+        } else {
+            hits[clusters[ci + 1][0]].pos
+        };
+
+        let (raw_head, clause_span) = if suffix_mode {
+            (
+                &zone_bytes[c_end..next_start],
+                (zone_offset + c_start, zone_offset + next_start),
+            )
+        } else {
+            (
+                &zone_bytes[prev_end..c_start],
+                (zone_offset + prev_end, zone_offset + c_end),
+            )
+        };
+
+        if trim_edge_ws(raw_head).len() >= 2 {
+            valid.push(ValidCluster {
+                raw_head,
+                clause_span,
                 mold_set,
                 hop_depth: max_child_hop + 1,
                 ref_labels,
             });
         }
     }
+
+    if valid.is_empty() {
+        return Vec::new();
+    }
+    let raw_heads: Vec<&[u8]> = valid.iter().map(|v| v.raw_head).collect();
+    let clean_heads = strip_common_head_affixes(&raw_heads);
+
+    let mut out = Vec::with_capacity(valid.len());
+    for (vc, name_bytes) in valid.into_iter().zip(clean_heads.into_iter()) {
+        if name_bytes.len() >= 2 {
+            out.push(ComposedConcept {
+                name_bytes,
+                clause_span: vc.clause_span,
+                mold_set: vc.mold_set,
+                hop_depth: vc.hop_depth,
+                ref_labels: vc.ref_labels,
+            });
+        }
+    }
     out
 }
 
-/// Analyse complète d'un flux continu multi-moules / multi-sauts :
-/// 1. Découverte connexionniste des régimes + démotion méta-langage
-/// 2. Identification de la cible (mono-cause ou composite par résidu / régime adjacent)
-/// 3. Projection Hop-1 vers les moules primitifs
-/// 4. Résolution récursive Hop-2 / Hop-3 sur les définitions composées de `perceived.eff`.
 pub fn analyze_multihop(graph: &PhiGraph, bytes: &[u8]) -> Option<MultiHopAnalysis> {
     let raw_regimes = discover_causal_regimes(graph, bytes, true);
     if raw_regimes.len() < 2 {
@@ -653,21 +676,21 @@ pub fn analyze_multihop(graph: &PhiGraph, bytes: &[u8]) -> Option<MultiHopAnalys
         return None;
     }
 
-    // 1. Regroupe les régimes finaux collés qui constituent une cible multi-causes
+    // 1. Regroupe les régimes finaux qui forment une cible multi-causes (couture <= 8 octets)
     let k = regimes.len();
     let mut split_t = k - 1;
-    while split_t >= 3 && (k - split_t) < 3 {
+    while split_t >= 3 && (k - split_t) < 4 {
         let cand_idx = split_t - 1;
         let gap_to_next = regimes[split_t]
             .core_start
             .saturating_sub(regimes[cand_idx].core_end);
-        if gap_to_next > 2 {
+        if gap_to_next > 8 {
             break;
         }
         let prev_end = regimes[cand_idx - 1].core_end;
         let gap_before = regimes[cand_idx].core_start.saturating_sub(prev_end);
-        // Un composant de cible est soit précédé d'un bloc définitionnel (>= 24 octets), soit collé (<= 2)
-        if gap_before > 2 && gap_before < 24 {
+        // Un composant de cible est soit après un bloc définitionnel (>= 20), soit collé (<= 8)
+        if gap_before > 8 && gap_before < 20 {
             break;
         }
         let earlier = &regimes[0..cand_idx];
@@ -679,7 +702,7 @@ pub fn analyze_multihop(graph: &PhiGraph, bytes: &[u8]) -> Option<MultiHopAnalys
         );
         let strong_match = proj
             .first()
-            .is_some_and(|m| m.score >= 0.65 && m.cos_sim >= 0.45);
+            .is_some_and(|m| m.score >= 0.62 && m.cos_sim >= 0.40);
         if strong_match {
             split_t = cand_idx;
         } else {
@@ -693,7 +716,28 @@ pub fn analyze_multihop(graph: &PhiGraph, bytes: &[u8]) -> Option<MultiHopAnalys
         .map(|r| (r.core_start, r.core_end))
         .collect();
 
-    // 2. Si la cible est un bloc unique, tente une décomposition multi-causes guidée par le résidu
+    // Fusionne deux fragments cibles adjacents s'ils relèvent de la même cause (sur-découpe)
+    if target_spans.len() >= 2 {
+        let mut merged_t: Vec<(usize, usize)> = vec![target_spans[0]];
+        for &(s, e) in &target_spans[1..] {
+            let prev = *merged_t.last().unwrap();
+            let h_prev = graph
+                .abduce(&graph.encode_bytes(&bytes[prev.0..prev.1]), None)
+                .final_state;
+            let h_cur = graph
+                .abduce(&graph.encode_bytes(&bytes[s..e]), None)
+                .final_state;
+            let ov = byte_overlap_ratio(&bytes[prev.0..prev.1], &bytes[s..e]);
+            if cosine_sim(&h_prev, &h_cur) > 0.72 && ov > 0.50 {
+                merged_t.last_mut().unwrap().1 = e;
+            } else {
+                merged_t.push((s, e));
+            }
+        }
+        target_spans = merged_t;
+    }
+
+    // 2. Si la cible est encore monolithique, tente une décomposition guidée par le résidu
     let mut residual_info: Option<(f32, f32, f32)> = None;
     if target_spans.len() == 1 {
         let (ts, te) = target_spans[0];
@@ -707,7 +751,6 @@ pub fn analyze_multihop(graph: &PhiGraph, bytes: &[u8]) -> Option<MultiHopAnalys
             residual_info = Some((dec.single_err, dec.split_err, dec.cross_cos));
         }
     } else if target_spans.len() >= 2 {
-        // Mesure informative du gain de résidu obtenu par la décomposition en causes multiples
         let (s0, e0) = target_spans[0];
         let (s1, e1) = target_spans[1];
         let full_err = graph
@@ -757,7 +800,7 @@ pub fn analyze_multihop(graph: &PhiGraph, bytes: &[u8]) -> Option<MultiHopAnalys
         def_zones.push((after_target, bytes.len()));
     }
 
-    // 5. Extraction des clés discriminantes de chaque moule + résolution Hop-2 / Hop-3
+    // 5. Extraction des clés discriminantes + résolution récursive Hop-2 / Hop-3
     let mut mold_keys: Vec<Option<Vec<u8>>> = Vec::with_capacity(mold_regimes.len());
     let mut entries: Vec<KeyEntry> = Vec::new();
     for i in 0..mold_regimes.len() {
@@ -767,6 +810,7 @@ pub fn analyze_multihop(graph: &PhiGraph, bytes: &[u8]) -> Option<MultiHopAnalys
                 key: k.clone(),
                 molds: vec![i],
                 hop: 1,
+                defined_in: None,
             });
         }
         mold_keys.push(key_opt);
@@ -774,13 +818,11 @@ pub fn analyze_multihop(graph: &PhiGraph, bytes: &[u8]) -> Option<MultiHopAnalys
 
     let mut all_concepts: Vec<ComposedConcept> = Vec::new();
     if entries.len() >= 2 {
-        // Passage Hop-2
         for &(ds, de) in &def_zones {
             let found = extract_definitions_in_zone(&bytes[ds..de], ds, &entries);
             all_concepts.extend(found);
         }
 
-        // Passage Hop-3 (méta-définitions qui composent un concept Hop-2 avec un autre concept/moule)
         if !all_concepts.is_empty() {
             let mut ext_entries = entries.clone();
             for c in &all_concepts {
@@ -791,6 +833,7 @@ pub fn analyze_multihop(graph: &PhiGraph, bytes: &[u8]) -> Option<MultiHopAnalys
                         key: c.name_bytes.clone(),
                         molds: c.mold_set.clone(),
                         hop: c.hop_depth,
+                        defined_in: Some(c.clause_span),
                     });
                 }
             }
@@ -811,7 +854,7 @@ pub fn analyze_multihop(graph: &PhiGraph, bytes: &[u8]) -> Option<MultiHopAnalys
         }
     }
 
-    // 6. Scoring compositionnel (Couverture x Précision) des concepts multi-sauts face aux causes cibles
+    // 6. Scoring compositionnel (Couverture x Précision)
     let m_count = mold_regimes.len();
     let mut res_mat: Vec<Vec<f32>> = vec![vec![0.0f32; m_count]; target_spans.len()];
     for (c_idx, matches) in hop1_per_part.iter().enumerate() {
@@ -863,7 +906,6 @@ pub fn analyze_multihop(graph: &PhiGraph, bytes: &[u8]) -> Option<MultiHopAnalys
     })
 }
 
-/// Raccourci pour vérifier si un bloc monolithique se décompose en 2 causes par le résidu.
 pub fn analyze_monolithic_residual(graph: &PhiGraph, bytes: &[u8]) -> ResidualSplit {
     let _ = SEARCH_STEPS;
     decompose_by_residual(graph, bytes)
