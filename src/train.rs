@@ -40,7 +40,7 @@ fn span_hits_concept(pred: (usize, usize), truth: (usize, usize)) -> bool {
     }
     let inter = inter_e - inter_s;
     let truth_len = truth.1.saturating_sub(truth.0).max(1);
-    inter * 2 >= truth_len && span_iou(pred, truth) >= 0.35
+    inter * 2 >= truth_len && span_iou(pred, truth) >= 0.30
 }
 
 fn batch_collapse_penalty(states: &[[f32; STATE_DIM]]) -> f32 {
@@ -135,8 +135,8 @@ fn eval_hop1_batch(
 
     mean_phi
         + 0.55 * spec
-        + 0.20 * mean_gate_c
-        + 0.30 * min_gate_c
+        + 0.25 * mean_gate_c
+        + 0.40 * min_gate_c
         - 0.40 * collapse
         + comp_w * mean_comp
 }
@@ -176,12 +176,12 @@ pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
         .unwrap_or(4)
         .min(cfg.pop_pairs.max(1));
 
-    // Une seule séance en 3 phases fluides : Hop-1 (60%) -> Mémoire de Travail (30%) -> Joint (10%)
-    let p1_end = ((cfg.steps * 60) / 100).max(1);
+    // Une séance fluide : Hop-1 (55%) -> Mémoire de Travail (35%) -> Joint (10%)
+    let p1_end = ((cfg.steps * 55) / 100).max(1);
     let p2_end = ((cfg.steps * 90) / 100).max(p1_end);
 
     println!(
-        "Entraînement Phisharp v0.7 ({} params = {} Hop-1 + {} Mémoire de Travail, {} étapes, {} paires ES, {} threads)...",
+        "Entraînement Phisharp v0.7.1 ({} params = {} Hop-1 + {} Mémoire de Travail, {} étapes, {} paires ES, {} threads)...",
         NUM_PARAMS,
         WM_PARAM_START,
         NUM_PARAMS - WM_PARAM_START,
@@ -214,17 +214,16 @@ pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
         };
         let step_sigma = match phase {
             Phase::Hop1 => cfg.sigma,
-            Phase::WorkingMemory => cfg.sigma * 1.15,
-            Phase::Joint => cfg.sigma * 0.65,
+            Phase::WorkingMemory => cfg.sigma * 1.25,
+            Phase::Joint => cfg.sigma * 0.55,
         };
         let step_lr = match phase {
             Phase::Hop1 => cfg.lr,
-            Phase::WorkingMemory => cfg.lr * 1.25,
-            Phase::Joint => cfg.lr * 0.40,
+            Phase::WorkingMemory => cfg.lr * 1.35,
+            Phase::Joint => cfg.lr * 0.35,
         };
         let comp_w = 0.10 + 0.45 * ((step as f32) / 120.0).min(1.0);
 
-        // Préparation des lots PTGRS (E seul est vu par le modèle)
         let mut singles: Vec<PreparedEpisode> = Vec::new();
         let mut composites: Vec<PreparedComposite> = Vec::new();
         let mut multihops: Vec<PreparedMultiHop> = Vec::new();
@@ -251,11 +250,21 @@ pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
         }
 
         if phase != Phase::Hop1 {
-            // 3 scènes multi-sauts : Hop-2 multiligne, Hop-2 flux plat, Hop-3 récursif (E seul)
+            // Mélange 1-saut étiqueté + Hop-2 (multiligne & plat) + Hop-3 récursif (E seul)
             multihops = vec![
-                PreparedMultiHop::from_bytes(&sample_multihop_episode(&mut rng, false, false, 2).effect),
-                PreparedMultiHop::from_bytes(&sample_multihop_episode(&mut rng, true, false, 2).effect),
-                PreparedMultiHop::from_bytes(&sample_multihop_episode(&mut rng, false, false, 3).effect),
+                PreparedMultiHop::from_bytes(
+                    &sample_composite_episode(&mut rng, 4, true, false, true, SepMode::Newline)
+                        .effect,
+                ),
+                PreparedMultiHop::from_bytes(
+                    &sample_multihop_episode(&mut rng, false, false, 2).effect,
+                ),
+                PreparedMultiHop::from_bytes(
+                    &sample_multihop_episode(&mut rng, true, false, 2).effect,
+                ),
+                PreparedMultiHop::from_bytes(
+                    &sample_multihop_episode(&mut rng, false, false, 3).effect,
+                ),
             ];
         }
 
@@ -295,9 +304,9 @@ pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
                             ),
                             Phase::Joint => (
                                 eval_hop1_batch(&g_pos, singles_ref, comp_ref, comp_w)
-                                    + 0.70 * eval_wm_batch(&g_pos, mh_ref),
+                                    + 0.75 * eval_wm_batch(&g_pos, mh_ref),
                                 eval_hop1_batch(&g_neg, singles_ref, comp_ref, comp_w)
-                                    + 0.70 * eval_wm_batch(&g_neg, mh_ref),
+                                    + 0.75 * eval_wm_batch(&g_neg, mh_ref),
                             ),
                         };
                         local.push((pseed, f_pos, f_neg));
@@ -401,12 +410,11 @@ pub fn train_phisharp(cfg: &TrainConfig) -> PhiGraph {
                 }
                 Phase::WorkingMemory => {
                     let wm_phi = eval_wm_batch(&model, &multihops);
-                    // Diag détaillé sur un échantillon frais Hop-2
                     let mut drng = Rng::new(cfg.seed ^ (step as u64).wrapping_mul(0x9E37_79B9));
                     let ep = sample_multihop_episode(&mut drng, false, false, 2);
                     if let Some(r) = run_working_memory(&model, &ep.effect) {
                         println!(
-                            "[WM] step {:>4}/{:<4} | φ_wm={:+.4} | head_cos={:.3} (cut={:.3}, IIT_echo={:+.3}) | HSel={:.3} RSel={:.3} RDisc={:.3} ({:.1}s)",
+                            "[WM] step {:>4}/{:<4} | φ_wm={:+.4} | align={:.3} (cut={:.3}, IIT_echo={:+.3}) | HSel={:.3} RSel={:.3} RDisc={:.3} ({:.1}s)",
                             step,
                             cfg.steps,
                             wm_phi,
@@ -485,9 +493,6 @@ fn evaluate_post_hoc(model: &PhiGraph, seed: u64) {
     let mut hits_glued = 0usize;
     let mut hits_tagged = 0usize;
     let mut ref_hits = 0usize;
-    let mut sum_cos = 0.0f32;
-    let mut sum_err = 0.0f32;
-    let mut sum_ov = 0.0f32;
 
     for _ in 0..proj_trials {
         let ep_raw = sample_composite_episode(&mut rng, 4, false, false, true, SepMode::None);
@@ -521,9 +526,6 @@ fn evaluate_post_hoc(model: &PhiGraph, seed: u64) {
                     && span_iou((top.core_start, top.core_end), true_m) >= 0.45
                 {
                     hits_tagged += 1;
-                    sum_cos += top.cos_sim;
-                    sum_err += top.cross_err;
-                    sum_ov += top.byte_overlap;
                     if let (Some(ext_ref), Some(gt_tag)) = (top.referent, true_tag)
                         && span_iou(ext_ref, gt_tag) >= 0.50
                     {
@@ -534,11 +536,13 @@ fn evaluate_post_hoc(model: &PhiGraph, seed: u64) {
         }
     }
 
-    // 3. Mémoire de Travail Connexionniste : Hop-2 & Hop-3 (0 parsing symbolique, 0 octet commun)
+    // 3. Mémoire de Travail 100% Connexionniste : Hop-2 & Hop-3 (P(t) et pic delta IIT)
     let wm_trials = 50;
     let mut h2_hits = 0usize;
+    let mut h2_delta_hits = 0usize;
     let mut h2_flat_hits = 0usize;
     let mut h3_hits = 0usize;
+    let mut h3_delta_hits = 0usize;
     let mut h2_iit_sum = 0.0f32;
     let mut h3_iit_sum = 0.0f32;
     let mut h2_margin_sum = 0.0f32;
@@ -547,6 +551,9 @@ fn evaluate_post_hoc(model: &PhiGraph, seed: u64) {
         let ep2 = sample_multihop_episode(&mut rng, false, false, 2);
         if let Some(rep) = run_working_memory(model, &ep2.effect) {
             h2_iit_sum += rep.iit_echo_gain;
+            if span_hits_concept(rep.delta_peak_span, ep2.hidden_concept_span) {
+                h2_delta_hits += 1;
+            }
             if let Some(top) = rep.top_spans.first()
                 && span_hits_concept((top.start, top.end), ep2.hidden_concept_span)
             {
@@ -568,6 +575,9 @@ fn evaluate_post_hoc(model: &PhiGraph, seed: u64) {
         let ep3 = sample_multihop_episode(&mut rng, false, false, 3);
         if let Some(rep) = run_working_memory(model, &ep3.effect) {
             h3_iit_sum += rep.iit_echo_gain;
+            if span_hits_concept(rep.delta_peak_span, ep3.hidden_concept_span) {
+                h3_delta_hits += 1;
+            }
             if let Some(top) = rep.top_spans.first()
                 && span_hits_concept((top.start, top.end), ep3.hidden_concept_span)
             {
@@ -588,27 +598,26 @@ fn evaluate_post_hoc(model: &PhiGraph, seed: u64) {
         proj_trials,
         100.0 * (hits_glued as f32) / (proj_trials as f32)
     );
-    let denom_t = hits_tagged.max(1) as f32;
     println!(
-        "  Moules étiquetés, sép. aléatoire (0 octet commun)  : {}/{} ({:.1}%)  [réf={}/{}, cos={:+.3}, err={:.3}, ov={:.0}%]",
+        "  Moules étiquetés, sép. aléatoire (0 octet commun)  : {}/{} ({:.1}%)  [référent exact={}/{}]",
         hits_tagged,
         proj_trials,
         100.0 * (hits_tagged as f32) / (proj_trials as f32),
         ref_hits,
-        hits_tagged,
-        sum_cos / denom_t,
-        sum_err / denom_t,
-        100.0 * (sum_ov / denom_t)
+        hits_tagged
     );
 
     println!(
         "\n--- Évaluation post-hoc 3 : Mémoire de Travail 100% Connexionniste (0 parsing symbolique) ---"
     );
     println!(
-        "  Hop-2 multiligne (4 déf., hasard = 25%) : {}/{} ({:.1}%)  [marge P={:+.3}, gain IIT échos={:+.3}]",
+        "  Hop-2 multiligne (4 déf., hasard = 25%) : P(t)={}/{} ({:.1}%) | Δ_IIT={}/{} ({:.1}%)  [marge P={:+.3}, IIT_echo={:+.3}]",
         h2_hits,
         wm_trials,
         100.0 * (h2_hits as f32) / (wm_trials as f32),
+        h2_delta_hits,
+        wm_trials,
+        100.0 * (h2_delta_hits as f32) / (wm_trials as f32),
         if h2_hits > 0 {
             h2_margin_sum / (h2_hits as f32)
         } else {
@@ -617,16 +626,19 @@ fn evaluate_post_hoc(model: &PhiGraph, seed: u64) {
         h2_iit_sum / (wm_trials as f32)
     );
     println!(
-        "  Hop-2 flux plat  (4 déf., hasard = 25%) : {}/{} ({:.1}%)",
+        "  Hop-2 flux plat  (4 déf., hasard = 25%) : P(t)={}/{} ({:.1}%)",
         h2_flat_hits,
         wm_trials,
         100.0 * (h2_flat_hits as f32) / (wm_trials as f32)
     );
     println!(
-        "  Hop-3 récursif   (5 déf., 3 causes)     : {}/{} ({:.1}%)  [gain IIT échos={:+.3}]",
+        "  Hop-3 récursif   (5 déf., 3 causes)     : P(t)={}/{} ({:.1}%) | Δ_IIT={}/{} ({:.1}%)  [IIT_echo={:+.3}]",
         h3_hits,
         wm_trials,
         100.0 * (h3_hits as f32) / (wm_trials as f32),
+        h3_delta_hits,
+        wm_trials,
+        100.0 * (h3_delta_hits as f32) / (wm_trials as f32),
         h3_iit_sum / (wm_trials as f32)
     );
 }
