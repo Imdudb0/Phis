@@ -1,13 +1,14 @@
 mod graph;
+mod multihop;
 mod phi;
 mod ptgrs;
 mod rng;
 mod train;
 
 use crate::graph::PhiGraph;
+use crate::multihop::{MultiHopAnalysis, analyze_monolithic_residual, analyze_multihop};
 use crate::phi::{
-    WmReport, compute_composite_phi, compute_phi_sharp, extract_abductive_core, fnv_hash,
-    format_partition, run_working_memory,
+    compute_composite_phi, compute_phi_sharp, extract_abductive_core, fnv_hash, format_partition,
 };
 use crate::ptgrs::{
     CauseFamily, SepMode, sample_composite_episode, sample_episode, sample_multihop_episode,
@@ -20,9 +21,9 @@ use std::process;
 
 fn usage() -> ! {
     eprintln!("Usage:");
-    eprintln!("  phisharp train --out out/sharp.phis [--steps 450] [--seed 42]");
+    eprintln!("  phisharp train --out out/sharp.phis [--steps 300] [--seed 42]");
     eprintln!(
-        "  phisharp sample --out perceived.eff [--family periodic|symmetric|nested|shared|substitution|grammar|composite|stream|multihop|multihop_flat|hop3] [--seed 7]"
+        "  phisharp sample --out perceived.eff [--family periodic|symmetric|nested|shared|substitution|grammar|composite|stream|multihop|multihop_flat] [--seed 7]"
     );
     eprintln!("  phisharp ask --model out/sharp.phis --file perceived.eff");
     process::exit(1);
@@ -78,7 +79,7 @@ fn main() {
             let out_path = arg_val(&args, "--out").unwrap_or_else(|| "out/sharp.phis".to_string());
             let steps = arg_val(&args, "--steps")
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(450);
+                .unwrap_or(300);
             let seed = arg_val(&args, "--seed")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(42);
@@ -139,29 +140,21 @@ fn main() {
                     println!("  FLUX : {}", printable_preview(&ep.effect));
                     return;
                 }
-                Some("multihop") | Some("multihop_flat") | Some("hop3") => {
-                    let fam = arg_val(&args, "--family").unwrap();
-                    let flat = fam == "multihop_flat";
-                    let hops = if fam == "hop3" { 3 } else { 2 };
-                    let ep = sample_multihop_episode(&mut rng, flat, true, hops);
+                Some("multihop") | Some("multihop_flat") => {
+                    let flat = arg_val(&args, "--family").as_deref() == Some("multihop_flat");
+                    let ep = sample_multihop_episode(&mut rng, flat, true);
                     if let Err(e) = fs::write(&out_path, &ep.effect) {
                         eprintln!("Erreur écriture '{}': {}", out_path, e);
                         process::exit(1);
                     }
-                    let causes_str = ep
-                        .hidden_causes
-                        .iter()
-                        .map(|c| c.name())
-                        .collect::<Vec<_>>()
-                        .join(" + ");
                     println!(
-                        "Scène Hop-{}{} générée dans '{}' ({} octets, concept caché = {} [{}])",
-                        hops,
+                        "Scène multi-sauts{} générée dans '{}' ({} octets, concept caché = {} [{} + {}])",
                         if flat { " (flux plat)" } else { "" },
                         out_path,
                         ep.effect.len(),
                         printable_preview(&ep.hidden_concept_name),
-                        causes_str
+                        ep.hidden_cause_pair.0.name(),
+                        ep.hidden_cause_pair.1.name(),
                     );
                     println!(
                         "  Moules : {}",
@@ -180,7 +173,7 @@ fn main() {
             let family = match arg_val(&args, "--family") {
                 Some(name) => CauseFamily::from_name(&name).unwrap_or_else(|| {
                     eprintln!(
-                        "Famille inconnue '{}'. Choix: periodic, symmetric, nested, shared, substitution, grammar, composite, stream, multihop, multihop_flat, hop3.",
+                        "Famille inconnue '{}'. Choix: periodic, symmetric, nested, shared, substitution, grammar, composite, stream, multihop, multihop_flat.",
                         name
                     );
                     process::exit(1);
@@ -218,8 +211,8 @@ fn main() {
                 process::exit(1);
             }
 
-            if let Some(wm) = run_working_memory(&model, &bytes) {
-                run_ask_wm(&model, &file_path, &bytes, &wm);
+            if let Some(ana) = analyze_multihop(&model, &bytes) {
+                run_ask_continuous(&model, &file_path, &bytes, &ana);
             } else {
                 run_ask_monolithic(&model, &file_path, &bytes);
             }
@@ -233,6 +226,7 @@ fn run_ask_monolithic(model: &PhiGraph, file_path: &str, bytes: &[u8]) {
     let mut rng = Rng::new(fnv_hash(bytes));
     let rep = compute_phi_sharp(model, bytes, &mut rng, true);
     let rels = model.encode_bytes(bytes);
+    let res_split = analyze_monolithic_residual(model, bytes);
 
     println!("=== PHISHARP ABDUCTION REPORT (v0.7 — Monolithique) ===");
     println!("Effet (E)       : '{}' ({} octets)", file_path, bytes.len());
@@ -271,6 +265,22 @@ fn run_ask_monolithic(model: &PhiGraph, file_path: &str, bytes: &[u8]) {
         traj_str, rep.traj_gain, rep.bounce_pen
     );
 
+    if res_split.parts.len() >= 2 {
+        println!(
+            "\nDécomposition multi-causes induite par le résidu (res {:.4} -> {:.4}, cos={:+.3}) :",
+            res_split.single_err, res_split.split_err, res_split.cross_cos
+        );
+        for (i, &(a, b)) in res_split.parts.iter().enumerate() {
+            println!(
+                "  cause #{} ({}..{}) : \"{}\"",
+                i + 1,
+                a,
+                b,
+                printable_preview(&bytes[a..b])
+            );
+        }
+    }
+
     let (start, motif, err_all) =
         extract_abductive_core(model, bytes, &rels, &rep.trace.final_state);
     println!(
@@ -304,50 +314,53 @@ fn run_ask_monolithic(model: &PhiGraph, file_path: &str, bytes: &[u8]) {
     }
 }
 
-fn run_ask_wm(model: &PhiGraph, file_path: &str, bytes: &[u8], wm: &WmReport) {
+fn run_ask_continuous(
+    model: &PhiGraph,
+    file_path: &str,
+    bytes: &[u8],
+    ana: &MultiHopAnalysis,
+) {
     let comp = compute_composite_phi(model, bytes);
+    let mode = if !ana.concepts.is_empty() {
+        "Champ Référentiel Connexionniste"
+    } else {
+        "Flux Continu Auto-Segmenté"
+    };
 
-    println!("=== PHISHARP ABDUCTION REPORT (v0.7 — Mémoire de Travail 100% Connexionniste) ===");
+    println!("=== PHISHARP ABDUCTION REPORT (v0.7 — {}) ===", mode);
     println!(
-        "Effet (E)       : '{}' ({} octets, contexte 0..{}, {} moules, {} cause(s) agrégée(s) en Z_Q)",
+        "Effet (E)       : '{}' ({} octets, {} moules + {} cause(s) cible, {} crête(s) réf., {} méta-bloc(s) démote)",
         file_path,
         bytes.len(),
-        wm.context_end,
-        wm.molds_count,
-        wm.target_causes
+        ana.mold_regimes.len(),
+        ana.target_spans.len(),
+        ana.concepts.len(),
+        ana.demoted_meta_count
     );
     println!(
-        "φ_wm (mémoire)  : {:+.4}  [cos_tête={:.3}, coupe_échos={:.3}, gain IIT échos={:+.3}]",
-        wm.wm_phi, wm.head_cos, wm.head_cos_cut, wm.iit_echo_gain
+        "Cohérence scène : sélectivité={:.4} (R_top={:.3} vs R_rest={:.3}, paire [{}]<->[{}])",
+        comp.selectivity, comp.r_top, comp.r_rest, comp.top_pair.0, comp.top_pair.1
     );
-    println!(
-        "Sélectivité WM  : HSel={:.3} | RSel={:.3} | RDisc={:.3}  (scène: sélec={:.3}, paire [{}]<->[{}])",
-        wm.head_sel, wm.readout_sel, wm.readout_disc, comp.selectivity, comp.top_pair.0, comp.top_pair.1
-    );
-
-    println!("\nMoules primitifs injectés dans Z^(0) :");
-    for (idx, reg) in wm.mold_regimes.iter().enumerate() {
-        let ref_txt = reg
-            .referent
-            .map(|(rs, re)| format!(" | réf=\"{}\"", printable_preview(trim_ctrl(&bytes[rs..re]))))
-            .unwrap_or_default();
+    if !ana.concepts.is_empty() {
         println!(
-            "  [{}] ({}..{}, gate={:.2}) \"{}\"{}",
-            idx,
-            reg.core_start,
-            reg.core_end,
-            reg.mean_gate,
-            printable_preview(&bytes[reg.core_start..reg.core_end]),
-            ref_txt
+            "Champ réf.      : pic={:.4}, sélectivité={:.4}",
+            ana.field_peak, ana.field_selectivity
         );
     }
 
-    for (ci, &(ts, te)) in wm.target_spans.iter().enumerate() {
+    if let Some((e_single, e_split, c_lr)) = ana.residual_info {
+        println!(
+            "Résidu cible    : décomposition multi-causes validée (res {:.4} -> {:.4}, cos inter-causes={:+.3})",
+            e_single, e_split, c_lr
+        );
+    }
+
+    for (ci, &(ts, te)) in ana.target_spans.iter().enumerate() {
         let q_bytes = &bytes[ts..te];
         let mut rng = Rng::new(fnv_hash(q_bytes));
         let q_rep = compute_phi_sharp(model, q_bytes, &mut rng, true);
         println!(
-            "\nRégime cible #{} ({}..{}) | φ={:+.4} [Gen={:.3} Disc={:.3} Proj={:.3} IIT={:.3} res={:.4}] :",
+            "\nCause cible #{} (octets {}..{}) | φ={:+.4} [Gen={:.3} Disc={:.3} Proj={:.3} IIT={:.3} res={:.4}] :",
             ci + 1,
             ts,
             te,
@@ -359,35 +372,87 @@ fn run_ask_wm(model: &PhiGraph, file_path: &str, bytes: &[u8], wm: &WmReport) {
             q_rep.residual
         );
         println!("  \"{}\"", printable_preview(q_bytes));
+
+        let matches = &ana.hop1_per_part[ci];
+        let show_n = if !ana.concepts.is_empty() {
+            2.min(matches.len())
+        } else {
+            matches.len()
+        };
+        for (rank, m) in matches.iter().take(show_n).enumerate() {
+            println!(
+                "    Hop-1 #{} moule [{}] | résonance={:.4} | err={:.4} | cos={:+.3} | octets_communs={:.0}%",
+                rank + 1,
+                m.dst_idx,
+                m.score,
+                m.cross_err,
+                m.cos_sim,
+                m.byte_overlap * 100.0
+            );
+            println!(
+                "       noyau : \"{}\"",
+                printable_preview(&bytes[m.core_start..m.core_end])
+            );
+            if let Some((rs, re)) = m.referent {
+                println!(
+                    "       réf.  : \"{}\"",
+                    printable_preview(trim_ctrl(&bytes[rs..re]))
+                );
+            }
+        }
     }
 
-    println!("\nChamp continu de lecture P(t) sur le contexte (zéro parsing symbolique) :");
-    for (rank, sp) in wm.top_spans.iter().enumerate() {
-        println!(
-            "  #{} ({:>3}..{:<3}) | P_pic={:.4} (moy={:.3}) | cos(Z,Zq)={:+.3} | ||Z||={:.2} | g={:.2} | écho={:.2} | \"{}\"",
-            rank + 1,
-            sp.start,
-            sp.end,
-            sp.peak_p,
-            sp.mean_p,
-            sp.mean_cos,
-            sp.mean_norm,
-            sp.mean_gate,
-            sp.mean_back_echo,
-            printable_preview(trim_ctrl(&bytes[sp.start..sp.end]))
-        );
+    if !ana.concepts.is_empty() {
+        println!("\nCrêtes du Champ Référentiel Connexionniste (zéro parsing symbolique) :");
+        for (rank, c) in ana.concepts.iter().enumerate() {
+            println!(
+                "  #{} [Hop-{}] \"{}\" ({}..{}) | φ_ref={:.4} (couv={:.3}, préc={:.3}, masse={:.2})",
+                rank + 1,
+                c.hop_depth,
+                printable_preview(trim_ctrl(&c.name_bytes)),
+                c.span.0,
+                c.span.1,
+                c.score,
+                c.coverage,
+                c.precision,
+                c.mass
+            );
+        }
     }
 
-    if let Some(best) = wm.top_spans.first() {
-        let margin = wm
-            .top_spans
+    let best_hop1 = ana.hop1_per_part.first().and_then(|v| v.first());
+    let best_ref = ana.concepts.first();
+
+    let use_multihop = match (best_ref, best_hop1) {
+        (Some(c), Some(h1)) => ana.target_spans.len() >= 2 || c.score > h1.score,
+        (Some(_), None) => true,
+        _ => false,
+    };
+
+    if use_multihop && let Some(c) = best_ref {
+        let margin = ana
+            .concepts
             .get(1)
-            .map(|sec| best.peak_p - sec.peak_p)
-            .unwrap_or(best.peak_p);
+            .map(|s| c.score - s.score)
+            .unwrap_or(c.score);
         println!(
-            "\nExplication projetée (champ neuronal P(t), alphabet de E, marge={:+.4}) :",
+            "\nExplication projetée (Champ Réf. Hop-{}, alphabet de E, marge={:+.4}) :",
+            c.hop_depth, margin
+        );
+        println!("  {}", printable_preview(trim_ctrl(&c.name_bytes)));
+    } else if let Some(best) = best_hop1 {
+        let margin = ana.hop1_per_part[0]
+            .get(1)
+            .map(|s| best.score - s.score)
+            .unwrap_or(best.score);
+        let out_slice = match best.referent {
+            Some((rs, re)) => trim_ctrl(&bytes[rs..re]),
+            None => &bytes[best.core_start..best.core_end],
+        };
+        println!(
+            "\nExplication projetée (Hop-1, alphabet de E, marge={:+.4}) :",
             margin
         );
-        println!("  {}", printable_preview(trim_ctrl(&bytes[best.start..best.end])));
+        println!("  {}", printable_preview(out_slice));
     }
 }
