@@ -23,7 +23,6 @@ pub struct PreparedEpisode {
     pub cuts: [u8; 6],
 }
 
-/// Flux continu brut : aucun découpage préalable sur `\n` ou autre délimiteur.
 #[derive(Clone, Debug)]
 pub struct PreparedComposite {
     pub stream: RawSubstrate,
@@ -185,6 +184,57 @@ fn byte_overlap_ratio(a: &[u8], b: &[u8]) -> f32 {
     (shared as f32) / (a.len() as f32)
 }
 
+/// Discontinuité de connectivité relationnelle `d_cut(p) ∈ [0, 1]` :
+/// vaut ~0 à l'intérieur d'un régime cohérent (arêtes supportées traversant `p`)
+/// et ~1 exactement sur la couture entre deux régimes collés sans séparateur.
+fn cut_discontinuity(sub: &RawSubstrate, s: usize, e: usize, p: usize) -> f32 {
+    let l_lo = p.saturating_sub(10).max(s);
+    let r_hi = (p + 10).min(e);
+    if p <= l_lo || r_hi <= p {
+        return 0.0;
+    }
+
+    let mut l_cross = 0usize;
+    for t in l_lo..p {
+        let mut has_cross = false;
+        for idx in sub.offsets[t]..sub.offsets[t + 1] {
+            let j = sub.edge_targets[idx] as usize;
+            if j >= p && j < e {
+                let f = &sub.edges[idx];
+                if f[0] + f[1] + f[4] + f[5] >= 1.0 {
+                    has_cross = true;
+                    break;
+                }
+            }
+        }
+        if has_cross {
+            l_cross += 1;
+        }
+    }
+
+    let mut r_cross = 0usize;
+    for t in p..r_hi {
+        let mut has_cross = false;
+        for idx in sub.offsets[t]..sub.offsets[t + 1] {
+            let j = sub.edge_targets[idx] as usize;
+            if j >= s && j < p {
+                let f = &sub.edges[idx];
+                if f[0] + f[1] + f[4] + f[5] >= 1.0 {
+                    has_cross = true;
+                    break;
+                }
+            }
+        }
+        if has_cross {
+            r_cross += 1;
+        }
+    }
+
+    let f_left = (l_cross as f32) / ((p - l_lo) as f32);
+    let f_right = (r_cross as f32) / ((r_hi - p) as f32);
+    (1.0 - 0.5 * (f_left + f_right)).clamp(0.0, 1.0)
+}
+
 fn abductive_discontinuity(
     graph: &PhiGraph,
     rels: &[[f32; REL_DIM]],
@@ -209,17 +259,17 @@ fn abductive_discontinuity(
     0.55 * state_disc + 0.45 * err_disc
 }
 
-/// Scinde un îlot actif continu aux transitions de régime causal par discontinuité abductive D(t),
-/// sans aucun séparateur codé en dur.
+/// Scinde un îlot actif continu aux transitions de régime causal (discontinuité abductive + couture).
 fn split_run_by_abduction(
     graph: &PhiGraph,
+    sub: &RawSubstrate,
     rels: &[[f32; REL_DIM]],
     s: usize,
     e: usize,
     exact: bool,
 ) -> Vec<(usize, usize)> {
     let len = e.saturating_sub(s);
-    if len < 34 {
+    if len < 32 {
         return vec![(s, e)];
     }
 
@@ -238,7 +288,6 @@ fn split_run_by_abduction(
         return vec![(s, e)];
     }
 
-    // Une seule abduction par fenêtre ancrée : chaque point de coupe compare fenêtre k et fenêtre k + offset.
     let traces: Vec<AbductionTrace> = anchors
         .iter()
         .map(|&a| graph.abduce_with_steps(&rels[a..a + win], None, steps))
@@ -246,8 +295,8 @@ fn split_run_by_abduction(
 
     let mut candidates: Vec<(usize, f32)> = Vec::new();
     for k in 0..(anchors.len() - offset) {
-        let split_p = anchors[k] + win;
-        if split_p < s + 14 || e.saturating_sub(split_p) < 14 {
+        let grid_p = anchors[k] + win;
+        if grid_p < s + 12 || e.saturating_sub(grid_p) < 12 {
             continue;
         }
         let hl = &traces[k];
@@ -261,28 +310,47 @@ fn split_run_by_abduction(
         let self_e = 0.5 * (hl.final_mean_err + hr.final_mean_err);
         let cross_e = 0.5 * (e_lr + e_rl);
         let err_disc = ((cross_e - self_e) / (cross_e + 0.08)).clamp(0.0, 1.0);
-        let disc = 0.55 * state_disc + 0.45 * err_disc;
-        candidates.push((split_p, disc));
+        let d_abd = 0.55 * state_disc + 0.45 * err_disc;
+
+        // Recherche du pic exact de couture dans le demi-pas autour de grid_p
+        let p_lo = grid_p.saturating_sub(step / 2).max(s + 12);
+        let p_hi = (grid_p + step / 2).min(e.saturating_sub(12));
+        let mut best_p = grid_p;
+        let mut best_cut = -1.0f32;
+        for cp in p_lo..=p_hi {
+            let c = cut_discontinuity(sub, s, e, cp);
+            if c > best_cut {
+                best_cut = c;
+                best_p = cp;
+            }
+        }
+
+        let mut score = 0.45 * d_abd + 0.55 * best_cut;
+        // Même si deux régimes collés partagent la même cause sur alphabets disjoints (d_abd faible),
+        // une couture franche (best_cut >= 0.85) déclenche la séparation.
+        if best_cut >= 0.85 {
+            score = score.max(0.75 * best_cut);
+        }
+        candidates.push((best_p, score));
     }
 
-    // Sélection des pics locaux de discontinuité > 0.36 espacés d'au moins 14 octets
     let mut peaks: Vec<(usize, f32)> = Vec::new();
     for i in 0..candidates.len() {
-        let (p, d) = candidates[i];
-        if d <= 0.36 {
+        let (p, sc) = candidates[i];
+        if sc <= 0.52 {
             continue;
         }
-        let left_ok = i == 0 || d >= candidates[i - 1].1;
-        let right_ok = i + 1 == candidates.len() || d >= candidates[i + 1].1;
+        let left_ok = i == 0 || sc >= candidates[i - 1].1;
+        let right_ok = i + 1 == candidates.len() || sc >= candidates[i + 1].1;
         if left_ok && right_ok {
-            peaks.push((p, d));
+            peaks.push((p, sc));
         }
     }
     peaks.sort_by(|a, b| b.1.total_cmp(&a.1));
 
     let mut chosen: Vec<usize> = Vec::new();
     for (p, _) in peaks {
-        if chosen.iter().all(|&c| c.abs_diff(p) >= 14) {
+        if chosen.iter().all(|&c| c.abs_diff(p) >= 16) {
             chosen.push(p);
         }
     }
@@ -291,19 +359,27 @@ fn split_run_by_abduction(
     }
     chosen.sort_unstable();
 
-    // En mode `ask` (exact), raffine chaque frontière à l'octet près dans [p-3..=p+3]
+    // En mode `ask`, affine chaque couture à l'octet près dans [p-3..=p+3]
     if exact {
         for p in &mut chosen {
             let mut best_p = *p;
-            let mut best_d = f32::NEG_INFINITY;
+            let mut best_sc = f32::NEG_INFINITY;
             let lo = (*p).saturating_sub(3).max(s + 12);
             let hi = (*p + 3).min(e.saturating_sub(12));
             for cand in lo..=hi {
                 let l_start = cand.saturating_sub(16).max(s);
                 let r_end = (cand + 16).min(e);
-                let d = abductive_discontinuity(graph, rels, (l_start, cand), (cand, r_end), SEARCH_STEPS);
-                if d > best_d {
-                    best_d = d;
+                let d_abd = abductive_discontinuity(
+                    graph,
+                    rels,
+                    (l_start, cand),
+                    (cand, r_end),
+                    SEARCH_STEPS,
+                );
+                let d_cut = cut_discontinuity(sub, s, e, cand);
+                let sc = 0.35 * d_abd + 0.65 * d_cut;
+                if sc > best_sc {
+                    best_sc = sc;
                     best_p = cand;
                 }
             }
@@ -314,7 +390,7 @@ fn split_run_by_abduction(
     let mut segs = Vec::with_capacity(chosen.len() + 1);
     let mut cur = s;
     for p in chosen {
-        if p >= cur + 10 && e >= p + 10 {
+        if p >= cur + 12 && e >= p + 12 {
             segs.push((cur, p));
             cur = p;
         }
@@ -327,8 +403,10 @@ fn split_run_by_abduction(
 /// d'octets brut continu : zéro `\n`, zéro séparateur, 100% piloté par `PhiGraph`.
 pub fn discover_causal_regimes_from_encoded(
     graph: &PhiGraph,
+    sub: &RawSubstrate,
     rels: &[[f32; REL_DIM]],
-    gates: &[f32],
+    gates_ctx: &[f32],
+    gates_pt: &[f32],
     exact: bool,
 ) -> Vec<DiscoveredRegime> {
     let n = rels.len();
@@ -336,7 +414,7 @@ pub fn discover_causal_regimes_from_encoded(
         let mg = if n == 0 {
             0.0
         } else {
-            gates.iter().sum::<f32>() / (n as f32)
+            gates_ctx.iter().sum::<f32>() / (n as f32)
         };
         return vec![DiscoveredRegime {
             core_start: 0,
@@ -346,21 +424,12 @@ pub fn discover_causal_regimes_from_encoded(
         }];
     }
 
-    // Lissage minimal (rayon 1) pour éviter les micro-coupures d'un octet
-    let mut smooth = vec![0.0f32; n];
-    for t in 0..n {
-        let lo = t.saturating_sub(1);
-        let hi = (t + 1).min(n - 1);
-        let sum: f32 = gates[lo..=hi].iter().sum();
-        smooth[t] = sum / ((hi - lo + 1) as f32);
-    }
-
-    // 1. Îlots actifs issus de la porte causale neuronale g(t)
+    // 1. Îlots actifs issus de la porte causale contextuelle (±2)
     let mut raw_runs: Vec<(usize, usize)> = Vec::new();
     let mut in_run = false;
     let mut run_start = 0usize;
     for t in 0..n {
-        if smooth[t] >= 0.45 {
+        if gates_ctx[t] >= 0.38 {
             if !in_run {
                 in_run = true;
                 run_start = t;
@@ -374,26 +443,28 @@ pub fn discover_causal_regimes_from_encoded(
         raw_runs.push((run_start, n));
     }
 
-    // Fusionne les micro-trous <= 3 octets (ponts uniques internes à un moule)
+    // Fusionne les micro-trous de 1 octet librement, et de 2..=3 octets seulement entre deux îlots >= 8
+    // (ponts dans Grammar sans jamais recoller un mini-blip d'étiquette comme "RAMMAR" via ": ").
     let mut merged: Vec<(usize, usize)> = Vec::new();
     for (s, e) in raw_runs {
-        if let Some(last) = merged.last_mut()
-            && s.saturating_sub(last.1) <= 3
-        {
-            last.1 = e;
-            continue;
+        if let Some(last) = merged.last_mut() {
+            let gap = s.saturating_sub(last.1);
+            let both_solid = last.1.saturating_sub(last.0) >= 8 && e.saturating_sub(s) >= 8;
+            if gap <= 1 || (gap <= 3 && both_solid) {
+                last.1 = e;
+                continue;
+            }
         }
         merged.push((s, e));
     }
 
-    // Élimine les micro-blips accidentels < 10 octets (ex: mini-palindrome dans une étiquette)
-    let active_runs: Vec<(usize, usize)> = merged
+    let mut active_runs: Vec<(usize, usize)> = merged
         .into_iter()
         .filter(|&(s, e)| e.saturating_sub(s) >= 10)
         .collect();
 
     if active_runs.is_empty() {
-        let mg = gates.iter().sum::<f32>() / (n as f32);
+        let mg = gates_ctx.iter().sum::<f32>() / (n as f32);
         return vec![DiscoveredRegime {
             core_start: 0,
             core_end: n,
@@ -402,14 +473,51 @@ pub fn discover_causal_regimes_from_encoded(
         }];
     }
 
-    // 2. Scinde les îlots qui contiennent plusieurs régimes causaux collés via D(t)
+    // 2. Calage fin des bords par hystérésis sur la porte ponctuelle `gates_pt`
+    for i in 0..active_runs.len() {
+        let min_s = if i == 0 { 0 } else { active_runs[i - 1].1 };
+        let max_e = if i + 1 == active_runs.len() {
+            n
+        } else {
+            active_runs[i + 1].0
+        };
+        let (mut s, mut e) = active_runs[i];
+
+        // Étend sur les 1..4 octets de bord activés ponctuellement
+        let mut ext_l = 0usize;
+        while s > min_s && ext_l < 4 && gates_pt[s - 1] >= 0.42 {
+            s -= 1;
+            ext_l += 1;
+        }
+        let mut ext_r = 0usize;
+        while e < max_e && ext_r < 4 && gates_pt[e] >= 0.42 {
+            e += 1;
+            ext_r += 1;
+        }
+
+        // Coupe un éventuel débordement de 1..3 octets morts en bordure
+        let mut trim_l = 0usize;
+        while s + 10 < e && trim_l < 3 && gates_pt[s] < 0.22 {
+            s += 1;
+            trim_l += 1;
+        }
+        let mut trim_r = 0usize;
+        while s + 10 < e && trim_r < 3 && gates_pt[e - 1] < 0.22 {
+            e -= 1;
+            trim_r += 1;
+        }
+
+        active_runs[i] = (s, e);
+    }
+
+    // 3. Scinde les îlots qui contiennent plusieurs régimes causaux collés
     let mut cores: Vec<(usize, usize)> = Vec::new();
     for (s, e) in active_runs {
-        let split = split_run_by_abduction(graph, rels, s, e, exact);
+        let split = split_run_by_abduction(graph, sub, rels, s, e, exact);
         cores.extend(split);
     }
 
-    // 3. Associe les zones passives adjacentes comme référents induits (préfixe ou suffixe)
+    // 4. Associe les zones passives adjacentes comme référents induits
     let k = cores.len();
     let lead_gap = cores[0].0;
     let trail_gap = n.saturating_sub(cores[k - 1].1);
@@ -418,7 +526,7 @@ pub fn discover_causal_regimes_from_encoded(
     let mut out = Vec::with_capacity(k);
     for i in 0..k {
         let (cs, ce) = cores[i];
-        let mg = gates[cs..ce].iter().sum::<f32>() / ((ce - cs).max(1) as f32);
+        let mg = gates_ctx[cs..ce].iter().sum::<f32>() / ((ce - cs).max(1) as f32);
 
         let prev_end = if i == 0 { 0 } else { cores[i - 1].1 };
         let next_start = if i + 1 == k { n } else { cores[i + 1].0 };
@@ -451,8 +559,8 @@ pub fn discover_causal_regimes(
     exact: bool,
 ) -> Vec<DiscoveredRegime> {
     let sub = RawSubstrate::from_bytes(bytes);
-    let (rels, gates) = graph.encode_with_gate(&sub);
-    discover_causal_regimes_from_encoded(graph, &rels, &gates, exact)
+    let (rels, gates_ctx, gates_pt) = graph.encode_with_gate(&sub);
+    discover_causal_regimes_from_encoded(graph, &sub, &rels, &gates_ctx, &gates_pt, exact)
 }
 
 pub fn compute_phi_sharp_prepared(
@@ -460,7 +568,7 @@ pub fn compute_phi_sharp_prepared(
     prep: &PreparedEpisode,
     exact_mip: bool,
 ) -> PhiReport {
-    let (rels, gates_orig) = graph.encode_with_gate(&prep.orig);
+    let (rels, gates_orig, _) = graph.encode_with_gate(&prep.orig);
     let trace = graph.abduce(&rels, None);
     let residual = trace.final_mean_err;
 
@@ -475,8 +583,8 @@ pub fn compute_phi_sharp_prepared(
 
     let generativity = (-2.2 * residual).exp().clamp(1e-4, 1.0);
 
-    // 1. Discrimination + contraste de la porte causale neuronale (structuré vs mélangé)
-    let (neg_rels, gates_neg) = graph.encode_with_gate(&prep.neg);
+    // 1. Discrimination + contraste de la porte causale neuronale
+    let (neg_rels, gates_neg, _) = graph.encode_with_gate(&prep.neg);
     let (_, _, cross_err) = graph.evaluate_hypothesis(&trace.final_state, &neg_rels);
     let neg_trace = graph.abduce(&neg_rels, None);
 
@@ -564,14 +672,13 @@ pub fn compute_phi_sharp(
     compute_phi_sharp_prepared(graph, &prep, exact_mip)
 }
 
-/// Signal non-supervisé sur flux continu brut : découvre les régimes via `PhiGraph` seul
-/// puis mesure la sélectivité causale de la matrice de résonance réciproque.
 pub fn compute_composite_phi_prepared(
     graph: &PhiGraph,
     prep: &PreparedComposite,
 ) -> CompositePhi {
-    let (rels, gates) = graph.encode_with_gate(&prep.stream);
-    let regimes = discover_causal_regimes_from_encoded(graph, &rels, &gates, false);
+    let (rels, gates_ctx, gates_pt) = graph.encode_with_gate(&prep.stream);
+    let regimes =
+        discover_causal_regimes_from_encoded(graph, &prep.stream, &rels, &gates_ctx, &gates_pt, false);
     let m = regimes.len();
     if m < 2 {
         return CompositePhi {
@@ -634,7 +741,6 @@ pub fn compute_composite_phi(graph: &PhiGraph, bytes: &[u8]) -> CompositePhi {
     compute_composite_phi_prepared(graph, &prep)
 }
 
-/// Projection Référentielle réciproque sur les régimes découverts par `PhiGraph`.
 pub fn project_query_to_regimes(
     graph: &PhiGraph,
     bytes: &[u8],
