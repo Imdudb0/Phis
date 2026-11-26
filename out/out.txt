@@ -1,40 +1,45 @@
-[1m[33mwarning[0m[1m: variant `Pipe` is never constructed[0m
-  [1m[94m--> [0msrc/ptgrs.rs:51:5
+[1m[33mwarning[0m[1m: field `mean_gate` is never read[0m
+  [1m[94m--> [0msrc/phi.rs:13:9
    [1m[94m|[0m
-[1m[94m48[0m [1m[94m|[0m pub enum SepMode {
-   [1m[94m|[0m          [1m[94m-------[0m [1m[94mvariant in this enum[0m
+[1m[94m 9[0m [1m[94m|[0m pub struct DiscoveredRegime {
+   [1m[94m|[0m            [1m[94m----------------[0m [1m[94mfield in this struct[0m
 [1m[94m...[0m
-[1m[94m51[0m [1m[94m|[0m     Pipe,
-   [1m[94m|[0m     [1m[33m^^^^[0m
+[1m[94m13[0m [1m[94m|[0m     pub mean_gate: f32,
+   [1m[94m|[0m         [1m[33m^^^^^^^^^[0m
    [1m[94m|[0m
-   [1m[94m= [0m[1mnote[0m: `SepMode` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+   [1m[94m= [0m[1mnote[0m: `DiscoveredRegime` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
    [1m[94m= [0m[1mnote[0m: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
 
 [1m[33mwarning[0m: `phisharp` (bin "phisharp") generated 1 warning
-[1m[92m    Finished[0m `release` profile [optimized] target(s) in 0.03s
+[1m[92m    Finished[0m `release` profile [optimized] target(s) in 0.00s
 [1m[92m     Running[0m `target/release/phisharp train --out out/sharp.phis --steps 300`
-Entraînement Phisharp v0.5.1 (1541 paramètres : capteur + porte causale + graphe, 300 étapes, 24 paires ES, 4 threads)...
+Entraînement Phisharp v0.6 (1541 paramètres, 300 étapes, 24 paires ES, 4 threads)...
 step    1/300  | φ=+0.0488 | Gen=0.310 Disc=0.040 Spec=0.003 Gate=0.25/0.25 IIT=0.070 RefSel=0.262 | res=0.532 coll=0.853 (0.1s)
-step   25/300  | φ=+0.4312 | Gen=0.611 Disc=0.472 Spec=0.026 Gate=0.26/0.26 IIT=0.130 RefSel=0.327 | res=0.228 coll=0.643 (1.9s)
-step   50/300  | φ=+0.5822 | Gen=0.773 Disc=0.688 Spec=0.110 Gate=0.27/0.26 IIT=0.142 RefSel=0.340 | res=0.121 coll=0.636 (3.8s)
-step   75/300  | φ=+0.6034 | Gen=0.765 Disc=0.717 Spec=0.182 Gate=0.33/0.31 IIT=0.181 RefSel=0.290 | res=0.126 coll=0.413 (5.6s)
-step  100/300  | φ=+0.5949 | Gen=0.731 Disc=0.738 Spec=0.214 Gate=0.41/0.33 IIT=0.190 RefSel=0.404 | res=0.148 coll=0.405 (7.3s)
-step  125/300  | φ=+0.6630 | Gen=0.770 Disc=0.813 Spec=0.230 Gate=0.56/0.45 IIT=0.214 RefSel=0.351 | res=0.125 coll=0.366 (9.1s)
-step  150/300  | φ=+0.6703 | Gen=0.757 Disc=0.766 Spec=0.281 Gate=0.66/0.49 IIT=0.213 RefSel=0.443 | res=0.132 coll=0.167 (10.9s)
-step  175/300  | φ=+0.7073 | Gen=0.801 Disc=0.785 Spec=0.320 Gate=0.69/0.55 IIT=0.245 RefSel=0.340 | res=0.104 coll=0.101 (12.8s)
-step  200/300  | φ=+0.7087 | Gen=0.762 Disc=0.804 Spec=0.343 Gate=0.76/0.58 IIT=0.276 RefSel=0.323 | res=0.128 coll=0.072 (14.6s)
-step  225/300  | φ=+0.7532 | Gen=0.777 Disc=0.808 Spec=0.348 Gate=0.80/0.65 IIT=0.362 RefSel=0.398 | res=0.120 coll=0.148 (16.4s)
-step  250/300  | φ=+0.7184 | Gen=0.780 Disc=0.777 Spec=0.370 Gate=0.80/0.63 IIT=0.287 RefSel=0.477 | res=0.121 coll=0.104 (18.2s)
-step  275/300  | φ=+0.6766 | Gen=0.727 Disc=0.787 Spec=0.355 Gate=0.75/0.64 IIT=0.263 RefSel=0.419 | res=0.151 coll=0.089 (20.0s)
-step  300/300  | φ=+0.6985 | Gen=0.750 Disc=0.803 Spec=0.344 Gate=0.79/0.67 IIT=0.252 RefSel=0.538 | res=0.139 coll=0.176 (21.7s)
+step   25/300  | φ=+0.4299 | Gen=0.608 Disc=0.472 Spec=0.025 Gate=0.26/0.26 IIT=0.133 RefSel=0.328 | res=0.230 coll=0.639 (1.7s)
+step   50/300  | φ=+0.5814 | Gen=0.773 Disc=0.689 Spec=0.110 Gate=0.27/0.26 IIT=0.137 RefSel=0.335 | res=0.120 coll=0.636 (3.3s)
+step   75/300  | φ=+0.6180 | Gen=0.776 Disc=0.740 Spec=0.194 Gate=0.32/0.31 IIT=0.199 RefSel=0.304 | res=0.119 coll=0.437 (4.8s)
+step  100/300  | φ=+0.5693 | Gen=0.692 Disc=0.722 Spec=0.259 Gate=0.41/0.33 IIT=0.179 RefSel=0.432 | res=0.174 coll=0.388 (6.3s)
+step  125/300  | φ=+0.6528 | Gen=0.740 Disc=0.775 Spec=0.267 Gate=0.54/0.43 IIT=0.290 RefSel=0.421 | res=0.144 coll=0.315 (7.9s)
+step  150/300  | φ=+0.6906 | Gen=0.769 Disc=0.768 Spec=0.280 Gate=0.64/0.49 IIT=0.347 RefSel=0.363 | res=0.123 coll=0.194 (9.4s)
+step  175/300  | φ=+0.7660 | Gen=0.821 Disc=0.811 Spec=0.329 Gate=0.70/0.55 IIT=0.440 RefSel=0.557 | res=0.092 coll=0.217 (11.0s)
+step  200/300  | φ=+0.7463 | Gen=0.802 Disc=0.833 Spec=0.342 Gate=0.74/0.59 IIT=0.309 RefSel=0.321 | res=0.103 coll=0.275 (12.6s)
+step  225/300  | φ=+0.8077 | Gen=0.802 Disc=0.836 Spec=0.334 Gate=0.80/0.65 IIT=0.475 RefSel=0.435 | res=0.104 coll=0.250 (14.1s)
+step  250/300  | φ=+0.8095 | Gen=0.824 Disc=0.844 Spec=0.346 Gate=0.81/0.73 IIT=0.494 RefSel=0.509 | res=0.090 coll=0.238 (15.7s)
+step  275/300  | φ=+0.7912 | Gen=0.788 Disc=0.812 Spec=0.363 Gate=0.78/0.68 IIT=0.495 RefSel=0.525 | res=0.111 coll=0.185 (17.2s)
+step  300/300  | φ=+0.7922 | Gen=0.786 Disc=0.800 Spec=0.338 Gate=0.82/0.75 IIT=0.529 RefSel=0.587 | res=0.114 coll=0.386 (18.8s)
 
 --- Évaluation post-hoc 1 : Abstraction Méta-relationnelle (0 octet commun) ---
-  Même cause cachée : cos = +0.9724
-  Causes différentes: cos = +0.0144
-  Marge             : +0.9580
+  Même cause cachée : cos = +0.9739
+  Causes différentes: cos = -0.0174
+  Marge             : +0.9913
 
---- Évaluation post-hoc 2 : Flux continu 100% auto-segmenté (4 moules, hasard = 25%) ---
-  Moules collés SANS séparateur (0 octet commun)     : 45/50 (90.0%)
-  Moules étiquetés, sép. aléatoire (0 octet commun)  : 47/50 (94.0%)  [marge=+0.2248, référent exact=41/47]
+--- Évaluation post-hoc 2 : Flux continu 1-saut auto-segmenté (4 moules, hasard = 25%) ---
+  Moules collés SANS séparateur (0 octet commun)     : 42/50 (84.0%)
+  Moules étiquetés, sép. aléatoire (0 octet commun)  : 42/50 (84.0%)  [référent exact=17/42]
+
+--- Évaluation post-hoc 3 : Multi-Sauts sur Définitions Composées (4 concepts, hasard = 25%) ---
+  Décomposition 2 causes (cible hybride)             : 20/50 (40.0%)
+  Concept composé exact (multiligne, 0 octet commun) : 0/50 (0.0%)  [marge Top1-Top2 = +0.0000]
+  Concept composé exact (flux plat, 0 octet commun)  : 0/50 (0.0%)
 
 Modèle sauvegardé dans 'out/sharp.phis'.
