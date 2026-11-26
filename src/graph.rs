@@ -17,6 +17,20 @@ pub const NODE_IN: usize = EDGE_HID * 2 + 2;
 pub const GATE_IN: usize = EDGE_HID * 2 + 2;
 pub const GATE_HID: usize = 4;
 
+// --- Mémoire de Travail Positionnelle (Hop-2 / Hop-3 100% connexionniste) ---
+pub const WM_DIM: usize = 12;
+pub const WM_STEPS: usize = 4;
+const ECHO_IN: usize = 7;
+const ECHO_HID: usize = 6;
+const SCAN_IN: usize = 7;
+const SCAN_CTRL: usize = 4;
+const SCAN_BLOCK: usize = SCAN_CTRL * SCAN_IN + SCAN_CTRL * SCAN_CTRL + SCAN_CTRL + 3 * SCAN_CTRL + 3; // 63
+const WM_UPD_IN: usize = 5;
+const WM_UPD_HID: usize = 4;
+const READ_IN: usize = 6;
+const READ_HID: usize = 6;
+
+// --- Paramètres Hop-1 (0..1541) ---
 const OFF_REL_EDGE_W: usize = 0; // 48
 const OFF_REL_EDGE_B: usize = OFF_REL_EDGE_W + EDGE_HID * EDGE_IN; // 48, len 4
 const OFF_REL_NODE_W: usize = OFF_REL_EDGE_B + EDGE_HID; // 52, len 80
@@ -36,12 +50,97 @@ const OFF_BH: usize = OFF_G2 + DIM * (2 * DIM); // 1429, len 32
 const OFF_CTX: usize = OFF_BH + DIM * (2 * DIM); // 1461, len 32
 const OFF_U: usize = OFF_CTX + DIM * REL_DIM; // 1493, len 16
 const OFF_OUT: usize = OFF_U + DIM * DIM; // 1509, len 32
-pub const NUM_PARAMS: usize = OFF_OUT + REL_DIM * DIM; // 1541
+
+// --- Paramètres Mémoire de Travail (1541..2136, +595 params) ---
+pub const WM_PARAM_START: usize = OFF_OUT + REL_DIM * DIM; // 1541
+const OFF_WM_INIT_W: usize = WM_PARAM_START; // 1541, len 288 (12 x 24)
+const OFF_WM_INIT_B: usize = OFF_WM_INIT_W + WM_DIM * STATE_DIM; // 1829, len 12
+const OFF_ECHO_W1: usize = OFF_WM_INIT_B + WM_DIM; // 1841, len 42
+const OFF_ECHO_B1: usize = OFF_ECHO_W1 + ECHO_HID * ECHO_IN; // 1883, len 6
+const OFF_ECHO_W2: usize = OFF_ECHO_B1 + ECHO_HID; // 1889, len 6
+const OFF_ECHO_B2: usize = OFF_ECHO_W2 + ECHO_HID; // 1895, len 1
+const OFF_SCAN_BWD: usize = OFF_ECHO_B2 + 1; // 1896, len 63
+const OFF_SCAN_FWD: usize = OFF_SCAN_BWD + SCAN_BLOCK; // 1959, len 63
+const OFF_WM_GAINS: usize = OFF_SCAN_FWD + SCAN_BLOCK; // 2022, len 36 (3 x 12)
+const OFF_WM_UPD_W1: usize = OFF_WM_GAINS + 3 * WM_DIM; // 2058, len 20
+const OFF_WM_UPD_B1: usize = OFF_WM_UPD_W1 + WM_UPD_HID * WM_UPD_IN; // 2078, len 4
+const OFF_WM_UPD_W2: usize = OFF_WM_UPD_B1 + WM_UPD_HID; // 2082, len 4
+const OFF_WM_UPD_B2: usize = OFF_WM_UPD_W2 + WM_UPD_HID; // 2086, len 1
+const OFF_READ_W1: usize = OFF_WM_UPD_B2 + 1; // 2087, len 36
+const OFF_READ_B1: usize = OFF_READ_W1 + READ_HID * READ_IN; // 2123, len 6
+const OFF_READ_W2: usize = OFF_READ_B1 + READ_HID; // 2129, len 6
+const OFF_READ_B2: usize = OFF_READ_W2 + READ_HID; // 2135, len 1
+pub const NUM_PARAMS: usize = OFF_READ_B2 + 1; // 2136
 
 const MAGIC: &[u8; 4] = b"PHIS";
-const VERSION: u32 = 5;
+const VERSION: u32 = 7;
 
-/// Substrat relationnel brut à échelle invariante (fenêtre fixe ±30, degré local ±12).
+#[inline]
+fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x.clamp(-12.0, 12.0)).exp())
+}
+
+pub fn wm_norm(v: &[f32; WM_DIM]) -> f32 {
+    let mut s = 0.0f32;
+    for &x in v {
+        s += x * x;
+    }
+    s.sqrt()
+}
+
+pub fn wm_cosine(a: &[f32; WM_DIM], b: &[f32; WM_DIM]) -> f32 {
+    let mut dot = 0.0f32;
+    let mut na = 0.0f32;
+    let mut nb = 0.0f32;
+    for d in 0..WM_DIM {
+        dot += a[d] * b[d];
+        na += a[d] * a[d];
+        nb += b[d] * b[d];
+    }
+    let denom = (na * nb).sqrt();
+    if denom < 1e-8 {
+        0.0
+    } else {
+        (dot / denom).clamp(-1.0, 1.0)
+    }
+}
+
+/// Nouveauté orthogonale idempotente :
+/// - `u1` reçu deux fois -> novelty = 0 (aucun double comptage)
+/// - `u2` orthogonal à `u1` -> novelty = `u2` (composition exacte `u1 + u2`)
+/// - `u1` reçu sur `u1 + u2` -> novelty = 0 (n'efface jamais `u2`).
+pub fn orth_novelty(msg: &[f32; WM_DIM], cur: &[f32; WM_DIM]) -> [f32; WM_DIM] {
+    let mut dot = 0.0f32;
+    let mut m2 = 0.0f32;
+    for d in 0..WM_DIM {
+        dot += msg[d] * cur[d];
+        m2 += msg[d] * msg[d];
+    }
+    if m2 < 1e-8 {
+        return [0.0; WM_DIM];
+    }
+    let overlap = (dot / m2).clamp(0.0, 1.0);
+    let keep = 1.0 - overlap;
+    let mut out = [0.0f32; WM_DIM];
+    for d in 0..WM_DIM {
+        out[d] = keep * msg[d];
+    }
+    out
+}
+
+/// Lien d'écho longue portée extrait uniquement des diagonales (>= 3 octets) de M(a,b).
+#[derive(Clone, Copy, Debug)]
+pub struct EchoEdge {
+    pub src: u32,
+    pub norm_len: f32,
+    pub log_deg: f32,
+    pub rel_dist: f32,
+    pub freq_src: f32,
+}
+
+/// Substrat relationnel complet extrait de la seule matrice d'auto-égalité M(a,b) = [E[a] == E[b]] :
+/// - Voisinage local (±30 octets) pour Hop-1 (invariance d'échelle)
+/// - Diagonales d'écho longue portée (|a-b| > 16, L >= 3) pour la Mémoire de Travail Hop-2/Hop-3.
 #[derive(Clone, Debug)]
 pub struct RawSubstrate {
     pub len: usize,
@@ -49,6 +148,12 @@ pub struct RawSubstrate {
     pub edges: Vec<[f32; EDGE_IN]>,
     pub edge_targets: Vec<u32>,
     pub deg: Vec<f32>,
+    pub global_freq: Vec<f32>,
+    pub back_echo_len: Vec<f32>,
+    pub fwd_echo_len: Vec<f32>,
+    pub echo_log_deg: Vec<f32>,
+    pub echo_offsets: Vec<usize>,
+    pub echo_edges: Vec<EchoEdge>,
 }
 
 impl RawSubstrate {
@@ -58,6 +163,21 @@ impl RawSubstrate {
         let deg_rad = 12usize;
         let max_edges = 12usize;
         let log_cap = (win_cap as f32).ln();
+
+        // Fréquence globale normalisée (invariante par bijection arbitraire des 256 octets)
+        let mut counts = [0u32; 256];
+        let mut max_c = 1u32;
+        for &b in bytes {
+            counts[b as usize] += 1;
+            if counts[b as usize] > max_c {
+                max_c = counts[b as usize];
+            }
+        }
+        let inv_max_c = 1.0 / (max_c as f32);
+        let global_freq: Vec<f32> = bytes
+            .iter()
+            .map(|&b| counts[b as usize] as f32 * inv_max_c)
+            .collect();
 
         let m_nb = |a: isize, b: isize, ti: isize, ji: isize| -> f32 {
             if a >= 0 && b >= 0 && a != b && !(a == ji && b == ti) {
@@ -156,12 +276,97 @@ impl RawSubstrate {
             offsets.push(edges.len());
         }
 
+        // Extraction des diagonales d'écho longue portée (|a - b| > 16, L >= 3)
+        let mut back_echo_len = vec![0.0f32; n];
+        let mut fwd_echo_len = vec![0.0f32; n];
+        let mut echo_deg_raw = vec![0u32; n];
+        let mut raw_links: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n];
+
+        if n > 20 {
+            let max_d = n.min(1024);
+            for d in 17..max_d {
+                let mut i = 0usize;
+                while i + d < n {
+                    if bytes[i] == bytes[i + d] {
+                        let start = i;
+                        while i + d < n && bytes[i] == bytes[i + d] {
+                            i += 1;
+                        }
+                        let run_len = i - start;
+                        if run_len >= 3 {
+                            let nl = (run_len as f32 / 10.0).min(1.0);
+                            for k in 0..run_len {
+                                let a = start + k;
+                                let b = a + d;
+                                echo_deg_raw[a] += 1;
+                                echo_deg_raw[b] += 1;
+                                if nl > fwd_echo_len[a] {
+                                    fwd_echo_len[a] = nl;
+                                }
+                                if nl > back_echo_len[b] {
+                                    back_echo_len[b] = nl;
+                                }
+                                raw_links[b].push((a, run_len));
+                                raw_links[a].push((b, run_len));
+                            }
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+        }
+
+        let echo_log_deg: Vec<f32> = echo_deg_raw
+            .iter()
+            .map(|&c| {
+                if c == 0 {
+                    0.0
+                } else {
+                    (((c + 1) as f32).ln() / 3.0).clamp(0.0, 1.0)
+                }
+            })
+            .collect();
+
+        let max_echo_per_pos = 6usize;
+        let inv_n = 1.0 / (n.max(1) as f32);
+        let mut echo_offsets = Vec::with_capacity(n + 1);
+        let mut echo_edges = Vec::new();
+        echo_offsets.push(0);
+
+        for dst in 0..n {
+            let list = &mut raw_links[dst];
+            if list.len() > max_echo_per_pos {
+                list.sort_unstable_by(|a, b| {
+                    b.1.cmp(&a.1)
+                        .then_with(|| dst.abs_diff(a.0).cmp(&dst.abs_diff(b.0)))
+                });
+                list.truncate(max_echo_per_pos);
+            }
+            for &(src, run_len) in list.iter() {
+                echo_edges.push(EchoEdge {
+                    src: src as u32,
+                    norm_len: (run_len as f32 / 10.0).min(1.0),
+                    log_deg: echo_log_deg[dst],
+                    rel_dist: ((dst as f32) - (src as f32)) * inv_n,
+                    freq_src: global_freq[src],
+                });
+            }
+            echo_offsets.push(echo_edges.len());
+        }
+
         Self {
             len: n,
             offsets,
             edges,
             edge_targets,
             deg,
+            global_freq,
+            back_echo_len,
+            fwd_echo_len,
+            echo_log_deg,
+            echo_offsets,
+            echo_edges,
         }
     }
 }
@@ -193,6 +398,7 @@ impl PhiGraph {
         Self { weights }
     }
 
+    /// Capteur relationnel 100% appris + porte causale neuronale contextuelle (`±2`) et ponctuelle.
     pub fn encode_with_gate(&self, sub: &RawSubstrate) -> (Vec<[f32; REL_DIM]>, Vec<f32>, Vec<f32>) {
         let w = &self.weights;
         let n = sub.len;
@@ -282,7 +488,7 @@ impl PhiGraph {
                 }
                 logit += w[OFF_GATE_W2 + h] * acc.tanh();
             }
-            1.0 / (1.0 + (-logit.clamp(-12.0, 12.0)).exp())
+            sigmoid(logit)
         };
 
         let mut gates_ctx = Vec::with_capacity(n);
@@ -502,6 +708,316 @@ impl PhiGraph {
         self.abduce_with_steps(rels, cut_mask, SEARCH_STEPS)
     }
 
+    // =========================================================================
+    // MÉMOIRE DE TRAVAIL POSITIONNELLE (Hop-1 -> Hop-2 -> Hop-3 connexionniste)
+    // =========================================================================
+
+    /// Projette une cause latente H (24D) dans l'espace normé de la mémoire de travail (12D).
+    pub fn project_cause_to_wm(&self, state: &[f32; STATE_DIM]) -> [f32; WM_DIM] {
+        let w = &self.weights;
+        let mut out = [0.0f32; WM_DIM];
+        let mut n2 = 0.0f32;
+        for d in 0..WM_DIM {
+            let base = OFF_WM_INIT_W + d * STATE_DIM;
+            let mut acc = w[OFF_WM_INIT_B + d];
+            for k in 0..STATE_DIM {
+                acc += w[base + k] * state[k];
+            }
+            let val = acc.tanh();
+            out[d] = val;
+            n2 += val * val;
+        }
+        let inv = 1.0 / (n2.sqrt().max(1e-6));
+        for x in &mut out {
+            *x *= inv;
+        }
+        out
+    }
+
+    fn eval_echo_weight(&self, feat: &[f32; ECHO_IN]) -> f32 {
+        let w = &self.weights;
+        let mut logit = w[OFF_ECHO_B2];
+        for h in 0..ECHO_HID {
+            let base = OFF_ECHO_W1 + h * ECHO_IN;
+            let mut acc = w[OFF_ECHO_B1 + h];
+            for k in 0..ECHO_IN {
+                acc += w[base + k] * feat[k];
+            }
+            logit += w[OFF_ECHO_W2 + h] * acc.tanh();
+        }
+        sigmoid(logit)
+    }
+
+    fn eval_scanner_step(
+        &self,
+        off: usize,
+        ctrl: &mut [f32; SCAN_CTRL],
+        inp: &[f32; SCAN_IN],
+    ) -> (f32, f32, f32) {
+        let w = &self.weights;
+        let off_in = off;
+        let off_rec = off_in + SCAN_CTRL * SCAN_IN;
+        let off_b = off_rec + SCAN_CTRL * SCAN_CTRL;
+        let off_out_w = off_b + SCAN_CTRL;
+        let off_out_b = off_out_w + 3 * SCAN_CTRL;
+
+        let mut next_ctrl = [0.0f32; SCAN_CTRL];
+        for h in 0..SCAN_CTRL {
+            let mut acc = w[off_b + h];
+            for k in 0..SCAN_IN {
+                acc += w[off_in + h * SCAN_IN + k] * inp[k];
+            }
+            for j in 0..SCAN_CTRL {
+                acc += w[off_rec + h * SCAN_CTRL + j] * ctrl[j];
+            }
+            next_ctrl[h] = acc.tanh();
+        }
+        *ctrl = next_ctrl;
+
+        let mut gates = [0.0f32; 3];
+        for g in 0..3 {
+            let mut acc = w[off_out_b + g];
+            for h in 0..SCAN_CTRL {
+                acc += w[off_out_w + g * SCAN_CTRL + h] * ctrl[h];
+            }
+            gates[g] = sigmoid(acc);
+        }
+        (gates[0], gates[1], gates[2])
+    }
+
+    /// Exécute `WM_STEPS` itérations de la mémoire de travail sur le flux :
+    /// 1. Transport non-réciproque le long des arêtes d'écho longue portée de M(a,b)
+    /// 2. Balayage directionnel arrière (`←`) et avant (`→`) à portes récurrentes apprises
+    /// 3. Mise à jour par nouveauté orthogonale idempotente (`cut_echoes = true` pour IIT).
+    pub fn propagate_working_memory(
+        &self,
+        sub: &RawSubstrate,
+        gates_pt: &[f32],
+        init_z: &[[f32; WM_DIM]],
+        cut_echoes: bool,
+    ) -> Vec<[f32; WM_DIM]> {
+        let n = sub.len;
+        if n == 0 {
+            return Vec::new();
+        }
+        let w = &self.weights;
+        let mut z = init_z.to_vec();
+
+        let mut g_echo = [0.0f32; WM_DIM];
+        let mut g_bwd = [0.0f32; WM_DIM];
+        let mut g_fwd = [0.0f32; WM_DIM];
+        for d in 0..WM_DIM {
+            g_echo[d] = sigmoid(w[OFF_WM_GAINS + d]);
+            g_bwd[d] = sigmoid(w[OFF_WM_GAINS + WM_DIM + d]);
+            g_fwd[d] = sigmoid(w[OFF_WM_GAINS + 2 * WM_DIM + d]);
+        }
+
+        let mut msg_echo = vec![[0.0f32; WM_DIM]; n];
+        let mut msg_bwd = vec![[0.0f32; WM_DIM]; n];
+        let mut msg_fwd = vec![[0.0f32; WM_DIM]; n];
+        let mut norms = vec![0.0f32; n];
+
+        for _ in 0..WM_STEPS {
+            for t in 0..n {
+                norms[t] = wm_norm(&z[t]);
+                msg_echo[t] = [0.0; WM_DIM];
+                msg_bwd[t] = [0.0; WM_DIM];
+                msg_fwd[t] = [0.0; WM_DIM];
+            }
+
+            // 1. Transport par arêtes d'écho longue portée (M(a,b))
+            if !cut_echoes {
+                for dst in 0..n {
+                    let slice = &sub.echo_edges[sub.echo_offsets[dst]..sub.echo_offsets[dst + 1]];
+                    if slice.is_empty() {
+                        continue;
+                    }
+                    let mut acc = [0.0f32; WM_DIM];
+                    let mut w_sum = 0.0f32;
+                    for edge in slice {
+                        let src = edge.src as usize;
+                        if norms[src] < 1e-4 {
+                            continue;
+                        }
+                        let feat = [
+                            edge.norm_len,
+                            edge.log_deg,
+                            edge.rel_dist,
+                            edge.freq_src,
+                            (norms[src] / 2.0).min(1.0),
+                            (norms[dst] / 2.0).min(1.0),
+                            gates_pt[src],
+                        ];
+                        let alpha = self.eval_echo_weight(&feat);
+                        if alpha > 0.02 {
+                            let nov = orth_novelty(&z[src], &acc);
+                            for d in 0..WM_DIM {
+                                acc[d] += alpha * nov[d];
+                            }
+                            w_sum += alpha;
+                        }
+                    }
+                    if w_sum > 0.0 {
+                        msg_echo[dst] = acc;
+                    }
+                }
+            }
+
+            // 2. Balayage directionnel arrière (t = n-1 -> 0) : diffuse moules -> étiquettes
+            //    et compose les membres droits -> têtes de définitions.
+            let mut ctrl_b = [0.0f32; SCAN_CTRL];
+            let mut carry_b = [0.0f32; WM_DIM];
+            for t in (0..n).rev() {
+                let c_norm = (wm_norm(&carry_b) / 2.0).min(1.0);
+                let inp = [
+                    gates_pt[t],
+                    sub.back_echo_len[t],
+                    sub.fwd_echo_len[t],
+                    sub.echo_log_deg[t],
+                    sub.global_freq[t],
+                    (norms[t] / 2.0).min(1.0),
+                    c_norm,
+                ];
+                let (keep, absorb, write) = self.eval_scanner_step(OFF_SCAN_BWD, &mut ctrl_b, &inp);
+
+                for d in 0..WM_DIM {
+                    carry_b[d] *= keep;
+                }
+                if norms[t] > 1e-4 {
+                    let nov = orth_novelty(&z[t], &carry_b);
+                    for d in 0..WM_DIM {
+                        carry_b[d] += absorb * nov[d];
+                    }
+                }
+                for d in 0..WM_DIM {
+                    msg_bwd[t][d] = write * carry_b[d];
+                }
+            }
+
+            // 3. Balayage directionnel avant (t = 0 -> n-1, non-réciproque)
+            let mut ctrl_f = [0.0f32; SCAN_CTRL];
+            let mut carry_f = [0.0f32; WM_DIM];
+            for t in 0..n {
+                let c_norm = (wm_norm(&carry_f) / 2.0).min(1.0);
+                let inp = [
+                    gates_pt[t],
+                    sub.back_echo_len[t],
+                    sub.fwd_echo_len[t],
+                    sub.echo_log_deg[t],
+                    sub.global_freq[t],
+                    (norms[t] / 2.0).min(1.0),
+                    c_norm,
+                ];
+                let (keep, absorb, write) = self.eval_scanner_step(OFF_SCAN_FWD, &mut ctrl_f, &inp);
+
+                for d in 0..WM_DIM {
+                    carry_f[d] *= keep;
+                }
+                if norms[t] > 1e-4 {
+                    let nov = orth_novelty(&z[t], &carry_f);
+                    for d in 0..WM_DIM {
+                        carry_f[d] += absorb * nov[d];
+                    }
+                }
+                for d in 0..WM_DIM {
+                    msg_fwd[t][d] = write * carry_f[d];
+                }
+            }
+
+            // 4. Fusion par nouveauté orthogonale idempotente dans la mémoire de travail Z
+            for t in 0..n {
+                let ne = (wm_norm(&msg_echo[t]) / 2.0).min(1.0);
+                let nb = (wm_norm(&msg_bwd[t]) / 2.0).min(1.0);
+                let nf = (wm_norm(&msg_fwd[t]) / 2.0).min(1.0);
+                if ne + nb + nf < 1e-5 {
+                    continue;
+                }
+
+                let upd_in = [(norms[t] / 2.0).min(1.0), ne, nb, nf, gates_pt[t]];
+                let mut logit = w[OFF_WM_UPD_B2];
+                for h in 0..WM_UPD_HID {
+                    let base = OFF_WM_UPD_W1 + h * WM_UPD_IN;
+                    let mut acc = w[OFF_WM_UPD_B1 + h];
+                    for k in 0..WM_UPD_IN {
+                        acc += w[base + k] * upd_in[k];
+                    }
+                    logit += w[OFF_WM_UPD_W2 + h] * acc.tanh();
+                }
+                let gamma = sigmoid(logit);
+
+                let nov_e = orth_novelty(&msg_echo[t], &z[t]);
+                let mut z_next = z[t];
+                for d in 0..WM_DIM {
+                    z_next[d] += gamma * g_echo[d] * nov_e[d];
+                }
+                let nov_b = orth_novelty(&msg_bwd[t], &z_next);
+                for d in 0..WM_DIM {
+                    z_next[d] += gamma * g_bwd[d] * nov_b[d];
+                }
+                let nov_f = orth_novelty(&msg_fwd[t], &z_next);
+                for d in 0..WM_DIM {
+                    z_next[d] += gamma * g_fwd[d] * nov_f[d];
+                }
+
+                let nrm = wm_norm(&z_next);
+                if nrm > 3.0 {
+                    let sc = 3.0 / nrm;
+                    for x in &mut z_next {
+                        *x *= sc;
+                    }
+                }
+                z[t] = z_next;
+            }
+        }
+
+        z
+    }
+
+    /// Tête de lecture connexionniste : évalue le champ continu d'explication `P(t) ∈ (0, 1)`
+    /// sur chaque octet du contexte face au vecteur mémoire de la cible `z_query`.
+    pub fn readout_explanation(
+        &self,
+        sub: &RawSubstrate,
+        gates_pt: &[f32],
+        z: &[[f32; WM_DIM]],
+        z_query: &[f32; WM_DIM],
+    ) -> Vec<f32> {
+        let w = &self.weights;
+        let n = sub.len;
+        let mut out = Vec::with_capacity(n);
+
+        for t in 0..n {
+            let cos = wm_cosine(&z[t], z_query);
+            let mut dot = 0.0f32;
+            for d in 0..WM_DIM {
+                dot += z[t][d] * z_query[d];
+            }
+            let dot_n = (dot / 2.5).clamp(-1.0, 1.0);
+            let nrm = (wm_norm(&z[t]) / 2.0).min(1.0);
+            let feat = [
+                cos,
+                dot_n,
+                nrm,
+                gates_pt[t],
+                sub.back_echo_len[t],
+                sub.global_freq[t],
+            ];
+
+            let mut logit = w[OFF_READ_B2];
+            for h in 0..READ_HID {
+                let base = OFF_READ_W1 + h * READ_IN;
+                let mut acc = w[OFF_READ_B1 + h];
+                for k in 0..READ_IN {
+                    acc += w[base + k] * feat[k];
+                }
+                logit += w[OFF_READ_W2 + h] * acc.tanh();
+            }
+            out.push(sigmoid(logit));
+        }
+
+        out
+    }
+
     pub fn save<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
         if let Some(parent) = path.as_ref().parent()
             && !parent.as_os_str().is_empty()
@@ -531,7 +1047,7 @@ impl PhiGraph {
         if version != VERSION || count != NUM_PARAMS || data.len() != 12 + count * 4 {
             return Err(io::Error::new(
                 ErrorKind::InvalidData,
-                "Version ou taille du modèle .phis incompatible (ré-entraîne avec v0.6.1)",
+                "Version ou taille du modèle .phis incompatible (ré-entraîne avec v0.7)",
             ));
         }
         let mut weights = Vec::with_capacity(count);
