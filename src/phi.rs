@@ -17,6 +17,7 @@ pub struct DiscoveredRegime {
 pub struct PreparedEpisode {
     pub orig: RawSubstrate,
     pub neg: RawSubstrate,
+    pub passive: RawSubstrate,
     pub refut: RawSubstrate,
     pub shift: RawSubstrate,
     pub abs: RawSubstrate,
@@ -127,6 +128,22 @@ impl PreparedEpisode {
         rng.shuffle(&mut neg_bytes);
         let neg = RawSubstrate::from_bytes(&neg_bytes);
 
+        // Négatif passif (85% octets uniques + 15% répétitions isolées) : apprend à la porte
+        // neuronale que les étiquettes/prose non structurées ont g(t) ≈ 0.
+        let mut pool: [u8; 256] = std::array::from_fn(|i| i as u8);
+        rng.shuffle(&mut pool);
+        let mut passive_bytes = Vec::with_capacity(bytes.len());
+        let mut cursor = 0usize;
+        for _ in 0..bytes.len() {
+            if cursor >= 6 && rng.next_usize(100) < 15 {
+                passive_bytes.push(pool[rng.next_usize(cursor.min(14))]);
+            } else {
+                passive_bytes.push(pool[cursor % 256]);
+                cursor += 1;
+            }
+        }
+        let passive = RawSubstrate::from_bytes(&passive_bytes);
+
         let mut ref_bytes = bytes.to_vec();
         let corrupt_n = (bytes.len() / 6).max(1);
         for _ in 0..corrupt_n {
@@ -154,6 +171,7 @@ impl PreparedEpisode {
         Self {
             orig,
             neg,
+            passive,
             refut,
             shift: shift_sub,
             abs,
@@ -389,8 +407,74 @@ fn split_run_by_abduction(
     segs
 }
 
-/// Découvre automatiquement les régimes causaux et leurs référents passifs sur un flux
-/// d'octets brut continu : zéro `\n`, zéro séparateur, calage strict sur `gates_pt`.
+fn attach_passive_referents(cores: &[(usize, usize)], gates_ctx: &[f32], n: usize) -> Vec<DiscoveredRegime> {
+    let k = cores.len();
+    if k == 0 {
+        return Vec::new();
+    }
+    let lead_gap = cores[0].0;
+    let trail_gap = n.saturating_sub(cores[k - 1].1);
+    let suffix_mode = trail_gap >= 3 && lead_gap < 3;
+
+    let mut out = Vec::with_capacity(k);
+    for i in 0..k {
+        let (cs, ce) = cores[i];
+        let mg = gates_ctx[cs..ce].iter().sum::<f32>() / ((ce - cs).max(1) as f32);
+
+        let prev_end = if i == 0 { 0 } else { cores[i - 1].1 };
+        let next_start = if i + 1 == k { n } else { cores[i + 1].0 };
+
+        let referent = if suffix_mode {
+            if next_start.saturating_sub(ce) >= 3 {
+                Some((ce, next_start))
+            } else {
+                None
+            }
+        } else if cs.saturating_sub(prev_end) >= 3 {
+            Some((prev_end, cs))
+        } else {
+            None
+        };
+
+        out.push(DiscoveredRegime {
+            core_start: cs,
+            core_end: ce,
+            referent,
+            mean_gate: mg,
+        });
+    }
+    out
+}
+
+/// Calage auto-cohérent des bords d'un régime par la même porte neuronale évaluée
+/// sur la tranche isolée `&bytes[cs..ce]` : détache tout octet qui n'avait d'arêtes
+/// que vers un bloc voisin (zéro séparateur codé en dur).
+fn tighten_regime_isolated(graph: &PhiGraph, bytes: &[u8], mut cs: usize, mut ce: usize) -> (usize, usize) {
+    for _ in 0..2 {
+        if ce.saturating_sub(cs) < 12 {
+            break;
+        }
+        let iso_sub = RawSubstrate::from_bytes(&bytes[cs..ce]);
+        let (_, _, iso_pt) = graph.encode_with_gate(&iso_sub);
+        let len = iso_pt.len();
+
+        let mut l = 0usize;
+        while l + 10 < len && iso_pt[l] < 0.44 {
+            l += 1;
+        }
+        let mut r = len;
+        while l + 10 < r && iso_pt[r - 1] < 0.44 {
+            r -= 1;
+        }
+        if l == 0 && r == len {
+            break;
+        }
+        cs += l;
+        ce = cs + (r - l);
+    }
+    (cs, ce)
+}
+
 pub fn discover_causal_regimes_from_encoded(
     graph: &PhiGraph,
     sub: &RawSubstrate,
@@ -460,7 +544,6 @@ pub fn discover_causal_regimes_from_encoded(
         }];
     }
 
-    // Rognage ponctuel sans plafond artificiel de 4 octets (nettoie les préfixes collés)
     for i in 0..active_runs.len() {
         let min_s = if i == 0 { 0 } else { active_runs[i - 1].1 };
         let max_e = if i + 1 == active_runs.len() {
@@ -516,7 +599,6 @@ pub fn discover_causal_regimes_from_encoded(
         }
     }
 
-    // Filtre les micro-blips faibles (ex: étiquette isolée) lorsque des régimes forts existent
     let max_mg = cores
         .iter()
         .map(|&(cs, ce)| gates_ctx[cs..ce].iter().sum::<f32>() / ((ce - cs).max(1) as f32))
@@ -536,39 +618,7 @@ pub fn discover_causal_regimes_from_encoded(
         }
     }
 
-    let k = cores.len();
-    let lead_gap = cores[0].0;
-    let trail_gap = n.saturating_sub(cores[k - 1].1);
-    let suffix_mode = trail_gap >= 3 && lead_gap < 3;
-
-    let mut out = Vec::with_capacity(k);
-    for i in 0..k {
-        let (cs, ce) = cores[i];
-        let mg = gates_ctx[cs..ce].iter().sum::<f32>() / ((ce - cs).max(1) as f32);
-
-        let prev_end = if i == 0 { 0 } else { cores[i - 1].1 };
-        let next_start = if i + 1 == k { n } else { cores[i + 1].0 };
-
-        let referent = if suffix_mode {
-            if next_start.saturating_sub(ce) >= 3 {
-                Some((ce, next_start))
-            } else {
-                None
-            }
-        } else if cs.saturating_sub(prev_end) >= 3 {
-            Some((prev_end, cs))
-        } else {
-            None
-        };
-
-        out.push(DiscoveredRegime {
-            core_start: cs,
-            core_end: ce,
-            referent,
-            mean_gate: mg,
-        });
-    }
-    out
+    attach_passive_referents(&cores, gates_ctx, n)
 }
 
 pub fn discover_causal_regimes(
@@ -578,7 +628,27 @@ pub fn discover_causal_regimes(
 ) -> Vec<DiscoveredRegime> {
     let sub = RawSubstrate::from_bytes(bytes);
     let (rels, gates_ctx, gates_pt) = graph.encode_with_gate(&sub);
-    discover_causal_regimes_from_encoded(graph, &sub, &rels, &gates_ctx, &gates_pt, exact)
+    let raw = discover_causal_regimes_from_encoded(graph, &sub, &rels, &gates_ctx, &gates_pt, exact);
+    if !exact || raw.is_empty() {
+        return raw;
+    }
+
+    let mut tightened: Vec<(usize, usize)> = Vec::with_capacity(raw.len());
+    for reg in raw {
+        let (cs, ce) = tighten_regime_isolated(graph, bytes, reg.core_start, reg.core_end);
+        if ce.saturating_sub(cs) >= 10 {
+            tightened.push((cs, ce));
+        }
+    }
+    if tightened.is_empty() {
+        return vec![DiscoveredRegime {
+            core_start: 0,
+            core_end: bytes.len(),
+            referent: None,
+            mean_gate: gates_ctx.iter().sum::<f32>() / (bytes.len().max(1) as f32),
+        }];
+    }
+    attach_passive_referents(&tightened, &gates_ctx, bytes.len())
 }
 
 pub fn compute_phi_sharp_prepared(
@@ -602,6 +672,7 @@ pub fn compute_phi_sharp_prepared(
     let generativity = (-2.2 * residual).exp().clamp(1e-4, 1.0);
 
     let (neg_rels, gates_neg_ctx, gates_neg_pt) = graph.encode_with_gate(&prep.neg);
+    let (_, gates_pass_ctx, gates_pass_pt) = graph.encode_with_gate(&prep.passive);
     let (_, _, cross_err) = graph.evaluate_hypothesis(&trace.final_state, &neg_rels);
     let neg_trace = graph.abduce(&neg_rels, None);
 
@@ -611,14 +682,21 @@ pub fn compute_phi_sharp_prepared(
 
     let inv_orig = 1.0 / (gates_orig_ctx.len().max(1) as f32);
     let inv_neg = 1.0 / (gates_neg_ctx.len().max(1) as f32);
-    let mean_g_orig_ctx = gates_orig_ctx.iter().sum::<f32>() * inv_orig;
-    let mean_g_orig_pt = gates_orig_pt.iter().sum::<f32>() * inv_orig;
-    let mean_g_neg_ctx = gates_neg_ctx.iter().sum::<f32>() * inv_neg;
-    let mean_g_neg_pt = gates_neg_pt.iter().sum::<f32>() * inv_neg;
+    let inv_pass = 1.0 / (gates_pass_ctx.len().max(1) as f32);
 
-    let mean_g_orig = 0.5 * (mean_g_orig_ctx + mean_g_orig_pt);
-    let mean_g_neg = 0.5 * (mean_g_neg_ctx + mean_g_neg_pt);
-    let gate_contrast = (mean_g_orig * (1.0 - mean_g_neg)).clamp(0.0, 1.0);
+    let mean_g_orig = 0.5
+        * (gates_orig_ctx.iter().sum::<f32>() * inv_orig
+            + gates_orig_pt.iter().sum::<f32>() * inv_orig);
+    let mean_g_neg = 0.5
+        * (gates_neg_ctx.iter().sum::<f32>() * inv_neg
+            + gates_neg_pt.iter().sum::<f32>() * inv_neg);
+    let mean_g_pass = 0.5
+        * (gates_pass_ctx.iter().sum::<f32>() * inv_pass
+            + gates_pass_pt.iter().sum::<f32>() * inv_pass);
+
+    // Pénalise le pire faux positif (répétitions mélangées OU prose/étiquettes passives)
+    let worst_bad_g = mean_g_neg.max(mean_g_pass);
+    let gate_contrast = (mean_g_orig * (1.0 - worst_bad_g)).clamp(0.0, 1.0);
 
     let ref_rels = graph.encode_relations(&prep.refut);
     let ref_trace = graph.abduce(&ref_rels, None);
