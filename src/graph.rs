@@ -41,7 +41,7 @@ pub const NUM_PARAMS: usize = OFF_OUT + REL_DIM * DIM; // 1541
 const MAGIC: &[u8; 4] = b"PHIS";
 const VERSION: u32 = 5;
 
-/// Substrat relationnel brut à échelle invariante (fenêtre fixe ±24, degré local ±12).
+/// Substrat relationnel brut à échelle invariante (fenêtre fixe ±30, degré local ±12).
 #[derive(Clone, Debug)]
 pub struct RawSubstrate {
     pub len: usize,
@@ -54,7 +54,7 @@ pub struct RawSubstrate {
 impl RawSubstrate {
     pub fn from_bytes(bytes: &[u8]) -> Self {
         let n = bytes.len();
-        let win_cap = 24usize;
+        let win_cap = 30usize;
         let deg_rad = 12usize;
         let max_edges = 12usize;
         let log_cap = (win_cap as f32).ln();
@@ -193,7 +193,6 @@ impl PhiGraph {
         Self { weights }
     }
 
-    /// Capteur relationnel 100% appris + porte causale neuronale contextuelle (`±2`) et ponctuelle.
     pub fn encode_with_gate(&self, sub: &RawSubstrate) -> (Vec<[f32; REL_DIM]>, Vec<f32>, Vec<f32>) {
         let w = &self.weights;
         let n = sub.len;
@@ -532,7 +531,7 @@ impl PhiGraph {
         if version != VERSION || count != NUM_PARAMS || data.len() != 12 + count * 4 {
             return Err(io::Error::new(
                 ErrorKind::InvalidData,
-                "Version ou taille du modèle .phis incompatible (ré-entraîne avec v0.5.2)",
+                "Version ou taille du modèle .phis incompatible (ré-entraîne avec v0.6.1)",
             ));
         }
         let mut weights = Vec::with_capacity(count);
