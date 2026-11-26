@@ -3399,6 +3399,7 @@ fn main() {
         eprintln!("  phisharp calibrate     --model out/sharp.phis [--seed 101]");
         eprintln!("  phisharp eval-ood      --model out/sharp.phis [--seed 202]");
         eprintln!("  phisharp eval-transfer --model out/sharp.phis [--seed 303]");
+        eprintln!("  phisharp eval-meta     --untrained out/sharp_step0.phis --ll out/sharp_ll.phis --mdl out/sharp_mdl.phis --phi out/sharp.phis [--seed 404]");
         eprintln!("  phisharp compare       --untrained out/step0.phis --ll out/ll.phis --mdl out/mdl.phis --phi out/sharp.phis");
         eprintln!("  phisharp compare-all   [--dir out] [--steps 300] [--seed 42]");
         eprintln!("  phisharp ask           --model out/sharp.phis --file perceived.eff");
@@ -3445,6 +3446,28 @@ fn main() {
                 .unwrap_or(303);
             let model = PhisharpModel::load(Path::new(&model_path)).expect("Chargement modèle");
             run_eval_transfer(&model, seed);
+        }
+        "eval-meta" => {
+            let p0 = get_arg(&args, "--untrained").expect("--untrained requis");
+            let p_ll = get_arg(&args, "--ll").expect("--ll requis");
+            let p_mdl = get_arg(&args, "--mdl").expect("--mdl requis");
+            let p_phi = get_arg(&args, "--phi").expect("--phi requis");
+            let seed: u64 = get_arg(&args, "--seed")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(404);
+
+            let m0 = PhisharpModel::load(Path::new(&p0)).expect("Chargement --untrained");
+            let m_ll = PhisharpModel::load(Path::new(&p_ll)).expect("Chargement --ll");
+            let m_mdl = PhisharpModel::load(Path::new(&p_mdl)).expect("Chargement --mdl");
+            let m_phi = PhisharpModel::load(Path::new(&p_phi)).expect("Chargement --phi");
+
+            let list = [
+                ("Step0 (rand)", &m0),
+                ("Baseline LL", &m_ll),
+                ("Baseline MDL", &m_mdl),
+                ("Phisharp φ", &m_phi),
+            ];
+            eval_meta::run_eval_meta(&list, seed);
         }
         "compare" => {
             let p0 = get_arg(&args, "--untrained").expect("--untrained requis");
