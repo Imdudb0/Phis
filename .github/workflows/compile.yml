@@ -29,7 +29,7 @@ jobs:
         run: |
           #cargo check
           cargo run --release -- train --out out/sharp.phis --steps 300 --seed 42 > out/out.txt 2>&1
-          #cargo run --release -- ask --model out/sharp.phis --file out/mh.eff
+          cargo run --release -- calibrate --model out/sharp.phis --seed 101
           #cargo run --release -- ask --model out/sharp.phis --file out/mh_flat.eff
           #cargo run --release -- ask --model out/sharp.phis --file out/defs_fr.eff
           #cargo run --release -- ask --model out/sharp.phis --file out/defs_hop3.eff
