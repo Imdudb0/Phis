@@ -327,7 +327,7 @@ fn cmd_gen_eff(args: &[String]) {
         }
     }
 
-    let mut gen = HoPtgrsGenerator::new(
+    let mut gen_ = HoPtgrsGenerator::new(
         seed,
         CurriculumConfig {
             horizon_k,
@@ -336,7 +336,7 @@ fn cmd_gen_eff(args: &[String]) {
             max_attempts: 64,
         },
     );
-    let ep = gen
+    let ep = gen_
         .generate_episode(forced_op)
         .expect("Échec génération HO-PTGRS");
 
