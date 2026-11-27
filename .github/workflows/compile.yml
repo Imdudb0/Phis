@@ -37,11 +37,7 @@ jobs:
             #--ll        out/sharp_ll.phis \
             #--mdl       out/sharp_mdl.phis \
             #--phi       out/sharp.phis
-          cargo run --release -- eval-meta \
-            --untrained out/sharp_step0.phis \
-            --ll        out/sharp_ll.phis \
-            --mdl       out/sharp_mdl.phis \
-            --phi       out/sharp.phis
+          cargo run --release -- compare-all --dir out --steps 250 --seed 42
           #cargo run --release -- calibrate --model out/sharp.phis --seed 101
           #cargo run --release -- eval-ood --model out/sharp.phis --seed 202
           #cargo run --release -- eval-transfer --model out/sharp.phis --seed 303
