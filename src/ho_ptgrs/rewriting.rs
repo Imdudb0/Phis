@@ -1,4 +1,5 @@
-use crate::term_graph::{Node, SymbolId, TermGraph};
+use super::term_graph::{Node, SymbolId, TermGraph};
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 /// Nœud d'un motif de règle DPO (interface K portée par les variables Var(id)).
