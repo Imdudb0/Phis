@@ -1,7 +1,7 @@
-use crate::meta_ops::{DefGraph, Instance};
-use crate::rewriting::{PatternNode, Rule};
-use crate::rng::Rng;
-use crate::term_graph::{SymbolId, TermGraph};
+use meta_ops::{DefGraph, Instance};
+use rewriting::{PatternNode, Rule};
+use rng::Rng;
+use term_graph::{SymbolId, TermGraph};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Marqueurs syntaxiques internes propres à chaque bloc (disjoints entre Def et Inst).
