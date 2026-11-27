@@ -477,7 +477,7 @@ mod tests {
     #[test]
     fn test_abductive_flow_lasalle_monotonicity_on_ho_ptgrs_episode() {
         // Génère un vrai fichier perceived.eff (opérateur \mu_bif) via crate::ho_ptgrs
-        let mut gen = HoPtgrsGenerator::new(
+        let mut gen_ = HoPtgrsGenerator::new(
             2026,
             CurriculumConfig {
                 horizon_k: 4,
@@ -486,7 +486,7 @@ mod tests {
                 max_attempts: 32,
             },
         );
-        let ep = gen
+        let ep = gen_
             .generate_episode(Some(MetaOp::Bif))
             .expect("Génération HO-PTGRS réussie");
 
