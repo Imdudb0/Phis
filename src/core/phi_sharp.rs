@@ -566,7 +566,7 @@ pub struct ModelParams {
 
 impl ModelParams {
     pub fn random_init(n: usize, d: usize, h: usize, rng: &mut Rng) -> Self {
-        let mut init_vec = |len: usize, scale: f64| -> Vec<f64> {
+        let mut init_vec = |len: usize, scale: f64, rng: &mut Rng| -> Vec<f64> {
             (0..len)
                 .map(|_| (rng.gen_f64() * 2.0 - 1.0) * scale)
                 .collect()
@@ -590,19 +590,19 @@ impl ModelParams {
             n,
             d,
             h,
-            w_dir: init_vec(h * d, s_edge),
-            w_comp: init_vec(h * d, s_edge * 0.5),
+            w_dir: init_vec(h * d, s_edge, rng),
+            w_comp: init_vec(h * d, s_edge * 0.5, rng),
             b_edge: vec![0.0; h],
-            w_rel_uni: init_vec(h * REL_DIM, s_rel),
+            w_rel_uni: init_vec(h * REL_DIM, s_rel, rng),
             b_rel_uni: vec![0.0; REL_DIM],
-            w_rel_bi: init_vec(h * BI_DIM, s_rel),
+            w_rel_bi: init_vec(h * BI_DIM, s_rel, rng),
             b_rel_bi: vec![0.0; BI_DIM],
-            w_enc_uni: init_vec(d * REL_DIM, s_enc),
-            w_enc_bi: init_vec(d * BI_DIM, s_enc),
-            w_init_asym: init_vec(d * d, 0.5 / (d as f64).sqrt()),
-            w_init_ov: init_vec(d, 0.3),
+            w_enc_uni: init_vec(d * REL_DIM, s_enc, rng),
+            w_enc_bi: init_vec(d * BI_DIM, s_enc, rng),
+            w_init_asym: init_vec(d * d, 0.5 / (d as f64).sqrt(), rng),
+            w_init_ov: init_vec(d, 0.3, rng),
             w_sol,
-            nu_sol: init_vec(d, 0.15),
+            nu_sol: init_vec(d, 0.15, rng),
         }
     }
 
