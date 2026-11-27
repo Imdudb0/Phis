@@ -53,8 +53,8 @@ fn main() {
         max_attempts: 64,
     };
 
-    let mut gen = HoPtgrsGenerator::new(seed, config);
-    let ep = gen
+    let mut gen_ = HoPtgrsGenerator::new(seed, config);
+    let ep = gen_
         .generate_episode(forced_op)
         .expect("Impossible de générer un épisode valide");
 
@@ -119,10 +119,10 @@ mod tests {
             noise_ratio: 0.75,
             max_attempts: 32,
         };
-        let mut gen = HoPtgrsGenerator::new(2026, cfg);
+        let mut gen_ = HoPtgrsGenerator::new(2026, cfg);
 
         for op in MetaOp::catalog() {
-            let ep = gen
+            let ep = gen_
                 .generate_episode(Some(op.clone()))
                 .unwrap_or_else(|e| panic!("Échec pour {:?}: {}", op, e));
 
