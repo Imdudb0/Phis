@@ -609,14 +609,14 @@ where
             noise_ratio: cur_noise,
             max_attempts: 64,
         };
-        let mut gen = HoPtgrsGenerator::new(
+        let mut gen_ = HoPtgrsGenerator::new(
             train_cfg
                 .seed
                 .wrapping_add((ep_idx as u64).wrapping_mul(0x9E37_79B9)),
             cur_cfg,
         );
 
-        let ep = match gen.generate_episode(None) {
+        let ep = match gen_.generate_episode(None) {
             Ok(e) => e,
             Err(_) => continue,
         };
@@ -693,7 +693,7 @@ pub fn evaluate_post_hoc(
     num_episodes: usize,
     seed: u64,
 ) -> PostHocEvalSummary {
-    let mut gen = HoPtgrsGenerator::new(seed, CurriculumConfig::default());
+    let mut gen_ = HoPtgrsGenerator::new(seed, CurriculumConfig::default());
     let mut tested = 0usize;
     let mut sum_phi_gain = 0.0;
     let mut sum_lam2 = 0.0;
@@ -702,7 +702,7 @@ pub fn evaluate_post_hoc(
     let mut sum_target_overlap = 0.0;
 
     for i in 0..num_episodes {
-        let ep = match gen.generate_episode(None) {
+        let ep = match gen_.generate_episode(None) {
             Ok(e) => e,
             Err(_) => continue,
         };
