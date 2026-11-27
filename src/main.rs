@@ -345,23 +345,36 @@ struct ForwardOut {
     p_hat: Vec<f64>,
 }
 
+// --- Fonction libre, à placer avant impl AbductiveNet ---
+fn init_vec(rng: &mut Rng, n: usize, s: f64) -> Vec<f64> {
+    (0..n).map(|_| (rng.gen_f64() * 2.0 - 1.0) * s).collect()
+}
+
 impl AbductiveNet {
     fn random_init(rng: &mut Rng) -> Self {
-        let mut init = |n: usize, s: f64| -> Vec<f64> {
-            (0..n).map(|_| (rng.gen_f64() * 2.0 - 1.0) * s).collect()
-        };
+        // Ordre d'appel identique à l'original (déterminisme préservé).
+        let abd1 = RelLayer::random_init(4, C_HID, rng);
+        let abd2 = RelLayer::random_init(C_HID, C_HID, rng);
+        let w_s_diag = init_vec(rng, C_HID, 0.4);
+        let w_s_row  = init_vec(rng, C_HID, 0.4);
+        let w_h      = init_vec(rng, H_DIM * C_HID, 0.5);
+        let exe1 = RelLayer::random_init(3 + H_DIM, C_HID, rng);
+        let exe2 = RelLayer::random_init(C_HID, C_HID, rng);
+        let exe3 = RelLayer::random_init(C_HID, C_HID, rng);
+        let w_t  = init_vec(rng, C_HID, 0.8);
+
         Self {
-            abd1: RelLayer::random_init(4, C_HID, rng),
-            abd2: RelLayer::random_init(C_HID, C_HID, rng),
-            w_s_diag: init(C_HID, 0.4),
-            w_s_row: init(C_HID, 0.4),
+            abd1,
+            abd2,
+            w_s_diag,
+            w_s_row,
             b_s: -0.5,
-            w_h: init(H_DIM * C_HID, 0.5),
+            w_h,
             b_h: vec![0.0; H_DIM],
-            exe1: RelLayer::random_init(3 + H_DIM, C_HID, rng),
-            exe2: RelLayer::random_init(C_HID, C_HID, rng),
-            exe3: RelLayer::random_init(C_HID, C_HID, rng),
-            w_t: init(C_HID, 0.8),
+            exe1,
+            exe2,
+            exe3,
+            w_t,
         }
     }
 
@@ -612,9 +625,9 @@ impl Adam {
         self.t += 1;
         let g = grad.flat_vec();
         let mut params = net.flat_params_mut();
-        let b1 = 0.9;
-        let b2 = 0.999;
-        let eps = 1e-8;
+        let b1: f64 = 0.9;
+        let b2: f64 = 0.999;
+        let eps: f64 = 1e-8;
         let bc1 = 1.0 - b1.powi(self.t as i32);
         let bc2 = 1.0 - b2.powi(self.t as i32);
 
