@@ -1,9 +1,9 @@
-use codec::EpisodicCodec;
-use meta_ops::{build_def_graph, evaluate_meta_op, Instance, MetaOp};
-use rewriting::{PatternGraph, Rule};
-use rigidity::{verify_rigidity_2fwl, RigidityReport};
-use rng::Rng;
-use term_graph::{SymbolId, TermGraph};
+use super::codec::EpisodicCodec;
+use super::meta_ops::{build_def_graph, evaluate_meta_op, Instance, MetaOp};
+use super::rewriting::{PatternGraph, Rule};
+use super::rigidity::{verify_rigidity_2fwl, RigidityReport};
+use super::rng::Rng;
+use super::term_graph::{SymbolId, TermGraph};
 
 use std::collections::BTreeMap;
 
