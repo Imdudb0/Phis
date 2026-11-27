@@ -108,7 +108,7 @@ mod tests {
     use super::*;
     use phisharp::ho_ptgrs::meta_ops::{build_def_graph, DefGraph};
     use phisharp::ho_ptgrs::rigidity::verify_rigidity_2fwl;
-    use phisharp::ho_ptgrs::crate::term_graph::SymbolId;
+    use phisharp::ho_ptgrs::term_graph::SymbolId;
 
     use std::collections::BTreeMap;
 
