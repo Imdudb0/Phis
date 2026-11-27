@@ -1,8 +1,8 @@
 use super::meta_ops::{DefGraph, Instance};
 use super::rewriting::{PatternNode, Rule};
+use super::rng::Rng;
+use super::term_graph::{SymbolId, TermGraph};
 
-use rng::Rng;
-use term_graph::{SymbolId, TermGraph};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Marqueurs syntaxiques internes propres à chaque bloc (disjoints entre Def et Inst).
