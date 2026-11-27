@@ -1,5 +1,5 @@
-use rewriting::{detect_absorber_symbols, DerivationGraph, Rule};
-use term_graph::{anti_unify, SymbolId, TermGraph};
+use super::rewriting::{detect_absorber_symbols, DerivationGraph, Rule};
+use super::term_graph::{anti_unify, SymbolId, TermGraph};
 
 use std::collections::{BTreeMap, BTreeSet};
 
