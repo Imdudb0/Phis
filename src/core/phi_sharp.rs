@@ -389,7 +389,7 @@ impl ModelParams {
             .map(|c| r.channels[c].matmul(&r.channels[c]))
             .collect();
 
-        let inv_n = 1.0 / (n as f64);
+        let inv_n = 1.0 / (n as f64).sqrt();
         let mut h_node = vec![0.0; h];
         let mut logits = [0.0f64; BYTE_VOCAB];
         let mut total = 0.0;
@@ -448,7 +448,7 @@ impl ModelParams {
         let n = self.n;
         let d = self.d;
         let h = self.h;
-        let inv_n = 1.0 / (n as f64);
+        let inv_n = 1.0 / (n as f64).sqrt();
 
         let comp: Vec<Mat> = (0..d)
             .map(|c| r.channels[c].matmul(&r.channels[c]))
@@ -716,7 +716,7 @@ pub fn evaluate_phi_sharp(
 
             let r_abl = r.with_ablated_edge(i, j);
             let rho_ij = params.residual_only(&r_abl, effect, cfg.lambda_bi);
-            let (s_ij, ds_drho_ij) = smooth_min(rho_ij, UNIFORM_BYTE_RESIDUAL, cfg.smin_eps);
+            let (s_ij, ds_drho_ij) = smooth_cap(rho_ij, UNIFORM_BYTE_RESIDUAL, cfg.smin_eps);
             let delta = s_ij - rho;
             let (h_val, h_prime) = smooth_hinge(delta, cfg.hinge_tau);
 
@@ -862,17 +862,13 @@ pub fn smooth_hinge(x: f64, tau: f64) -> (f64, f64) {
     }
 }
 
-/// Minimum lisse stable smin_\eps(a, b) et sa dérivée exacte d(smin)/da.
+/// Plafond lisse C^1 sans biais sous le seuil b :
+/// - pour a <= b : vaut exactement `a` (dérivée = 1, zéro zone morte sous log(256))
+/// - pour a >= b + eps : plafonné à `b + 0.5*eps` (dérivée = 0)
 #[inline]
-pub fn smooth_min(a: f64, b: f64, eps: f64) -> (f64, f64) {
-    let diff = (a - b) / eps;
-    if diff >= 0.0 {
-        let e = (-diff).exp();
-        (b - eps * e.ln_1p(), e / (1.0 + e))
-    } else {
-        let e = diff.exp();
-        (a - eps * e.ln_1p(), 1.0 / (1.0 + e))
-    }
+pub fn smooth_cap(a: f64, b: f64, eps: f64) -> (f64, f64) {
+    let (h, hp) = smooth_hinge(a - b, eps);
+    (a - h, 1.0 - hp)
 }
 
 fn head_cross_entropy(
@@ -1041,9 +1037,8 @@ mod tests {
         let mut rng = Rng::from_seed(2026);
         let n = 5;
         let d = 2;
-        let h = 4;
+        let h = 8;
         let mut params = ModelParams::random_init(n, d, h, &mut rng);
-        // Amplifier légèrement la sortie pour que de nombreuses arêtes aient w_{ij} > 0
         for v in &mut params.w_out_uni {
             *v *= 2.5;
         }
@@ -1071,9 +1066,9 @@ mod tests {
 
         let mut r = params.encode_regional_pole(&eff, 4.0);
         // Quelques pas de descente sur le résidu pour se placer en régime causal actif (\lambda_2 > 0)
-        for _ in 0..12 {
+        for _ in 0..20 {
             let (_, g_rho) = params.residual_and_grad_r(&r, &eff, cfg.lambda_bi);
-            r.axpy(-0.8, &g_rho);
+            r.axpy(-2.0, &g_rho);
         }
 
         let (eval, grad_opt) = evaluate_phi_sharp(&params, &r, &eff, &probes, &cfg, true);
