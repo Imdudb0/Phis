@@ -215,7 +215,7 @@ fn compute_max_inst_index(inst: &Instance) -> usize {
     for r in &inst.rules {
         m = m.max(r.lhs.nodes.len() + 1).max(r.rhs.nodes.len() + 1);
         for n in r.lhs.nodes.iter().chain(r.rhs.nodes.iter()) {
-            if let crate::rewriting::PatternNode::Var(vid) = n {
+            if let PatternNode::Var(vid) = n {
                 m = m.max(*vid as usize + 1);
             }
         }
