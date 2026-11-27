@@ -270,7 +270,8 @@ pub struct ModelParams {
 
 impl ModelParams {
     pub fn random_init(n: usize, d: usize, h: usize, rng: &mut Rng) -> Self {
-        let mut init_vec = |len: usize, scale: f64| -> Vec<f64> {
+        // closure NE capture PAS rng : elle le reçoit en argument
+        let init_vec = |len: usize, scale: f64, rng: &mut Rng| -> Vec<f64> {
             (0..len)
                 .map(|_| (rng.gen_f64() * 2.0 - 1.0) * scale)
                 .collect()
@@ -294,18 +295,18 @@ impl ModelParams {
             n,
             d,
             h,
-            w_dir: init_vec(h * d, s_edge),
-            w_comp: init_vec(h * d, s_edge * 0.5),
+            w_dir: init_vec(h * d, s_edge, rng),
+            w_comp: init_vec(h * d, s_edge * 0.5, rng),
             b_edge: vec![0.0; h],
-            w_out_uni: init_vec(BYTE_VOCAB * h, s_out),
+            w_out_uni: init_vec(BYTE_VOCAB * h, s_out, rng),
             b_out_uni: vec![0.0; BYTE_VOCAB],
-            w_out_bi: init_vec(BYTE_VOCAB * h, s_out),
+            w_out_bi: init_vec(BYTE_VOCAB * h, s_out, rng),
             b_out_bi: vec![0.0; BYTE_VOCAB],
-            w_enc_uni: init_vec(d * BYTE_VOCAB, s_enc),
-            w_enc_bi: init_vec(d * BYTE_VOCAB, s_enc),
-            w_init_asym: init_vec(d * d, 0.5 / (d as f64).sqrt()),
+            w_enc_uni: init_vec(d * BYTE_VOCAB, s_enc, rng),
+            w_enc_bi: init_vec(d * BYTE_VOCAB, s_enc, rng),
+            w_init_asym: init_vec(d * d, 0.5 / (d as f64).sqrt(), rng),
             w_sol,
-            nu_sol: init_vec(d, 0.15),
+            nu_sol: init_vec(d, 0.15, rng),
         }
     }
 
