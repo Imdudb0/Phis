@@ -38,7 +38,7 @@ impl Default for FlowConfig {
             max_steps: 40,
             dt_init: 0.25,
             dt_min: 1e-5,
-            dt_max: 2.0,
+            dt_max: 8.0,
             eta: 1.0,
             omega: 0.5,
             omega_perp: 0.1,
@@ -296,12 +296,14 @@ pub fn run_abductive_flow(
         let rate_lie = flow_cfg.omega * dual.frob_norm_sq();
         let lyap_rate = rate_grad + rate_lie;
 
+        let ascent_scale = proj_g.frob_norm() + a_asc.frob_norm();
+        let perp_cap = (flow_cfg.omega_perp * ascent_scale).min(flow_cfg.max_perp_norm);
         let a_perp = build_orthogonal_solenoidal(
             params,
             &r,
             &a_asc,
             flow_cfg.omega_perp,
-            flow_cfg.max_perp_norm,
+            perp_cap,
         );
         let perp_norm = a_perp.frob_norm();
 
@@ -492,7 +494,7 @@ mod tests {
 
         let n = 6;
         let d = 2;
-        let h = 4;
+        let h = 8;
         let mut rng = Rng::from_seed(777);
         let mut params = ModelParams::random_init(n, d, h, &mut rng);
         for v in &mut params.w_out_uni {
@@ -514,11 +516,12 @@ mod tests {
             max_inv_power: 4,
         };
         let flow_cfg = FlowConfig {
-            max_steps: 18,
-            dt_init: 0.4,
+            max_steps: 25,
+            dt_init: 1.0,
+            dt_max: 8.0,
             eta: 1.0,
             omega: 0.4,
-            omega_perp: 0.08,
+            omega_perp: 0.15,
             gamma_abs: 0.01,
             ball_radius_k: 6.0,
             ..FlowConfig::default()
