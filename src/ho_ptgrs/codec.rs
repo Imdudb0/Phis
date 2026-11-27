@@ -1,5 +1,6 @@
-use meta_ops::{DefGraph, Instance};
-use rewriting::{PatternNode, Rule};
+use super::meta_ops::{DefGraph, Instance};
+use super::rewriting::{PatternNode, Rule};
+
 use rng::Rng;
 use term_graph::{SymbolId, TermGraph};
 use std::collections::{BTreeMap, BTreeSet};
