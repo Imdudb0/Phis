@@ -196,8 +196,8 @@ impl AdamWState {
         weight_decay: f64,
     ) {
         self.step += 1;
-        let b1 = 0.9;
-        let b2 = 0.999;
+        let b1: f64 = 0.9;
+        let b2: f64 = 0.999;
         let eps = 1e-8;
         let bc1 = 1.0 - b1.powi(self.step as i32);
         let bc2 = 1.0 - b2.powi(self.step as i32);
