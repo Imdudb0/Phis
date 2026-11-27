@@ -27,25 +27,7 @@ jobs:
 
       - name: Run Phisharp
         run: |
-          cargo run --release -- grad-check --seed 42
-          #cargo check
-          #cargo run --release -- train --out out/sharp.phis --steps 300 --seed 42 > out/out.txt 2>&1
-          #cargo run --release -- train --out out/sharp_step0.phis --objective untrained --seed 42
-          #cargo run --release -- train --out out/sharp_ll.phis    --objective ll  --steps 300 --seed 42
-          #cargo run --release -- train --out out/sharp_mdl.phis   --objective mdl --steps 300 --seed 42
-          #cargo run --release -- compare \
-            #--untrained out/sharp_step0.phis \
-            #--ll        out/sharp_ll.phis \
-            #--mdl       out/sharp_mdl.phis \
-            #--phi       out/sharp.phis
-          cargo run --release -- compare-all --dir out --steps 120 --seed 42
-          #cargo run --release -- calibrate --model out/sharp.phis --seed 101
-          #cargo run --release -- eval-ood --model out/sharp.phis --seed 202
-          #cargo run --release -- eval-transfer --model out/sharp.phis --seed 303
-          #cargo run --release -- ask --model out/sharp.phis --file out/defs_hop3.eff
-          #cargo run --release -- ask --model out/sharp.phis --file out/comp.eff
-
-          #cargo run --release -- ask --model out/sharp.phis --file out/defs_fr.eff > out/ask.txt 2>&1
+          cargo run --release
         env:
           RUSTFLAGS: "-C target-cpu=native"
 
