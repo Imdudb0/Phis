@@ -1,5 +1,6 @@
-use crate::rewriting::{detect_absorber_symbols, DerivationGraph, Rule};
-use crate::term_graph::{anti_unify, SymbolId, TermGraph};
+use rewriting::{detect_absorber_symbols, DerivationGraph, Rule};
+use term_graph::{anti_unify, SymbolId, TermGraph};
+
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Base canonique des 6 opérateurs méta-relationnels M et leur clôture par composition.
