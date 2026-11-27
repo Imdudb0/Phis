@@ -1,9 +1,10 @@
-use crate::codec::EpisodicCodec;
-use crate::meta_ops::{build_def_graph, evaluate_meta_op, Instance, MetaOp};
-use crate::rewriting::{PatternGraph, Rule};
-use crate::rigidity::{verify_rigidity_2fwl, RigidityReport};
-use crate::rng::Rng;
-use crate::term_graph::{SymbolId, TermGraph};
+use codec::EpisodicCodec;
+use meta_ops::{build_def_graph, evaluate_meta_op, Instance, MetaOp};
+use rewriting::{PatternGraph, Rule};
+use rigidity::{verify_rigidity_2fwl, RigidityReport};
+use rng::Rng;
+use term_graph::{SymbolId, TermGraph};
+
 use std::collections::BTreeMap;
 
 /// Paramètres de curriculum du générateur HO-PTGRS : (k, D, r_bruit).
