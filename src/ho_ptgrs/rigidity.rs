@@ -1,4 +1,4 @@
-use crate::meta_ops::{DefGraph, MetaOp};
+use super::meta_ops::{DefGraph, MetaOp};
 use std::collections::{BTreeMap, HashMap};
 
 /// Rapport de vérification de rigidité définitionnelle (Théorème B, Condition 1).
