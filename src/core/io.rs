@@ -1,5 +1,5 @@
 use crate::core::flow::FlowConfig;
-use crate::core::phi_sharp::{ModelParams, PhiSharpConfig};
+use crate::core::phi_sharp::{ModelParams, PhiSharpConfig, BI_DIM, REL_DIM};
 use crate::core::projection::ProjectionConfig;
 use crate::core::tensor::Mat;
 use std::fs::{self, File};
@@ -7,9 +7,9 @@ use std::io::{Read, Write};
 use std::path::Path;
 
 const MAGIC: &[u8; 8] = b"PHISHARP";
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 
-/// Point de sauvegarde complet d'un modèle Phisharp (`out/sharp.phis`).
+/// Point de sauvegarde complet d'un modèle Phisharp S_256-équivariant (`out/sharp.phis`).
 #[derive(Debug, Clone)]
 pub struct PhisCheckpoint {
     pub params: ModelParams,
@@ -91,12 +91,13 @@ impl PhisCheckpoint {
         write_u64(&mut buf, p.d as u64);
         write_u64(&mut buf, p.h as u64);
 
-        // PhiSharpConfig
+        // PhiSharpConfig v2
+        write_f64(&mut buf, self.phi_cfg.beta_iit);
         write_f64(&mut buf, self.phi_cfg.alpha);
         write_f64(&mut buf, self.phi_cfg.beta);
         write_f64(&mut buf, self.phi_cfg.lambda_bi);
         write_f64(&mut buf, self.phi_cfg.hinge_tau);
-        write_f64(&mut buf, self.phi_cfg.smin_eps);
+        write_f64(&mut buf, self.phi_cfg.cap_eps);
         write_u64(&mut buf, self.phi_cfg.max_krylov as u64);
         write_u64(&mut buf, self.phi_cfg.max_inv_power as u64);
 
@@ -126,17 +127,18 @@ impl PhisCheckpoint {
         write_f64(&mut buf, self.proj_cfg.tau_sharp);
         write_f64(&mut buf, self.proj_cfg.tol_step_l12);
 
-        // ModelParams
+        // ModelParams v2 (strictement S_256-équivariant)
         write_vec_f64(&mut buf, &p.w_dir);
         write_vec_f64(&mut buf, &p.w_comp);
         write_vec_f64(&mut buf, &p.b_edge);
-        write_vec_f64(&mut buf, &p.w_out_uni);
-        write_vec_f64(&mut buf, &p.b_out_uni);
-        write_vec_f64(&mut buf, &p.w_out_bi);
-        write_vec_f64(&mut buf, &p.b_out_bi);
+        write_vec_f64(&mut buf, &p.w_rel_uni);
+        write_vec_f64(&mut buf, &p.b_rel_uni);
+        write_vec_f64(&mut buf, &p.w_rel_bi);
+        write_vec_f64(&mut buf, &p.b_rel_bi);
         write_vec_f64(&mut buf, &p.w_enc_uni);
         write_vec_f64(&mut buf, &p.w_enc_bi);
         write_vec_f64(&mut buf, &p.w_init_asym);
+        write_vec_f64(&mut buf, &p.w_init_ov);
         write_vec_f64(&mut buf, &p.w_sol.data);
         write_vec_f64(&mut buf, &p.nu_sol);
 
@@ -151,11 +153,12 @@ impl PhisCheckpoint {
         let h = read_u64(data, &mut cursor)? as usize;
 
         let phi_cfg = PhiSharpConfig {
+            beta_iit: read_f64(data, &mut cursor)?,
             alpha: read_f64(data, &mut cursor)?,
             beta: read_f64(data, &mut cursor)?,
             lambda_bi: read_f64(data, &mut cursor)?,
             hinge_tau: read_f64(data, &mut cursor)?,
-            smin_eps: read_f64(data, &mut cursor)?,
+            cap_eps: read_f64(data, &mut cursor)?,
             max_krylov: read_u64(data, &mut cursor)? as usize,
             max_inv_power: read_u64(data, &mut cursor)? as usize,
         };
@@ -191,18 +194,25 @@ impl PhisCheckpoint {
         let w_dir = read_vec_f64(data, &mut cursor)?;
         let w_comp = read_vec_f64(data, &mut cursor)?;
         let b_edge = read_vec_f64(data, &mut cursor)?;
-        let w_out_uni = read_vec_f64(data, &mut cursor)?;
-        let b_out_uni = read_vec_f64(data, &mut cursor)?;
-        let w_out_bi = read_vec_f64(data, &mut cursor)?;
-        let b_out_bi = read_vec_f64(data, &mut cursor)?;
+        let w_rel_uni = read_vec_f64(data, &mut cursor)?;
+        let b_rel_uni = read_vec_f64(data, &mut cursor)?;
+        let w_rel_bi = read_vec_f64(data, &mut cursor)?;
+        let b_rel_bi = read_vec_f64(data, &mut cursor)?;
         let w_enc_uni = read_vec_f64(data, &mut cursor)?;
         let w_enc_bi = read_vec_f64(data, &mut cursor)?;
         let w_init_asym = read_vec_f64(data, &mut cursor)?;
+        let w_init_ov = read_vec_f64(data, &mut cursor)?;
         let w_sol_data = read_vec_f64(data, &mut cursor)?;
         let nu_sol = read_vec_f64(data, &mut cursor)?;
 
-        if w_sol_data.len() != n * n {
-            return Err("Dimensions incohérentes pour w_sol".to_string());
+        if w_rel_uni.len() != h * REL_DIM
+            || b_rel_uni.len() != REL_DIM
+            || w_rel_bi.len() != h * BI_DIM
+            || b_rel_bi.len() != BI_DIM
+            || w_init_ov.len() != d
+            || w_sol_data.len() != n * n
+        {
+            return Err("Dimensions incohérentes dans le checkpoint .phis v2".to_string());
         }
 
         let params = ModelParams {
@@ -212,13 +222,14 @@ impl PhisCheckpoint {
             w_dir,
             w_comp,
             b_edge,
-            w_out_uni,
-            b_out_uni,
-            w_out_bi,
-            b_out_bi,
+            w_rel_uni,
+            b_rel_uni,
+            w_rel_bi,
+            b_rel_bi,
             w_enc_uni,
             w_enc_bi,
             w_init_asym,
+            w_init_ov,
             w_sol: Mat {
                 n,
                 data: w_sol_data,
@@ -295,7 +306,7 @@ mod tests {
     use crate::ho_ptgrs::rng::Rng;
 
     #[test]
-    fn test_phis_checkpoint_roundtrip_and_corruption_check() {
+    fn test_phis_checkpoint_v2_roundtrip_and_corruption_check() {
         let mut rng = Rng::from_seed(1337);
         let ckpt = PhisCheckpoint {
             params: ModelParams::random_init(5, 2, 6, &mut rng),
@@ -304,16 +315,17 @@ mod tests {
             proj_cfg: ProjectionConfig::default(),
         };
 
-        let path = std::env::temp_dir().join("phisharp_roundtrip_test.phis");
-        ckpt.save(&path).expect("Sauvegarde .phis réussie");
+        let path = std::env::temp_dir().join("phisharp_v2_roundtrip_test.phis");
+        ckpt.save(&path).expect("Sauvegarde .phis v2 réussie");
 
-        let loaded = PhisCheckpoint::load(&path).expect("Chargement .phis réussi");
+        let loaded = PhisCheckpoint::load(&path).expect("Chargement .phis v2 réussi");
         assert_eq!(loaded.params.n, ckpt.params.n);
         assert_eq!(loaded.params.d, ckpt.params.d);
         assert_eq!(loaded.params.h, ckpt.params.h);
-        assert_eq!(loaded.params.w_dir, ckpt.params.w_dir);
-        assert_eq!(loaded.params.w_sol.data, ckpt.params.w_sol.data);
-        assert_eq!(loaded.proj_cfg.out_len, ckpt.proj_cfg.out_len);
+        assert_eq!(loaded.params.w_rel_uni, ckpt.params.w_rel_uni);
+        assert_eq!(loaded.params.w_rel_bi, ckpt.params.w_rel_bi);
+        assert_eq!(loaded.params.w_init_ov, ckpt.params.w_init_ov);
+        assert_eq!(loaded.phi_cfg.beta_iit, ckpt.phi_cfg.beta_iit);
 
         // Corrompre 1 octet et vérifier le rejet par FNV-1a
         let mut raw = fs::read(&path).unwrap();
