@@ -7,11 +7,6 @@ use crate::core::*;
 
 pub(crate) const MAGIC: &[u8; 8] = b"PHIS24V4";
 
-// ============================================================================
-// Disposition des paramètres (2861 paramètres, poids non-réciproques)
-// Zéro fast-weight, repère L0 fixe, 100 % différentiable sur Tape.
-// ============================================================================
-
 const D2: usize = DIM * DIM;
 
 const OFF_W_LAT1: usize = 0;
@@ -45,7 +40,6 @@ const OFF_B_ABS: usize = OFF_B2 + DIM;
 const OFF_GATES: usize = OFF_B_ABS + DIM;
 pub(crate) const PARAM_COUNT: usize = OFF_GATES + 8;
 
-/// Vues slicées des paramètres sur la Tape.
 #[derive(Clone, Copy)]
 pub(crate) struct ParamsTape {
     pub(crate) root: usize,
@@ -145,14 +139,12 @@ impl ParamsTape {
     }
 }
 
-/// État causal pur sur la Tape : uniquement (H1, H2). L0 reste fixe et immuable.
 #[derive(Clone)]
 pub(crate) struct NmState {
     pub(crate) h1: Vec<usize>,
     pub(crate) h2: Vec<usize>,
 }
 
-/// État matérialisé (détaché de la Tape) pour inspections et épreuves externes.
 #[derive(Clone)]
 pub(crate) struct RawState {
     pub(crate) h1: Vec<[f64; DIM]>,
@@ -347,7 +339,6 @@ impl PhisharpV4 {
         NmState { h1, h2 }
     }
 
-    /// Régénère H1 purement de haut en bas depuis H2 (épreuve d'abstraction S_abs).
     pub(crate) fn regenerate_h1_from_h2(
         t: &mut Tape,
         p: &ParamsTape,
@@ -378,7 +369,6 @@ impl PhisharpV4 {
         h1_abs
     }
 
-    /// Prépare l'opérateur non-markovien sur le repère L0 fixe et immuable.
     pub(crate) fn prepare_operator(
         t: &mut Tape,
         p: &ParamsTape,
@@ -410,7 +400,6 @@ impl PhisharpV4 {
             t.mul(th1, th2)
         };
 
-        // 1. Gouvernance descendante L2 -> L1 (non-réciproque)
         let mut h1_eff = state.h1.clone();
         let mut meta2 = Vec::with_capacity(k2);
         if !cut_vertical && k2 > 0 {
@@ -438,7 +427,6 @@ impl PhisharpV4 {
             }
         }
 
-        // 2. Flux latéral dirigé dans L1 + gouvernance L2
         let flow_msg: Vec<usize> = h1_eff
             .iter()
             .map(|&hk| t.mat_vec(p.u_flow, hk, DIM, DIM))
@@ -473,7 +461,6 @@ impl PhisharpV4 {
             gate_h.push(t.mat_vec(p.u_mul, h1_eff[k], DIM, DIM));
         }
 
-        // 3. Pré-projection unique des V vecteurs fixes du repère L0
         let basis: Vec<usize> = view.basis.iter().map(|b| t.leaf(b.clone())).collect();
         let ua_e: Vec<usize> = basis
             .iter()
@@ -516,7 +503,6 @@ impl PhisharpV4 {
         }
     }
 
-    /// Applique l'opérateur causal T_{H1, H2} sur un vecteur de contexte c in R^DIM.
     fn apply_op(t: &mut Tape, f: &OpFields, c: usize) -> (usize, usize) {
         let k1 = f.h1_eff.len();
         if k1 == 0 {
@@ -555,8 +541,6 @@ impl PhisharpV4 {
         t.scalar_mul(raw, f.inv_tau)
     }
 
-    /// Déploiement vertical non-markovien sur les 3 tables ternaires :
-    /// 0: (u,v) -> next ; 1: (u,_,w) -> mid ; 2: composition (v, B(u,v)) -> skip3.
     pub(crate) fn unfold_tables(
         t: &mut Tape,
         p: &ParamsTape,
@@ -619,7 +603,6 @@ impl PhisharpV4 {
                         (c1, y1, at1)
                     }
                     _ => {
-                        // Composition verticale de profondeur 2 : y_skip = B(e_v, B(e_u, e_v))
                         let a = f.ua_e[entry.u];
                         let b = f.ub_e[entry.v];
                         let ab = t.mul(a, b);
@@ -655,7 +638,6 @@ impl PhisharpV4 {
                 probs[m].push(pr);
             }
 
-            // Gain normalisé strictement au-dessus de H(P_marg)
             let hm = tables.h_marg[m].max(0.05_f64);
             let neg_nll = t.scale(nll_acc, -1.0_f64);
             let diff = t.add_scalar(neg_nll, hm);
@@ -702,7 +684,6 @@ impl PhisharpV4 {
         )
     }
 
-    /// Une étape de circulation abductive pure sur (H1, H2) (repère L0 fixe).
     pub(crate) fn abductive_step(
         t: &mut Tape,
         p: &ParamsTape,
@@ -721,22 +702,27 @@ impl PhisharpV4 {
         let (f, ev) =
             Self::unfold_tables(t, p, view, tables, state, cut_l1, cut_vertical, task_mask);
 
-        // Portes temporelles pilotées par la norme du résidu
         let g0 = p.gate(t, 0);
         let g1 = p.gate(t, 1);
         let g2 = p.gate(t, 2);
         let g3 = p.gate(t, 3);
-        let a1_pre = t.add(t.mul(g0, ev.residual_l1), g1);
+
+        let a1_mul = t.mul(g0, ev.residual_l1);
+        let a1_pre = t.add(a1_mul, g1);
         let a1_sig = t.sigmoid(a1_pre);
-        let alpha1 = t.add_scalar(t.scale(a1_sig, 0.56_f64), 0.14_f64);
-        let one_m_a1 = t.add_scalar(t.scale(alpha1, -1.0_f64), 1.0_f64);
+        let a1_sc = t.scale(a1_sig, 0.56_f64);
+        let alpha1 = t.add_scalar(a1_sc, 0.14_f64);
+        let neg_a1 = t.scale(alpha1, -1.0_f64);
+        let one_m_a1 = t.add_scalar(neg_a1, 1.0_f64);
 
-        let a2_pre = t.add(t.mul(g2, ev.residual_l1), g3);
+        let a2_mul = t.mul(g2, ev.residual_l1);
+        let a2_pre = t.add(a2_mul, g3);
         let a2_sig = t.sigmoid(a2_pre);
-        let alpha2 = t.add_scalar(t.scale(a2_sig, 0.56_f64), 0.14_f64);
-        let one_m_a2 = t.add_scalar(t.scale(alpha2, -1.0_f64), 1.0_f64);
+        let a2_sc = t.scale(a2_sig, 0.56_f64);
+        let alpha2 = t.add_scalar(a2_sc, 0.14_f64);
+        let neg_a2 = t.scale(alpha2, -1.0_f64);
+        let one_m_a2 = t.add_scalar(neg_a2, 1.0_f64);
 
-        // 1. Agrégation des résidus ternaires non-markoviens vers L1
         let mut w_sum = 0.0_f64;
         for m in 0..3 {
             if task_mask[m] && !tables.tables[m].is_empty() {
@@ -754,7 +740,7 @@ impl PhisharpV4 {
             let mw = TASK_W[m] * inv_w;
             for (i, entry) in tables.tables[m].iter().enumerate() {
                 let tgt = t.leaf(entry.target.clone());
-                let diff = t.sub(tgt, ev.probs[m][i]); // P_obs - P_hat (s'annule à l'attracteur)
+                let diff = t.sub(tgt, ev.probs[m][i]);
                 let r_vec = t.weighted_sum(diff, f.basis.clone());
                 let ur = t.mat_vec(p.u_res, r_vec, DIM, DIM);
                 let uc = t.mat_vec(p.u_ctx, r_vec, DIM, DIM);
@@ -765,14 +751,14 @@ impl PhisharpV4 {
 
                 for k in 0..k1 {
                     let ak = t.slice(ev.attn_vecs[m][i], k, 1);
-                    let gate_k = t.add_scalar(t.scale(ak, 0.85_f64), 0.15_f64);
+                    let ak_s = t.scale(ak, 0.85_f64);
+                    let gate_k = t.add_scalar(ak_s, 0.15_f64);
                     let contrib = t.scalar_mul(s_scaled, gate_k);
                     e_up[k] = t.add(e_up[k], contrib);
                 }
             }
         }
 
-        // 2. Mise à jour Niveau 1 (résidu + couplage latéral W_lat1 + L2 -> L1)
         let lat1_msg: Vec<usize> = state
             .h1
             .iter()
@@ -816,16 +802,18 @@ impl PhisharpV4 {
             next_h1.push(t.rms_norm(raw, 0.25_f64));
         }
 
-        // 3. Réification pure L1 -> L2 (zéro accès direct à L0)
         let g5 = p.gate(t, 5);
-        let beta_dyn = t.add_scalar(t.scale(t.sigmoid(g5), 0.80_f64), 0.20_f64);
+        let sig_g5 = t.sigmoid(g5);
+        let sc_g5 = t.scale(sig_g5, 0.80_f64);
+        let beta_dyn = t.add_scalar(sc_g5, 0.20_f64);
 
         let mut e1_reified = Vec::with_capacity(k1);
         for k in 0..k1 {
             let dh = t.sub(next_h1[k], state.h1[k]);
             let dh_s = t.scalar_mul(dh, beta_dyn);
             let s1 = t.add(next_h1[k], dh_s);
-            let s2 = t.add(s1, t.scale(e_up[k], 0.70_f64));
+            let e_sc = t.scale(e_up[k], 0.70_f64);
+            let s2 = t.add(s1, e_sc);
             e1_reified.push(t.mat_vec(p.u_up_12, s2, DIM, DIM));
         }
 
@@ -871,7 +859,6 @@ impl PhisharpV4 {
             h2: next_h2,
         };
 
-        // 4. Réfutation endogène conservatrice (teste une contre-hypothèse L1+L2)
         if use_refutation
             && cut_l1.is_none()
             && cut_l2.is_none()
@@ -896,12 +883,16 @@ impl PhisharpV4 {
                 .unwrap_or(0);
 
             let mut refuted = next_state.clone();
-            let p1 = t.tanh(t.mat_vec(p.u_ref1, refuted.h1[peak1], DIM, DIM));
-            let r1 = t.sub(refuted.h1[peak1], t.scale(p1, 0.35_f64));
+            let mv1 = t.mat_vec(p.u_ref1, refuted.h1[peak1], DIM, DIM);
+            let p1 = t.tanh(mv1);
+            let p1_sc = t.scale(p1, 0.35_f64);
+            let r1 = t.sub(refuted.h1[peak1], p1_sc);
             refuted.h1[peak1] = t.rms_norm(r1, 0.25_f64);
 
-            let p2 = t.tanh(t.mat_vec(p.u_ref2, refuted.h2[peak2], DIM, DIM));
-            let r2 = t.sub(refuted.h2[peak2], t.scale(p2, 0.35_f64));
+            let mv2 = t.mat_vec(p.u_ref2, refuted.h2[peak2], DIM, DIM);
+            let p2 = t.tanh(mv2);
+            let p2_sc = t.scale(p2, 0.35_f64);
+            let r2 = t.sub(refuted.h2[peak2], p2_sc);
             refuted.h2[peak2] = t.rms_norm(r2, 0.25_f64);
 
             let (_, ev_base) =
@@ -913,11 +904,13 @@ impl PhisharpV4 {
                 next_state = refuted;
             } else if t.scalar(ev_base.gain_mix) >= t.scalar(ev.gain_mix) {
                 let d1 = t.sub(next_state.h1[peak1], refuted.h1[peak1]);
-                let c1 = t.add(next_state.h1[peak1], t.scale(d1, 0.10_f64));
+                let d1_sc = t.scale(d1, 0.10_f64);
+                let c1 = t.add(next_state.h1[peak1], d1_sc);
                 next_state.h1[peak1] = t.rms_norm(c1, 0.25_f64);
 
                 let d2 = t.sub(next_state.h2[peak2], refuted.h2[peak2]);
-                let c2 = t.add(next_state.h2[peak2], t.scale(d2, 0.10_f64));
+                let d2_sc = t.scale(d2, 0.10_f64);
+                let c2 = t.add(next_state.h2[peak2], d2_sc);
                 next_state.h2[peak2] = t.rms_norm(c2, 0.25_f64);
             }
         }
@@ -965,13 +958,7 @@ impl PhisharpV4 {
         (st, snaps)
     }
 
-    /// Trouve la coupe minimale exacte C* hors-tape (zéro allocation de gradient),
-    /// afin d'appliquer le théorème de l'enveloppe sur la tape d'autograd.
-    fn find_min_cut_offtape(
-        &self,
-        view: &RelationalView,
-        raw: &RawState,
-    ) -> Option<CutSpec> {
+    fn find_min_cut_offtape(&self, view: &RelationalView, raw: &RawState) -> Option<CutSpec> {
         let k1 = raw.h1.len();
         let k2 = raw.h2.len();
         if k1 <= 1 || k2 <= 1 {
@@ -1025,7 +1012,6 @@ impl PhisharpV4 {
         let mut best_spec = CutSpec::Vertical;
         let mut min_div = f64::INFINITY;
 
-        // 1. Coupes L1
         let masks1 = 1u32 << (k1.min(10) - 1);
         for mask in 1..masks1 {
             let cn = Self::abductive_step(
@@ -1057,7 +1043,6 @@ impl PhisharpV4 {
             }
         }
 
-        // 2. Coupes L2
         let masks2 = 1u32 << (k2.min(10) - 1);
         for mask in 1..masks2 {
             let cn = Self::abductive_step(
@@ -1089,7 +1074,6 @@ impl PhisharpV4 {
             }
         }
 
-        // 3. Coupe verticale L1 <-> L2
         let vn = Self::abductive_step(
             &mut ft,
             &fp,
@@ -1134,14 +1118,15 @@ impl PhisharpV4 {
             let mut sc = t.leaf_scalar(0.0_f64);
             for (i, e) in tables.tables[m].iter().enumerate() {
                 let d = t.smooth_l1_half(a.probs[m][i], b.probs[m][i]);
-                sc = t.add(sc, t.scale(d, e.weight));
+                let wd = t.scale(d, e.weight);
+                sc = t.add(sc, wd);
             }
-            tot = t.add(tot, t.scale(sc, TASK_W[m]));
+            let wsc = t.scale(sc, TASK_W[m]);
+            tot = t.add(tot, wsc);
         }
         tot
     }
 
-    /// Évaluation complète et différentiable de φ_sharp V4 sur la Tape.
     pub(crate) fn evaluate_phi_tape(
         &self,
         t: &mut Tape,
@@ -1176,7 +1161,6 @@ impl PhisharpV4 {
             };
         }
 
-        // 1. Générativité & Discrimination au-dessus de H(P_marg)
         let (_, ev_e) = Self::unfold_tables(
             t,
             p,
@@ -1199,9 +1183,9 @@ impl PhisharpV4 {
             false,
             [true, true, true],
         );
-        let disc_raw = t.clamp(t.sub(gen_raw, ev_neg.gain_mix), -1.0_f64, 1.0_f64);
+        let disc_diff = t.sub(gen_raw, ev_neg.gain_mix);
+        let disc_raw = t.clamp(disc_diff, -1.0_f64, 1.0_f64);
 
-        // 2. Projection immunisée contre l'écho : min(P_temp, P_comp)
         let (pt_raw, pc_raw) = if budget == 0 || state.h1.is_empty() || state.h2.is_empty() {
             (t.leaf_scalar(0.0_f64), t.leaf_scalar(0.0_f64))
         } else {
@@ -1237,7 +1221,6 @@ impl PhisharpV4 {
                 [true, true, true],
             );
 
-            // Projection compositionnelle P_comp : abduit sur {next, mid}, déplie skip3 masqué
             let owned_pc;
             let st_pc = if let Some(s) = pre_proj_comp {
                 s
@@ -1269,7 +1252,6 @@ impl PhisharpV4 {
         };
         let proj_raw = t.min_scalar(pt_raw, pc_raw);
 
-        // 3. Irréductibilité de circulation Φ_cut = Φ_mip(coupe min) * Φ_diff
         let k1 = state.h1.len();
         let k2 = state.h2.len();
         let phi_cut = if budget == 0 || k1 <= 1 || k2 <= 1 {
@@ -1298,9 +1280,12 @@ impl PhisharpV4 {
                     min_dist = t.min_scalar(min_dist, d);
                 }
             }
-            let f1 = t.tanh(t.scale(min_n1, 3.0_f64));
-            let f2 = t.tanh(t.scale(min_n2, 3.0_f64));
-            let fd = t.tanh(t.scale(min_dist, 3.0_f64));
+            let mn1_s = t.scale(min_n1, 3.0_f64);
+            let f1 = t.tanh(mn1_s);
+            let mn2_s = t.scale(min_n2, 3.0_f64);
+            let f2 = t.tanh(mn2_s);
+            let md_s = t.scale(min_dist, 3.0_f64);
+            let fd = t.tanh(md_s);
             let f12 = t.mul(f1, f2);
             let phi_diff = t.mul(f12, fd);
 
@@ -1360,7 +1345,9 @@ impl PhisharpV4 {
                         [true, true, true],
                     );
                     let div = Self::tables_pred_tvd(t, &view.obs, &ev_full, &ev_cut);
-                    let mip = t.clamp(t.tanh(t.scale(div, 10.0_f64)), 0.0_f64, 1.0_f64);
+                    let div_s = t.scale(div, 10.0_f64);
+                    let div_th = t.tanh(div_s);
+                    let mip = t.clamp(div_th, 0.0_f64, 1.0_f64);
                     t.mul(mip, phi_diff)
                 } else {
                     t.leaf_scalar(0.0_f64)
@@ -1368,7 +1355,6 @@ impl PhisharpV4 {
             }
         };
 
-        // 4. Survie sous Réfutation (S_ref), Déplacement (S_disp) et Abstraction (S_abs)
         let (s_ref_raw, s_disp_raw, s_abs_raw) =
             if budget == 0 || t.scalar(gen_raw) <= 1e-6_f64 || k1 == 0 || k2 == 0 {
                 (
@@ -1377,9 +1363,9 @@ impl PhisharpV4 {
                     t.leaf_scalar(0.0_f64),
                 )
             } else {
-                let denom = t.max_scalar(gen_raw, t.leaf_scalar(0.05_f64));
+                let floor = t.leaf_scalar(0.05_f64);
+                let denom = t.max_scalar(gen_raw, floor);
 
-                // (a) S_ref : attaque du nœud L1 dominant + 2 pas de réparation active
                 let peak1 = (0..k1)
                     .max_by(|&a, &b| {
                         let na: f64 = t.val(state.h1[a]).iter().map(|x| x * x).sum();
@@ -1415,7 +1401,6 @@ impl PhisharpV4 {
                 );
                 let sr = t.div_scalar(ev_rep.gain_mix, denom);
 
-                // (b) S_disp : (H1*, H2*) verrouillés, évalués sur fenêtre déplacée [1/4, 3/4]
                 let q1 = view.seq.len() / 4;
                 let q3 = (3 * view.seq.len()) / 4;
                 let shifted = view.subslice_same_vocab(q1, q3);
@@ -1431,7 +1416,6 @@ impl PhisharpV4 {
                 );
                 let sd = t.div_scalar(ev_disp.gain_mix, denom);
 
-                // (c) S_abs : efface H1*, régénère H1_abs depuis H2* seul (verrou anti-gel strict)
                 let h1_abs = Self::regenerate_h1_from_h2(t, p, &state.h2, k1);
                 let abs_st = NmState {
                     h1: h1_abs,
@@ -1456,22 +1440,24 @@ impl PhisharpV4 {
         let s_disp = t.clamp(s_disp_raw, 0.0_f64, 1.0_f64);
         let s_abs = t.clamp(s_abs_raw, 0.0_f64, 1.0_f64);
 
-        let s_prod = t.mul(t.mul(s_ref, s_disp), s_abs);
+        let s_rd = t.mul(s_ref, s_disp);
+        let s_prod = t.mul(s_rd, s_abs);
         let s_abd = t.pow_scalar(s_prod, 1.0_f64 / 3.0_f64);
 
         let res_c = t.clamp(ev_e.residual_l1, 0.0_f64, 1.0_f64);
-        let res_fac = t.add_scalar(t.scale(res_c, -0.5_f64), 1.0_f64);
+        let res_neg = t.scale(res_c, -0.5_f64);
+        let res_fac = t.add_scalar(res_neg, 1.0_f64);
 
         let g_c = t.clamp(gen_raw, 0.0_f64, 1.0_f64);
         let d_c = t.clamp(disc_raw, 0.0_f64, 1.0_f64);
         let p_c = t.clamp(proj_raw, 0.0_f64, 1.0_f64);
 
-        let base_min = t.min_scalar(t.min_scalar(g_c, d_c), p_c);
+        let min_gd = t.min_scalar(g_c, d_c);
+        let base_min = t.min_scalar(min_gd, p_c);
         let p1 = t.mul(base_min, phi_cut);
         let p2 = t.mul(p1, s_abd);
         let phi_sharp = t.mul(p2, res_fac);
 
-        // Verrou anti-Goodhart strict : zéro gradient vers Φ_cut / R / D / A tant que G, D, P <= 0
         let shaping_score = if t.scalar(gen_raw) > 0.0_f64
             && t.scalar(disc_raw) > 0.0_f64
             && t.scalar(proj_raw) > 0.0_f64
@@ -1479,16 +1465,28 @@ impl PhisharpV4 {
             let sa_br = t.clamp(s_abs_raw, -0.5_f64, 1.0_f64);
             let sr_br = t.clamp(s_ref_raw, -0.5_f64, 1.0_f64);
             let sd_br = t.clamp(s_disp_raw, -0.5_f64, 1.0_f64);
-            let b0 = t.add(phi_sharp, t.scale(base_min, 0.08_f64));
-            let b1 = t.add(b0, t.scale(sa_br, 0.06_f64));
-            let b2 = t.add(b1, t.scale(sr_br, 0.04_f64));
-            let b3 = t.add(b2, t.scale(sd_br, 0.04_f64));
-            t.add(b3, t.scale(phi_cut, 0.04_f64))
+
+            let w_bm = t.scale(base_min, 0.08_f64);
+            let b0 = t.add(phi_sharp, w_bm);
+            let w_sa = t.scale(sa_br, 0.06_f64);
+            let b1 = t.add(b0, w_sa);
+            let w_sr = t.scale(sr_br, 0.04_f64);
+            let b2 = t.add(b1, w_sr);
+            let w_sd = t.scale(sd_br, 0.04_f64);
+            let b3 = t.add(b2, w_sd);
+            let w_pc = t.scale(phi_cut, 0.04_f64);
+            t.add(b3, w_pc)
         } else {
-            let min_raw = t.min_scalar(t.min_scalar(gen_raw, disc_raw), proj_raw);
-            let avg_raw = t.scale(t.add(t.add(gen_raw, disc_raw), proj_raw), 1.0_f64 / 3.0_f64);
-            let s1 = t.add(t.scale(min_raw, 0.55_f64), t.scale(avg_raw, 0.25_f64));
-            t.sub(s1, t.scale(res_c, 0.10_f64))
+            let min_gd_r = t.min_scalar(gen_raw, disc_raw);
+            let min_raw = t.min_scalar(min_gd_r, proj_raw);
+            let sum_gd = t.add(gen_raw, disc_raw);
+            let sum_gdp = t.add(sum_gd, proj_raw);
+            let avg_raw = t.scale(sum_gdp, 1.0_f64 / 3.0_f64);
+            let w_min = t.scale(min_raw, 0.55_f64);
+            let w_avg = t.scale(avg_raw, 0.25_f64);
+            let s1 = t.add(w_min, w_avg);
+            let w_res = t.scale(res_c, 0.10_f64);
+            t.sub(s1, w_res)
         };
 
         let report = PhiReport {
@@ -1513,7 +1511,6 @@ impl PhisharpV4 {
         }
     }
 
-    /// Helpers hors-tape rapides pour l'inférence et l'évaluation.
     pub(crate) fn run_abduction_raw(
         &self,
         view: &RelationalView,
@@ -1590,13 +1587,12 @@ impl PhisharpV4 {
             }
         }
         let ll = t.scalar(ev.ll_mix);
-        let mdl = t.scalar(mdl_tape_v4(&mut t, ev.ll_mix, &st, view.seq.len()));
+        let mdl_node = mdl_tape_v4(&mut t, ev.ll_mix, &st, view.seq.len());
+        let mdl = t.scalar(mdl_node);
         let gain = t.scalar(ev.gain_mix);
         (preds, ll, mdl, gain)
     }
 
-    /// Canal `ask` pur : déploiement compositionnel dans R^DIM depuis les paires
-    /// à plus fort résidu (zéro autorégression sur E), sélectionné par clôture φ_sharp(E ⊕ ΔE).
     pub(crate) fn ask_emit(&self, view: &RelationalView, budget: usize, out_len: usize) -> Vec<u8> {
         if view.vocab.is_empty() || view.obs.tables[0].is_empty() {
             return Vec::new();
@@ -1649,7 +1645,9 @@ impl PhisharpV4 {
                 let a = t.mat_vec(p.u_a, z_prev, DIM, DIM);
                 let b = t.mat_vec(p.u_b, z_curr, DIM, DIM);
                 let ab = t.mul(a, b);
-                let c = t.tanh(t.add(t.add(a, b), ab));
+                let s1 = t.add(a, b);
+                let s2 = t.add(s1, ab);
+                let c = t.tanh(s2);
                 let (y, _) = Self::apply_op(&mut t, &f, c);
                 let logits = Self::read_logits(&mut t, &f, y);
                 let pr = t.softmax(logits);
@@ -1667,7 +1665,7 @@ impl PhisharpV4 {
                 visits[best_w] += 1;
                 cand_idx.push(best_w);
                 z_prev = z_curr;
-                z_curr = y; // Déroulement purement dans l'espace latent R^DIM
+                z_curr = y;
             }
 
             let mut ext_seq = view.seq.clone();
@@ -1698,7 +1696,6 @@ impl PhisharpV4 {
     }
 }
 
-/// Score MDL différentiable sur la Tape (pénalité BIC-like sur l'énergie de H1 et H2).
 pub(crate) fn mdl_tape_v4(
     t: &mut Tape,
     ll_mix: usize,
@@ -1712,5 +1709,6 @@ pub(crate) fn mdl_tape_v4(
     }
     let n = seq_len.max(2) as f64;
     let pen_coeff = 0.012_f64 * n.ln() / n;
-    t.sub(ll_mix, t.scale(energy, pen_coeff))
+    let pen = t.scale(energy, pen_coeff);
+    t.sub(ll_mix, pen)
 }
