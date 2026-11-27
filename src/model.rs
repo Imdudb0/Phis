@@ -2,122 +2,241 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
+use crate::autograd::Tape;
 use crate::core::*;
 
-pub(crate) const MAGIC: &[u8; 8] = b"PHIS24V3";
+pub(crate) const MAGIC: &[u8; 8] = b"PHIS24V4";
 
 // ============================================================================
-// Disposition des paramètres (1329 paramètres, poids non-réciproques)
-// Zéro fast-weight (L_A / L_E / L_G supprimés) ; zéro pénalité IB/MDL.
+// Disposition des paramètres (2861 paramètres, poids non-réciproques)
+// Zéro fast-weight, repère L0 fixe, 100 % différentiable sur Tape.
 // ============================================================================
+
+const D2: usize = DIM * DIM;
 
 const OFF_W_LAT1: usize = 0;
 const OFF_W_LAT2: usize = OFF_W_LAT1 + K1 * K1;
 const OFF_W_UP_12: usize = OFF_W_LAT2 + K2 * K2;
 const OFF_W_DOWN_21: usize = OFF_W_UP_12 + K2 * K1;
 
-const OFF_U_X_IN: usize = OFF_W_DOWN_21 + K1 * K2;
-const OFF_U_X_OUT: usize = OFF_U_X_IN + DIM * DIM;
-const OFF_U_X_TD: usize = OFF_U_X_OUT + DIM * DIM;
-const OFF_W_UP_01: usize = OFF_U_X_TD + DIM * DIM;
-const OFF_U_OBS_1: usize = OFF_W_UP_01 + DIM * DIM;
-const OFF_U_LAT1: usize = OFF_U_OBS_1 + DIM * DIM;
-const OFF_U_UP_12: usize = OFF_U_LAT1 + DIM * DIM;
-const OFF_U_LAT2: usize = OFF_U_UP_12 + DIM * DIM;
-const OFF_U_DOWN_21: usize = OFF_U_LAT2 + DIM * DIM;
-const OFF_U_MOD: usize = OFF_U_DOWN_21 + DIM * DIM;
-const OFF_U_FLOW: usize = OFF_U_MOD + DIM * DIM;
-const OFF_U_META: usize = OFF_U_FLOW + DIM * DIM;
-const OFF_U_DOWN_10: usize = OFF_U_META + DIM * DIM;
-const OFF_U_ROT: usize = OFF_U_DOWN_10 + DIM * DIM;
-const OFF_U_GATE: usize = OFF_U_ROT + DIM * DIM;
-const OFF_W_READ: usize = OFF_U_GATE + DIM * DIM;
-const OFF_U_ABS_21: usize = OFF_W_READ + DIM * DIM;
-const OFF_U_REF1: usize = OFF_U_ABS_21 + DIM * DIM;
-const OFF_U_REF2: usize = OFF_U_REF1 + DIM * DIM;
+const OFF_U_A: usize = OFF_W_DOWN_21 + K1 * K2;
+const OFF_U_B: usize = OFF_U_A + D2;
+const OFF_U_MA: usize = OFF_U_B + D2;
+const OFF_U_MB: usize = OFF_U_MA + D2;
+const OFF_U_DOWN_21: usize = OFF_U_MB + D2;
+const OFF_U_MOD: usize = OFF_U_DOWN_21 + D2;
+const OFF_U_FLOW: usize = OFF_U_MOD + D2;
+const OFF_U_META: usize = OFF_U_FLOW + D2;
+const OFF_U_OUT: usize = OFF_U_META + D2;
+const OFF_U_MUL: usize = OFF_U_OUT + D2;
+const OFF_W_READ: usize = OFF_U_MUL + D2;
+const OFF_U_RES: usize = OFF_W_READ + D2;
+const OFF_U_CTX: usize = OFF_U_RES + D2;
+const OFF_U_LAT1: usize = OFF_U_CTX + D2;
+const OFF_U_UP_12: usize = OFF_U_LAT1 + D2;
+const OFF_U_LAT2: usize = OFF_U_UP_12 + D2;
+const OFF_U_ABS_21: usize = OFF_U_LAT2 + D2;
+const OFF_U_REF1: usize = OFF_U_ABS_21 + D2;
+const OFF_U_REF2: usize = OFF_U_REF1 + D2;
 
-const OFF_B1: usize = OFF_U_REF2 + DIM * DIM;
+const OFF_B1: usize = OFF_U_REF2 + D2;
 const OFF_B2: usize = OFF_B1 + DIM;
 const OFF_B_ABS: usize = OFF_B2 + DIM;
 const OFF_GATES: usize = OFF_B_ABS + DIM;
 pub(crate) const PARAM_COUNT: usize = OFF_GATES + 8;
 
-/// État dynamique pur de circulation : uniquement des activations de nœuds (L0, L1, L2).
+/// Vues slicées des paramètres sur la Tape.
+#[derive(Clone, Copy)]
+pub(crate) struct ParamsTape {
+    pub(crate) root: usize,
+    u_a: usize,
+    u_b: usize,
+    u_ma: usize,
+    u_mb: usize,
+    u_down_21: usize,
+    u_mod: usize,
+    u_flow: usize,
+    u_meta: usize,
+    u_out: usize,
+    u_mul: usize,
+    w_read: usize,
+    u_res: usize,
+    u_ctx: usize,
+    u_lat1: usize,
+    u_up_12: usize,
+    u_lat2: usize,
+    u_abs_21: usize,
+    u_ref1: usize,
+    u_ref2: usize,
+    b1: usize,
+    b2: usize,
+    b_abs: usize,
+}
+
+impl ParamsTape {
+    pub(crate) fn from_model(t: &mut Tape, model: &PhisharpV4) -> Self {
+        let root = t.leaf(model.params.clone());
+        Self {
+            root,
+            u_a: t.slice(root, OFF_U_A, D2),
+            u_b: t.slice(root, OFF_U_B, D2),
+            u_ma: t.slice(root, OFF_U_MA, D2),
+            u_mb: t.slice(root, OFF_U_MB, D2),
+            u_down_21: t.slice(root, OFF_U_DOWN_21, D2),
+            u_mod: t.slice(root, OFF_U_MOD, D2),
+            u_flow: t.slice(root, OFF_U_FLOW, D2),
+            u_meta: t.slice(root, OFF_U_META, D2),
+            u_out: t.slice(root, OFF_U_OUT, D2),
+            u_mul: t.slice(root, OFF_U_MUL, D2),
+            w_read: t.slice(root, OFF_W_READ, D2),
+            u_res: t.slice(root, OFF_U_RES, D2),
+            u_ctx: t.slice(root, OFF_U_CTX, D2),
+            u_lat1: t.slice(root, OFF_U_LAT1, D2),
+            u_up_12: t.slice(root, OFF_U_UP_12, D2),
+            u_lat2: t.slice(root, OFF_U_LAT2, D2),
+            u_abs_21: t.slice(root, OFF_U_ABS_21, D2),
+            u_ref1: t.slice(root, OFF_U_REF1, D2),
+            u_ref2: t.slice(root, OFF_U_REF2, D2),
+            b1: t.slice(root, OFF_B1, DIM),
+            b2: t.slice(root, OFF_B2, DIM),
+            b_abs: t.slice(root, OFF_B_ABS, DIM),
+        }
+    }
+
+    #[inline]
+    fn w_lat1(&self, t: &mut Tape, dst: usize, src: usize) -> Option<usize> {
+        if dst < K1 && src < K1 {
+            Some(t.slice(self.root, OFF_W_LAT1 + dst * K1 + src, 1))
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn w_lat2(&self, t: &mut Tape, dst: usize, src: usize) -> Option<usize> {
+        if dst < K2 && src < K2 {
+            Some(t.slice(self.root, OFF_W_LAT2 + dst * K2 + src, 1))
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn w_up_12(&self, t: &mut Tape, dst2: usize, src1: usize) -> Option<usize> {
+        if dst2 < K2 && src1 < K1 {
+            Some(t.slice(self.root, OFF_W_UP_12 + dst2 * K1 + src1, 1))
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn w_down_21(&self, t: &mut Tape, dst1: usize, src2: usize) -> Option<usize> {
+        if dst1 < K1 && src2 < K2 {
+            Some(t.slice(self.root, OFF_W_DOWN_21 + dst1 * K2 + src2, 1))
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn gate(&self, t: &mut Tape, idx: usize) -> usize {
+        t.slice(self.root, OFF_GATES + idx, 1)
+    }
+}
+
+/// État causal pur sur la Tape : uniquement (H1, H2). L0 reste fixe et immuable.
 #[derive(Clone)]
-pub(crate) struct CircState {
-    pub(crate) x: Vec<[f64; DIM]>,
+pub(crate) struct NmState {
+    pub(crate) h1: Vec<usize>,
+    pub(crate) h2: Vec<usize>,
+}
+
+/// État matérialisé (détaché de la Tape) pour inspections et épreuves externes.
+#[derive(Clone)]
+pub(crate) struct RawState {
     pub(crate) h1: Vec<[f64; DIM]>,
     pub(crate) h2: Vec<[f64; DIM]>,
 }
 
-impl CircState {
-    pub(crate) fn zeros(v_size: usize, k1: usize, k2: usize) -> Self {
+impl RawState {
+    pub(crate) fn zeros(k1: usize, k2: usize) -> Self {
         Self {
-            x: vec![[0.0_f64; DIM]; v_size],
             h1: vec![[0.0_f64; DIM]; k1],
             h2: vec![[0.0_f64; DIM]; k2],
         }
     }
 
-    /// Initialisation strictement invariante à toute bijection π de l'alphabet :
-    /// dépend uniquement de `node_init[u]` et de l'indice d'ordre d'apparition `u`.
-    pub(crate) fn seeded(view: &RelationalView) -> Self {
-        let mut x = vec![[0.0_f64; DIM]; view.v_size];
-        for u in 0..view.v_size {
-            for d in 0..DIM {
-                let sym_break = 0.28_f64 * (((u + 1) * (d + 2)) as f64 * 1.37_f64).sin();
-                x[u][d] = 0.55_f64 * view.node_init[u][d] + sym_break;
-            }
-            rms_norm(&mut x[u]);
+    pub(crate) fn from_tape(t: &Tape, st: &NmState) -> Self {
+        let mut h1 = Vec::with_capacity(st.h1.len());
+        for &id in &st.h1 {
+            let mut v = [0.0_f64; DIM];
+            v.copy_from_slice(t.val(id));
+            h1.push(v);
         }
-        let mut h1 = vec![[0.0_f64; DIM]; K1];
-        for (k, v) in h1.iter_mut().enumerate() {
-            for d in 0..DIM {
-                v[d] = 0.22_f64 * (((k + 1) * (d + 3)) as f64 * 1.19_f64).sin();
-            }
-            rms_norm(v);
+        let mut h2 = Vec::with_capacity(st.h2.len());
+        for &id in &st.h2 {
+            let mut v = [0.0_f64; DIM];
+            v.copy_from_slice(t.val(id));
+            h2.push(v);
         }
-        let mut h2 = vec![[0.0_f64; DIM]; K2];
-        for (m, v) in h2.iter_mut().enumerate() {
-            for d in 0..DIM {
-                v[d] = 0.22_f64 * (((m + 2) * (d + 1)) as f64 * 1.29_f64).cos();
-            }
-            rms_norm(v);
-        }
-        Self { x, h1, h2 }
+        Self { h1, h2 }
     }
 
-    pub(crate) fn with_dead_l1_node(&self) -> Self {
+    pub(crate) fn into_tape(&self, t: &mut Tape) -> NmState {
+        let h1 = self.h1.iter().map(|v| t.leaf(v.to_vec())).collect();
+        let h2 = self.h2.iter().map(|v| t.leaf(v.to_vec())).collect();
+        NmState { h1, h2 }
+    }
+
+    pub(crate) fn with_dead_l1(&self) -> Self {
         let mut out = self.clone();
         out.h1.push([0.0_f64; DIM]);
         out
     }
 
-    pub(crate) fn with_cloned_l1_node(&self, src_k: usize) -> Self {
+    pub(crate) fn with_cloned_l1(&self, idx: usize) -> Self {
         let mut out = self.clone();
-        out.h1.push(self.h1[src_k]);
+        out.h1.push(self.h1[idx]);
         out
     }
 
-    pub(crate) fn with_cloned_l2_node(&self, src_m: usize) -> Self {
+    pub(crate) fn with_cloned_l2(&self, idx: usize) -> Self {
         let mut out = self.clone();
-        out.h2.push(self.h2[src_m]);
+        out.h2.push(self.h2[idx]);
         out
     }
 }
 
-pub(crate) struct CircUnfold {
-    pub(crate) h1_eff: Vec<[f64; DIM]>,
-    pub(crate) a_ground: Vec<f64>,   // V * k1
-    pub(crate) y: [Vec<[f64; DIM]>; 3], // T^1(X), T^2(X), T^3(X)
-    pub(crate) r_hat: [Vec<f64>; 3], // V * V
+pub(crate) struct OpFields {
+    h1_eff: Vec<usize>,
+    v_flow: Vec<usize>,
+    gate_h: Vec<usize>,
+    g_act: usize,
+    inv_tau: usize,
+    basis: Vec<usize>,
+    ua_e: Vec<usize>,
+    ub_e: Vec<usize>,
+    uma_e: Vec<usize>,
+    umb_e: Vec<usize>,
+    read_k: Vec<usize>,
 }
 
-#[derive(Clone)]
-pub(crate) struct AbductionTrace {
-    pub(crate) state: CircState,
-    pub(crate) snapshots: Vec<(usize, CircState)>,
-    pub(crate) phi_history: Vec<f64>,
+pub(crate) struct TablesEval {
+    pub(crate) task_gains: [usize; 3],
+    pub(crate) gain_mix: usize,
+    pub(crate) ll_mix: usize,
+    pub(crate) residual_l1: usize,
+    pub(crate) ctx_vecs: [Vec<usize>; 3],
+    pub(crate) attn_vecs: [Vec<usize>; 3],
+    pub(crate) probs: [Vec<usize>; 3],
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum CutSpec {
+    L1(u32),
+    L2(u32),
+    Vertical,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -126,7 +245,7 @@ pub(crate) struct PhiReport {
     pub(crate) discrimination: f64,
     pub(crate) projection: f64,
     pub(crate) proj_temp: f64,
-    pub(crate) proj_scale: f64,
+    pub(crate) proj_comp: f64,
     pub(crate) phi_cut: f64,
     pub(crate) s_ref: f64,
     pub(crate) s_disp: f64,
@@ -136,21 +255,27 @@ pub(crate) struct PhiReport {
     pub(crate) shaping_score: f64,
 }
 
+pub(crate) struct PhiTapeOut {
+    pub(crate) phi_sharp: usize,
+    pub(crate) shaping_score: usize,
+    pub(crate) report: PhiReport,
+}
+
 #[derive(Clone)]
-pub(crate) struct PhisharpV3 {
+pub(crate) struct PhisharpV4 {
     pub(crate) params: Vec<f64>,
 }
 
-impl PhisharpV3 {
+impl PhisharpV4 {
     pub(crate) fn new_random(rng: &mut Rng) -> Self {
         let mut params = vec![0.0_f64; PARAM_COUNT];
         for (i, p) in params.iter_mut().enumerate() {
-            let scale = if i < OFF_U_X_IN {
+            let scale = if i < OFF_U_A {
                 0.45_f64
             } else if i < OFF_B1 {
-                0.35_f64
+                0.32_f64
             } else {
-                0.15_f64
+                0.10_f64
             };
             *p = rng.next_normal() * scale;
         }
@@ -177,14 +302,14 @@ impl PhisharpV3 {
         if data.len() < 16 || &data[0..8] != MAGIC {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "Format de modèle .phis V3 invalide",
+                "Format de modèle .phis V4 invalide",
             ));
         }
         let count = u64::from_le_bytes(data[8..16].try_into().unwrap()) as usize;
         if count != PARAM_COUNT || data.len() != 16 + count * 8 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "Nombre de paramètres V3 incompatible",
+                "Nombre de paramètres V4 incompatible",
             ));
         }
         let mut params = Vec::with_capacity(count);
@@ -194,157 +319,135 @@ impl PhisharpV3 {
         Ok(Self { params })
     }
 
-    #[inline]
-    fn w_lat1(&self, dst: usize, src: usize) -> f64 {
-        if dst < K1 && src < K1 {
-            self.params[OFF_W_LAT1 + dst * K1 + src]
-        } else {
-            0.0_f64
+    pub(crate) fn seeded_state(t: &mut Tape) -> NmState {
+        let mut h1 = Vec::with_capacity(K1);
+        for k in 0..K1 {
+            let mut v = vec![0.0_f64; DIM];
+            for d in 0..DIM {
+                v[d] = 0.25_f64 * (((k + 1) * (d + 3)) as f64 * 1.19_f64).sin();
+            }
+            let id = t.leaf(v);
+            h1.push(t.rms_norm(id, 0.25_f64));
         }
-    }
-    #[inline]
-    fn w_lat2(&self, dst: usize, src: usize) -> f64 {
-        if dst < K2 && src < K2 {
-            self.params[OFF_W_LAT2 + dst * K2 + src]
-        } else {
-            0.0_f64
+        let mut h2 = Vec::with_capacity(K2);
+        for m in 0..K2 {
+            let mut v = vec![0.0_f64; DIM];
+            for d in 0..DIM {
+                v[d] = 0.25_f64 * (((m + 2) * (d + 1)) as f64 * 1.29_f64).cos();
+            }
+            let id = t.leaf(v);
+            h2.push(t.rms_norm(id, 0.25_f64));
         }
-    }
-    #[inline]
-    fn w_up_12(&self, dst2: usize, src1: usize) -> f64 {
-        if dst2 < K2 && src1 < K1 {
-            self.params[OFF_W_UP_12 + dst2 * K1 + src1]
-        } else {
-            0.0_f64
-        }
-    }
-    #[inline]
-    fn w_down_21(&self, dst1: usize, src2: usize) -> f64 {
-        if dst1 < K1 && src2 < K2 {
-            self.params[OFF_W_DOWN_21 + dst1 * K2 + src2]
-        } else {
-            0.0_f64
-        }
+        NmState { h1, h2 }
     }
 
-    fn u_x_in(&self) -> &[f64] { &self.params[OFF_U_X_IN..OFF_U_X_OUT] }
-    fn u_x_out(&self) -> &[f64] { &self.params[OFF_U_X_OUT..OFF_U_X_TD] }
-    fn u_x_td(&self) -> &[f64] { &self.params[OFF_U_X_TD..OFF_W_UP_01] }
-    fn w_up_01(&self) -> &[f64] { &self.params[OFF_W_UP_01..OFF_U_OBS_1] }
-    fn u_obs_1(&self) -> &[f64] { &self.params[OFF_U_OBS_1..OFF_U_LAT1] }
-    fn u_lat1(&self) -> &[f64] { &self.params[OFF_U_LAT1..OFF_U_UP_12] }
-    fn u_up_12(&self) -> &[f64] { &self.params[OFF_U_UP_12..OFF_U_LAT2] }
-    fn u_lat2(&self) -> &[f64] { &self.params[OFF_U_LAT2..OFF_U_DOWN_21] }
-    fn u_down_21(&self) -> &[f64] { &self.params[OFF_U_DOWN_21..OFF_U_MOD] }
-    fn u_mod(&self) -> &[f64] { &self.params[OFF_U_MOD..OFF_U_FLOW] }
-    fn u_flow(&self) -> &[f64] { &self.params[OFF_U_FLOW..OFF_U_META] }
-    fn u_meta(&self) -> &[f64] { &self.params[OFF_U_META..OFF_U_DOWN_10] }
-    fn u_down_10(&self) -> &[f64] { &self.params[OFF_U_DOWN_10..OFF_U_ROT] }
-    fn u_rot(&self) -> &[f64] { &self.params[OFF_U_ROT..OFF_U_GATE] }
-    fn u_gate(&self) -> &[f64] { &self.params[OFF_U_GATE..OFF_W_READ] }
-    fn w_read(&self) -> &[f64] { &self.params[OFF_W_READ..OFF_U_ABS_21] }
-    fn u_abs_21(&self) -> &[f64] { &self.params[OFF_U_ABS_21..OFF_U_REF1] }
-    fn u_ref1(&self) -> &[f64] { &self.params[OFF_U_REF1..OFF_U_REF2] }
-    fn u_ref2(&self) -> &[f64] { &self.params[OFF_U_REF2..OFF_B1] }
-    fn b1(&self) -> &[f64] { &self.params[OFF_B1..OFF_B2] }
-    fn b2(&self) -> &[f64] { &self.params[OFF_B2..OFF_B_ABS] }
-    fn b_abs(&self) -> &[f64] { &self.params[OFF_B_ABS..OFF_GATES] }
-    fn gates(&self) -> &[f64] { &self.params[OFF_GATES..PARAM_COUNT] }
+    pub(crate) fn zero_state(t: &mut Tape, k1: usize, k2: usize) -> NmState {
+        let h1 = (0..k1).map(|_| t.leaf(vec![0.0_f64; DIM])).collect();
+        let h2 = (0..k2).map(|_| t.leaf(vec![0.0_f64; DIM])).collect();
+        NmState { h1, h2 }
+    }
 
-    /// Régénère H1 purement de haut en bas depuis H2 (utilisé par l'épreuve d'Abstraction S_abs).
-    pub(crate) fn regenerate_h1_from_h2(&self, h2: &[[f64; DIM]], k1: usize) -> Vec<[f64; DIM]> {
+    /// Régénère H1 purement de haut en bas depuis H2 (épreuve d'abstraction S_abs).
+    pub(crate) fn regenerate_h1_from_h2(
+        t: &mut Tape,
+        p: &ParamsTape,
+        h2: &[usize],
+        k1: usize,
+    ) -> Vec<usize> {
         let k2 = h2.len();
-        let mut h1_abs = vec![[0.0_f64; DIM]; k1];
         if k2 == 0 {
-            return h1_abs;
+            return (0..k1).map(|_| t.leaf(vec![0.0_f64; DIM])).collect();
         }
-        let b_abs = self.b_abs();
-        let mut msg2 = vec![[0.0_f64; DIM]; k2];
-        for m in 0..k2 {
-            msg2[m] = mat_vec(self.u_abs_21(), &h2[m]);
-        }
+        let msg2: Vec<usize> = h2
+            .iter()
+            .map(|&hm| t.mat_vec(p.u_abs_21, hm, DIM, DIM))
+            .collect();
+
+        let mut h1_abs = Vec::with_capacity(k1);
         for k in 0..k1 {
-            let mut acc = [0.0_f64; DIM];
+            let mut acc = p.b_abs;
             for m in 0..k2 {
-                let w = self.w_down_21(k, m);
-                if w != 0.0_f64 {
-                    for d in 0..DIM {
-                        acc[d] += w * msg2[m][d];
-                    }
+                if let Some(w) = p.w_down_21(t, k, m) {
+                    let term = t.scalar_mul(msg2[m], w);
+                    acc = t.add(acc, term);
                 }
             }
-            for d in 0..DIM {
-                h1_abs[k][d] = (acc[d] + b_abs[d]).tanh();
-            }
-            rms_norm(&mut h1_abs[k]);
+            let th = t.tanh(acc);
+            h1_abs.push(t.rms_norm(th, 0.25_f64));
         }
         h1_abs
     }
 
-    /// Prépare les champs de circulation (h1_eff, flux v_k, portes u_gate(h1_eff), g_act)
-    /// pour l'opérateur vertical T_{H1, H2}.
-    fn prepare_operator(
-        &self,
-        state: &CircState,
+    /// Prépare l'opérateur non-markovien sur le repère L0 fixe et immuable.
+    pub(crate) fn prepare_operator(
+        t: &mut Tape,
+        p: &ParamsTape,
+        view: &RelationalView,
+        state: &NmState,
         cut_l1: Option<u32>,
         cut_vertical: bool,
-    ) -> (Vec<[f64; DIM]>, Vec<[f64; DIM]>, Vec<[f64; DIM]>, f64) {
+    ) -> OpFields {
         let k1 = state.h1.len();
         let k2 = state.h2.len();
 
-        let n1_sq: f64 = state.h1.iter().map(|h| dot(h, h)).sum();
-        let n2_sq: f64 = state.h2.iter().map(|h| dot(h, h)).sum();
-        let n1 = n1_sq.sqrt();
-        let n2 = n2_sq.sqrt();
-
-        // Si budget = 0 ou si H1 ou H2 est absent/nul (hors coupe MIP verticale), g_act = 0
-        let g_act = if cut_vertical {
-            n1.tanh()
+        let n1 = if k1 == 0 {
+            t.leaf_scalar(0.0_f64)
         } else {
-            n1.tanh() * n2.tanh()
+            let stacked = t.stack(state.h1.clone());
+            t.smooth_norm(stacked)
+        };
+        let n2 = if k2 == 0 {
+            t.leaf_scalar(0.0_f64)
+        } else {
+            let stacked = t.stack(state.h2.clone());
+            t.smooth_norm(stacked)
+        };
+        let th1 = t.tanh(n1);
+        let g_act = if cut_vertical {
+            th1
+        } else {
+            let th2 = t.tanh(n2);
+            t.mul(th1, th2)
         };
 
+        // 1. Gouvernance descendante L2 -> L1 (non-réciproque)
         let mut h1_eff = state.h1.clone();
-        let mut down21 = vec![[0.0_f64; DIM]; k2];
-        let mut meta2 = vec![[0.0_f64; DIM]; k2];
-
+        let mut meta2 = Vec::with_capacity(k2);
         if !cut_vertical && k2 > 0 {
-            for m in 0..k2 {
-                down21[m] = mat_vec(self.u_down_21(), &state.h2[m]);
-                meta2[m] = mat_vec(self.u_meta(), &state.h2[m]);
+            let down21: Vec<usize> = state
+                .h2
+                .iter()
+                .map(|&hm| t.mat_vec(p.u_down_21, hm, DIM, DIM))
+                .collect();
+            for &hm in &state.h2 {
+                meta2.push(t.mat_vec(p.u_meta, hm, DIM, DIM));
             }
             for k in 0..k1 {
-                if vec_norm(&state.h1[k]) <= 1e-12_f64 {
-                    continue;
-                }
-                let mut td = [0.0_f64; DIM];
+                let mut td = t.leaf(vec![0.0_f64; DIM]);
                 for m in 0..k2 {
-                    let w = self.w_down_21(k, m);
-                    if w != 0.0_f64 {
-                        for d in 0..DIM {
-                            td[d] += w * down21[m][d];
-                        }
+                    if let Some(w) = p.w_down_21(t, k, m) {
+                        let term = t.scalar_mul(down21[m], w);
+                        td = t.add(td, term);
                     }
                 }
-                let mod_h = mat_vec(self.u_mod(), &state.h1[k]);
-                for d in 0..DIM {
-                    h1_eff[k][d] += td[d].tanh() * mod_h[d];
-                }
-                rms_norm(&mut h1_eff[k]);
+                let td_th = t.tanh(td);
+                let mod_h = t.mat_vec(p.u_mod, state.h1[k], DIM, DIM);
+                let gated = t.mul(td_th, mod_h);
+                let sum = t.add(state.h1[k], gated);
+                h1_eff[k] = t.rms_norm(sum, 0.25_f64);
             }
         }
 
-        // Flux causal dirigé v_k dans L1 (+ gouvernance descendante L2 -> L1)
-        let mut flow_msg = vec![[0.0_f64; DIM]; k1];
-        for j in 0..k1 {
-            flow_msg[j] = mat_vec(self.u_flow(), &h1_eff[j]);
-        }
-
-        let mut v_flow = vec![[0.0_f64; DIM]; k1];
-        let mut gate_h = vec![[0.0_f64; DIM]; k1];
+        // 2. Flux latéral dirigé dans L1 + gouvernance L2
+        let flow_msg: Vec<usize> = h1_eff
+            .iter()
+            .map(|&hk| t.mat_vec(p.u_flow, hk, DIM, DIM))
+            .collect();
+        let mut v_flow = Vec::with_capacity(k1);
+        let mut gate_h = Vec::with_capacity(k1);
 
         for k in 0..k1 {
-            let mut acc = [0.0_f64; DIM];
+            let mut acc = t.leaf(vec![0.0_f64; DIM]);
             for j in 0..k1 {
                 if let Some(mask) = cut_l1 {
                     let sk = ((mask >> k.min(30)) & 1) != 0;
@@ -353,528 +456,1102 @@ impl PhisharpV3 {
                         continue;
                     }
                 }
-                let w = self.w_lat1(k, j);
-                if w != 0.0_f64 {
-                    for d in 0..DIM {
-                        acc[d] += w * flow_msg[j][d];
-                    }
+                if let Some(w) = p.w_lat1(t, k, j) {
+                    let term = t.scalar_mul(flow_msg[j], w);
+                    acc = t.add(acc, term);
                 }
             }
             if !cut_vertical {
                 for m in 0..k2 {
-                    let w = self.w_down_21(k, m);
-                    if w != 0.0_f64 {
-                        for d in 0..DIM {
-                            acc[d] += w * meta2[m][d];
-                        }
+                    if let Some(w) = p.w_down_21(t, k, m) {
+                        let term = t.scalar_mul(meta2[m], w);
+                        acc = t.add(acc, term);
                     }
                 }
             }
-            v_flow[k] = mat_vec(self.u_down_10(), &acc);
-            gate_h[k] = mat_vec(self.u_gate(), &h1_eff[k]);
+            v_flow.push(t.mat_vec(p.u_out, acc, DIM, DIM));
+            gate_h.push(t.mat_vec(p.u_mul, h1_eff[k], DIM, DIM));
         }
 
-        (h1_eff, v_flow, gate_h, g_act)
+        // 3. Pré-projection unique des V vecteurs fixes du repère L0
+        let basis: Vec<usize> = view.basis.iter().map(|b| t.leaf(b.clone())).collect();
+        let ua_e: Vec<usize> = basis
+            .iter()
+            .map(|&e| t.mat_vec(p.u_a, e, DIM, DIM))
+            .collect();
+        let ub_e: Vec<usize> = basis
+            .iter()
+            .map(|&e| t.mat_vec(p.u_b, e, DIM, DIM))
+            .collect();
+        let uma_e: Vec<usize> = basis
+            .iter()
+            .map(|&e| t.mat_vec(p.u_ma, e, DIM, DIM))
+            .collect();
+        let umb_e: Vec<usize> = basis
+            .iter()
+            .map(|&e| t.mat_vec(p.u_mb, e, DIM, DIM))
+            .collect();
+        let read_k: Vec<usize> = basis
+            .iter()
+            .map(|&e| t.mat_vec(p.w_read, e, DIM, DIM))
+            .collect();
+
+        let g_tau = p.gate(t, 4);
+        let sig_tau = t.sigmoid(g_tau);
+        let scaled_tau = t.scale(sig_tau, 3.6_f64);
+        let inv_tau = t.add_scalar(scaled_tau, 0.80_f64);
+
+        OpFields {
+            h1_eff,
+            v_flow,
+            gate_h,
+            g_act,
+            inv_tau,
+            basis,
+            ua_e,
+            ub_e,
+            uma_e,
+            umb_e,
+            read_k,
+        }
     }
 
-    /// Applique une fois l'opérateur de circulation T_{H1, H2}(z) dans R^d.
-    fn apply_operator_once(
-        &self,
-        z: &[f64; DIM],
-        h1_eff: &[[f64; DIM]],
-        v_flow: &[[f64; DIM]],
-        gate_h: &[[f64; DIM]],
-        g_act: f64,
-        attn_out: Option<&mut [f64]>,
-    ) -> [f64; DIM] {
-        let k1 = h1_eff.len();
-        if k1 == 0 || g_act <= 1e-12_f64 {
-            if let Some(a) = attn_out {
-                let u = 1.0_f64 / (a.len().max(1) as f64);
-                for x in a.iter_mut() {
-                    *x = u;
-                }
-            }
-            return [0.0_f64; DIM];
+    /// Applique l'opérateur causal T_{H1, H2} sur un vecteur de contexte c in R^DIM.
+    fn apply_op(t: &mut Tape, f: &OpFields, c: usize) -> (usize, usize) {
+        let k1 = f.h1_eff.len();
+        if k1 == 0 {
+            let z = t.leaf(vec![0.0_f64; DIM]);
+            let a = t.leaf(Vec::new());
+            return (z, a);
         }
-
         let inv_sqrt_d = 1.0_f64 / (DIM as f64).sqrt();
-        let q = mat_vec(self.w_up_01(), z);
-        let mut logits = [0.0_f64; 16];
-        let mut weights = [0.0_f64; 16];
-        let k_use = k1.min(16);
+        let mut dots = Vec::with_capacity(k1);
+        for k in 0..k1 {
+            let d = t.dot(c, f.h1_eff[k]);
+            dots.push(t.scale(d, inv_sqrt_d));
+        }
+        let attn_logits = t.stack(dots);
+        let attn = t.softmax(attn_logits);
 
-        for k in 0..k_use {
-            if vec_norm(&h1_eff[k]) <= 1e-12_f64 {
-                logits[k] = -1e9_f64;
-            } else {
-                logits[k] = dot(&q, &h1_eff[k]) * inv_sqrt_d;
-            }
+        let mut branches = Vec::with_capacity(k1);
+        for k in 0..k1 {
+            let cm = t.mul(c, f.gate_h[k]);
+            let sum = t.add(f.v_flow[k], cm);
+            branches.push(t.tanh(sum));
         }
-        softmax_slice(&logits[..k_use], &mut weights[..k_use]);
-
-        if let Some(a) = attn_out {
-            for k in 0..k_use.min(a.len()) {
-                a[k] = weights[k];
-            }
-        }
-
-        let rot_z = mat_vec(self.u_rot(), z);
-        let mut delta = [0.0_f64; DIM];
-        for k in 0..k_use {
-            let ak = weights[k];
-            if ak <= 1e-12_f64 {
-                continue;
-            }
-            for d in 0..DIM {
-                delta[d] += ak * (v_flow[k][d] + rot_z[d] * gate_h[k][d]).tanh();
-            }
-        }
-
-        let mut next_z = [0.0_f64; DIM];
-        for d in 0..DIM {
-            next_z[d] = z[d] + delta[d];
-        }
-        rms_norm(&mut next_z);
-        for d in 0..DIM {
-            next_z[d] *= g_act;
-        }
-        next_z
+        let mix = t.weighted_sum(attn, branches);
+        let normed = t.rms_norm(mix, 0.25_f64);
+        let y = t.scalar_mul(normed, f.g_act);
+        (y, attn)
     }
 
-    /// Déploiement vertical pur sans autorégression ni fast-weights :
-    /// y^(1) = T(X), y^(2) = T(y^(1)), y^(3) = T(y^(2)), R_hat^(s) = softmax(<y^(s), W_read X> / tau).
-    pub(crate) fn unfold_top_down(
-        &self,
-        state: &CircState,
+    fn read_logits(t: &mut Tape, f: &OpFields, y: usize) -> usize {
+        let v = f.read_k.len();
+        let mut dots = Vec::with_capacity(v);
+        for w in 0..v {
+            dots.push(t.dot(y, f.read_k[w]));
+        }
+        let raw = t.stack(dots);
+        t.scalar_mul(raw, f.inv_tau)
+    }
+
+    /// Déploiement vertical non-markovien sur les 3 tables ternaires :
+    /// 0: (u,v) -> next ; 1: (u,_,w) -> mid ; 2: composition (v, B(u,v)) -> skip3.
+    pub(crate) fn unfold_tables(
+        t: &mut Tape,
+        p: &ParamsTape,
+        view: &RelationalView,
+        tables: &NonMarkovTables,
+        state: &NmState,
         cut_l1: Option<u32>,
         cut_vertical: bool,
-    ) -> CircUnfold {
-        let v = state.x.len();
-        let k1 = state.h1.len();
-
-        let (h1_eff, v_flow, gate_h, g_act) = self.prepare_operator(state, cut_l1, cut_vertical);
-
-        let mut a_ground = vec![0.0_f64; v * k1];
-        let mut y1 = vec![[0.0_f64; DIM]; v];
-        let mut y2 = vec![[0.0_f64; DIM]; v];
-        let mut y3 = vec![[0.0_f64; DIM]; v];
-
-        if v == 0 || k1 == 0 || g_act <= 1e-12_f64 {
-            let unif = if v > 0 { 1.0_f64 / (v as f64) } else { 0.0_f64 };
-            let r = vec![unif; v * v];
-            return CircUnfold {
-                h1_eff,
-                a_ground,
-                y: [y1, y2, y3],
-                r_hat: [r.clone(), r.clone(), r],
-            };
-        }
-
-        for u in 0..v {
-            let row = &mut a_ground[u * k1..(u + 1) * k1];
-            y1[u] = self.apply_operator_once(&state.x[u], &h1_eff, &v_flow, &gate_h, g_act, Some(row));
-            y2[u] = self.apply_operator_once(&y1[u], &h1_eff, &v_flow, &gate_h, g_act, None);
-            y3[u] = self.apply_operator_once(&y2[u], &h1_eff, &v_flow, &gate_h, g_act, None);
-        }
-
-        // Clés de lecture W_read * x_w
-        let mut read_keys = vec![[0.0_f64; DIM]; v];
-        for w in 0..v {
-            read_keys[w] = mat_vec(self.w_read(), &state.x[w]);
-        }
-
-        let inv_tau = 0.60_f64 + 3.40_f64 * sigmoid(self.gates()[6]);
-        let mut r_hat = [
-            vec![0.0_f64; v * v],
-            vec![0.0_f64; v * v],
-            vec![0.0_f64; v * v],
+        task_mask: [bool; 3],
+    ) -> (OpFields, TablesEval) {
+        let f = Self::prepare_operator(t, p, view, state, cut_l1, cut_vertical);
+        let mut task_gains = [
+            t.leaf_scalar(0.0_f64),
+            t.leaf_scalar(0.0_f64),
+            t.leaf_scalar(0.0_f64),
         ];
-        let mut logits = vec![0.0_f64; v];
+        let mut task_lls = [
+            t.leaf_scalar(0.0_f64),
+            t.leaf_scalar(0.0_f64),
+            t.leaf_scalar(0.0_f64),
+        ];
+        let mut task_l1s = [
+            t.leaf_scalar(0.0_f64),
+            t.leaf_scalar(0.0_f64),
+            t.leaf_scalar(0.0_f64),
+        ];
 
-        for (s, ys) in [&y1, &y2, &y3].into_iter().enumerate() {
-            for u in 0..v {
-                for w in 0..v {
-                    logits[w] = inv_tau * dot(&ys[u], &read_keys[w]);
-                }
-                softmax_slice(&logits, &mut r_hat[s][u * v..(u + 1) * v]);
+        let mut ctx_vecs: [Vec<usize>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        let mut attn_vecs: [Vec<usize>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        let mut probs: [Vec<usize>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+
+        for m in 0..3 {
+            if !task_mask[m] || tables.tables[m].is_empty() {
+                continue;
+            }
+            let entries = &tables.tables[m];
+            let mut nll_acc = t.leaf_scalar(0.0_f64);
+            let mut l1_acc = t.leaf_scalar(0.0_f64);
+
+            for entry in entries {
+                let (c, y, attn) = match m {
+                    0 => {
+                        let a = f.ua_e[entry.u];
+                        let b = f.ub_e[entry.v];
+                        let ab = t.mul(a, b);
+                        let s1 = t.add(a, b);
+                        let s2 = t.add(s1, ab);
+                        let c0 = t.tanh(s2);
+                        let (y0, at0) = Self::apply_op(t, &f, c0);
+                        (c0, y0, at0)
+                    }
+                    1 => {
+                        let a = f.uma_e[entry.u];
+                        let b = f.umb_e[entry.v];
+                        let ab = t.mul(a, b);
+                        let s1 = t.add(a, b);
+                        let s2 = t.add(s1, ab);
+                        let c1 = t.tanh(s2);
+                        let (y1, at1) = Self::apply_op(t, &f, c1);
+                        (c1, y1, at1)
+                    }
+                    _ => {
+                        // Composition verticale de profondeur 2 : y_skip = B(e_v, B(e_u, e_v))
+                        let a = f.ua_e[entry.u];
+                        let b = f.ub_e[entry.v];
+                        let ab = t.mul(a, b);
+                        let s1 = t.add(a, b);
+                        let s2 = t.add(s1, ab);
+                        let c_first = t.tanh(s2);
+                        let (y_first, _) = Self::apply_op(t, &f, c_first);
+
+                        let a2 = f.ua_e[entry.v];
+                        let b2 = t.mat_vec(p.u_b, y_first, DIM, DIM);
+                        let ab2 = t.mul(a2, b2);
+                        let s3 = t.add(a2, b2);
+                        let s4 = t.add(s3, ab2);
+                        let c2 = t.tanh(s4);
+                        let (y2, at2) = Self::apply_op(t, &f, c2);
+                        (c2, y2, at2)
+                    }
+                };
+
+                let logits = Self::read_logits(t, &f, y);
+                let pr = t.softmax(logits);
+                let ce = t.cross_entropy_logits(logits, entry.target.clone());
+                let w_ce = t.scale(ce, entry.weight);
+                nll_acc = t.add(nll_acc, w_ce);
+
+                let tgt_node = t.leaf(entry.target.clone());
+                let l1 = t.smooth_l1_half(pr, tgt_node);
+                let w_l1 = t.scale(l1, entry.weight);
+                l1_acc = t.add(l1_acc, w_l1);
+
+                ctx_vecs[m].push(c);
+                attn_vecs[m].push(attn);
+                probs[m].push(pr);
+            }
+
+            // Gain normalisé strictement au-dessus de H(P_marg)
+            let hm = tables.h_marg[m].max(0.05_f64);
+            let neg_nll = t.scale(nll_acc, -1.0_f64);
+            let diff = t.add_scalar(neg_nll, hm);
+            let raw_g = t.scale(diff, 1.0_f64 / hm);
+            task_gains[m] = t.clamp(raw_g, -1.0_f64, 1.0_f64);
+            task_lls[m] = neg_nll;
+            task_l1s[m] = l1_acc;
+        }
+
+        let mut w_sum = 0.0_f64;
+        for m in 0..3 {
+            if task_mask[m] && !tables.tables[m].is_empty() {
+                w_sum += TASK_W[m];
+            }
+        }
+        let inv_w = if w_sum > 1e-9_f64 { 1.0_f64 / w_sum } else { 1.0_f64 };
+
+        let mut gain_mix = t.leaf_scalar(0.0_f64);
+        let mut ll_mix = t.leaf_scalar(0.0_f64);
+        let mut residual_l1 = t.leaf_scalar(0.0_f64);
+        for m in 0..3 {
+            if task_mask[m] && !tables.tables[m].is_empty() {
+                let cw = TASK_W[m] * inv_w;
+                let g_term = t.scale(task_gains[m], cw);
+                let l_term = t.scale(task_lls[m], cw);
+                let r_term = t.scale(task_l1s[m], cw);
+                gain_mix = t.add(gain_mix, g_term);
+                ll_mix = t.add(ll_mix, l_term);
+                residual_l1 = t.add(residual_l1, r_term);
             }
         }
 
-        CircUnfold {
-            h1_eff,
-            a_ground,
-            y: [y1, y2, y3],
-            r_hat,
-        }
+        (
+            f,
+            TablesEval {
+                task_gains,
+                gain_mix,
+                ll_mix,
+                residual_l1,
+                ctx_vecs,
+                attn_vecs,
+                probs,
+            },
+        )
     }
 
-    /// Une étape abductive pure de circulation L0 <-> L1 <-> L2.
-    /// - `scale_mask`: masque certaines échelles de R_obs (ex: [true, false, true] pour P_scale).
-    /// - `freeze_h`: verrouille (H1, H2) pour tester le ré-ancrage seul de X sous Déplacement.
+    /// Une étape de circulation abductive pure sur (H1, H2) (repère L0 fixe).
     pub(crate) fn abductive_step(
-        &self,
+        t: &mut Tape,
+        p: &ParamsTape,
         view: &RelationalView,
-        state: &CircState,
+        tables: &NonMarkovTables,
+        state: &NmState,
         use_refutation: bool,
-        scale_mask: [bool; 3],
-        freeze_h: bool,
+        task_mask: [bool; 3],
         cut_l1: Option<u32>,
         cut_l2: Option<u32>,
         cut_vertical: bool,
-    ) -> CircState {
-        let v = view.v_size;
+    ) -> NmState {
         let k1 = state.h1.len();
         let k2 = state.h2.len();
 
-        let unfold = self.unfold_top_down(state, cut_l1, cut_vertical);
-        let res_norm = multi_scale_l1(&view.graph, &unfold.r_hat, v);
+        let (f, ev) =
+            Self::unfold_tables(t, p, view, tables, state, cut_l1, cut_vertical, task_mask);
 
-        // Forces résiduelles duales (sortante r_u et entrante r_tilde_w) sur les échelles actives
-        let mut r_out = vec![[0.0_f64; DIM]; v];
-        let mut r_in = vec![[0.0_f64; DIM]; v];
-        let mut mask_w_sum = 0.0_f64;
-        for s in 0..3 {
-            if scale_mask[s] {
-                mask_w_sum += SCALE_W[s];
+        // Portes temporelles pilotées par la norme du résidu
+        let g0 = p.gate(t, 0);
+        let g1 = p.gate(t, 1);
+        let g2 = p.gate(t, 2);
+        let g3 = p.gate(t, 3);
+        let a1_pre = t.add(t.mul(g0, ev.residual_l1), g1);
+        let a1_sig = t.sigmoid(a1_pre);
+        let alpha1 = t.add_scalar(t.scale(a1_sig, 0.56_f64), 0.14_f64);
+        let one_m_a1 = t.add_scalar(t.scale(alpha1, -1.0_f64), 1.0_f64);
+
+        let a2_pre = t.add(t.mul(g2, ev.residual_l1), g3);
+        let a2_sig = t.sigmoid(a2_pre);
+        let alpha2 = t.add_scalar(t.scale(a2_sig, 0.56_f64), 0.14_f64);
+        let one_m_a2 = t.add_scalar(t.scale(alpha2, -1.0_f64), 1.0_f64);
+
+        // 1. Agrégation des résidus ternaires non-markoviens vers L1
+        let mut w_sum = 0.0_f64;
+        for m in 0..3 {
+            if task_mask[m] && !tables.tables[m].is_empty() {
+                w_sum += TASK_W[m];
             }
         }
-        let inv_mw = if mask_w_sum > 1e-9_f64 {
-            1.0_f64 / mask_w_sum
-        } else {
-            1.0_f64
-        };
+        let inv_w = if w_sum > 1e-9_f64 { 1.0_f64 / w_sum } else { 1.0_f64 };
 
-        for s in 0..3 {
-            if !scale_mask[s] {
+        let mut e_up: Vec<usize> = (0..k1).map(|_| t.leaf(vec![0.0_f64; DIM])).collect();
+
+        for m in 0..3 {
+            if !task_mask[m] || tables.tables[m].is_empty() {
                 continue;
             }
-            let sw = SCALE_W[s] * inv_mw;
-            for u in 0..v {
-                let wu = view.graph.w[s][u];
-                if wu <= 0.0_f64 {
-                    continue;
-                }
-                let base = u * v;
-                let yu = &unfold.y[s][u];
-                for w in 0..v {
-                    let diff = view.graph.r[s][base + w] - unfold.r_hat[s][base + w];
-                    if diff.abs() <= 1e-12_f64 {
-                        continue;
-                    }
-                    let c_out = sw * diff;
-                    let c_in = sw * wu * diff * (v as f64);
-                    for d in 0..DIM {
-                        r_out[u][d] += c_out * state.x[w][d];
-                        r_in[w][d] += c_in * yu[d];
-                    }
+            let mw = TASK_W[m] * inv_w;
+            for (i, entry) in tables.tables[m].iter().enumerate() {
+                let tgt = t.leaf(entry.target.clone());
+                let diff = t.sub(tgt, ev.probs[m][i]); // P_obs - P_hat (s'annule à l'attracteur)
+                let r_vec = t.weighted_sum(diff, f.basis.clone());
+                let ur = t.mat_vec(p.u_res, r_vec, DIM, DIM);
+                let uc = t.mat_vec(p.u_ctx, r_vec, DIM, DIM);
+                let inter = t.mul(ev.ctx_vecs[m][i], uc);
+                let sum_s = t.add(ur, inter);
+                let s_vec = t.tanh(sum_s);
+                let s_scaled = t.scale(s_vec, mw * entry.weight * 2.5_f64);
+
+                for k in 0..k1 {
+                    let ak = t.slice(ev.attn_vecs[m][i], k, 1);
+                    let gate_k = t.add_scalar(t.scale(ak, 0.85_f64), 0.15_f64);
+                    let contrib = t.scalar_mul(s_scaled, gate_k);
+                    e_up[k] = t.add(e_up[k], contrib);
                 }
             }
         }
 
-        let g = self.gates();
-        let alpha0 = 0.14_f64 + 0.50_f64 * sigmoid(g[0] * res_norm + g[1]);
-        let alpha1 = 0.14_f64 + 0.50_f64 * sigmoid(g[2] * res_norm + g[3]);
-        let alpha2 = 0.14_f64 + 0.50_f64 * sigmoid(g[4] * res_norm + g[5]);
+        // 2. Mise à jour Niveau 1 (résidu + couplage latéral W_lat1 + L2 -> L1)
+        let lat1_msg: Vec<usize> = state
+            .h1
+            .iter()
+            .map(|&hk| t.mat_vec(p.u_lat1, hk, DIM, DIM))
+            .collect();
+        let down2_msg: Vec<usize> = state
+            .h2
+            .iter()
+            .map(|&hm| t.mat_vec(p.u_down_21, hm, DIM, DIM))
+            .collect();
 
-        // 1. Réorganisation géométrique de L0 (ancrage relationnel sans stocker la loi)
-        let mut next_x = vec![[0.0_f64; DIM]; v];
-        for u in 0..v {
-            let m_in = mat_vec(self.u_x_in(), &r_in[u]);
-            let m_out = mat_vec(self.u_x_out(), &r_out[u]);
-            let mut h_mix = [0.0_f64; DIM];
-            for k in 0..k1 {
-                let ak = unfold.a_ground[u * k1 + k];
-                for d in 0..DIM {
-                    h_mix[d] += ak * unfold.h1_eff[k][d];
-                }
-            }
-            let m_td = mat_vec(self.u_x_td(), &h_mix);
-
-            for d in 0..DIM {
-                let drv = (m_in[d] + m_out[d] + 0.35_f64 * m_td[d]).tanh();
-                next_x[u][d] = (1.0_f64 - alpha0) * state.x[u][d] + alpha0 * drv;
-            }
-            rms_norm(&mut next_x[u]);
-        }
-
-        if freeze_h {
-            return CircState {
-                x: next_x,
-                h1: state.h1.clone(),
-                h2: state.h2.clone(),
-            };
-        }
-
-        // 2. Abduction à Niveau 1 (résidu agrégé + couplage latéral W_lat1 + L2 -> L1)
-        let mut next_h1 = vec![[0.0_f64; DIM]; k1];
-        let b1 = self.b1();
-
-        let mut obs1_msg = vec![[0.0_f64; DIM]; v];
-        for u in 0..v {
-            obs1_msg[u] = mat_vec(self.u_obs_1(), &r_out[u]);
-        }
-        let mut lat1_msg = vec![[0.0_f64; DIM]; k1];
-        for src in 0..k1 {
-            lat1_msg[src] = mat_vec(self.u_lat1(), &state.h1[src]);
-        }
-        let mut down2_msg = vec![[0.0_f64; DIM]; k2];
-        for m in 0..k2 {
-            down2_msg[m] = mat_vec(self.u_down_21(), &state.h2[m]);
-        }
-
-        let mut e_up = vec![[0.0_f64; DIM]; k1];
+        let mut next_h1 = Vec::with_capacity(k1);
         for dst in 0..k1 {
-            let mut ek = [0.0_f64; DIM];
-            for u in 0..v {
-                let wu = view.graph.w[0][u];
-                if wu <= 0.0_f64 {
-                    continue;
-                }
-                let coeff = wu * (0.20_f64 + 0.80_f64 * unfold.a_ground[u * k1 + dst]);
-                for d in 0..DIM {
-                    ek[d] += coeff * obs1_msg[u][d];
-                }
-            }
-            e_up[dst] = ek;
-
-            let mut acc = ek;
+            let mut acc = t.add(e_up[dst], p.b1);
             for src in 0..k1 {
                 if let Some(mask) = cut_l1 {
-                    let s_dst = ((mask >> dst.min(30)) & 1) != 0;
-                    let s_src = ((mask >> src.min(30)) & 1) != 0;
-                    if s_dst != s_src {
+                    let sd = ((mask >> dst.min(30)) & 1) != 0;
+                    let ss = ((mask >> src.min(30)) & 1) != 0;
+                    if sd != ss {
                         continue;
                     }
                 }
-                let w = self.w_lat1(dst, src);
-                if w != 0.0_f64 {
-                    for d in 0..DIM {
-                        acc[d] += w * lat1_msg[src][d];
-                    }
+                if let Some(w) = p.w_lat1(t, dst, src) {
+                    let term = t.scalar_mul(lat1_msg[src], w);
+                    acc = t.add(acc, term);
                 }
             }
-
             if !cut_vertical {
                 for m in 0..k2 {
-                    let w = self.w_down_21(dst, m);
-                    if w != 0.0_f64 {
-                        for d in 0..DIM {
-                            acc[d] += 0.65_f64 * w * down2_msg[m][d];
-                        }
+                    if let Some(w) = p.w_down_21(t, dst, m) {
+                        let term = t.scalar_mul(down2_msg[m], w);
+                        let sc = t.scale(term, 0.65_f64);
+                        acc = t.add(acc, sc);
                     }
                 }
             }
-
-            for d in 0..DIM {
-                next_h1[dst][d] =
-                    (1.0_f64 - alpha1) * state.h1[dst][d] + alpha1 * (acc[d] + b1[d]).tanh();
-            }
-            rms_norm(&mut next_h1[dst]);
+            let drv = t.tanh(acc);
+            let old_part = t.scalar_mul(state.h1[dst], one_m_a1);
+            let new_part = t.scalar_mul(drv, alpha1);
+            let raw = t.add(old_part, new_part);
+            next_h1.push(t.rms_norm(raw, 0.25_f64));
         }
 
         // 3. Réification pure L1 -> L2 (zéro accès direct à L0)
-        let mut next_h2 = vec![[0.0_f64; DIM]; k2];
-        let b2 = self.b2();
-        let beta_dyn = 0.20_f64 + 0.80_f64 * sigmoid(g[7]);
+        let g5 = p.gate(t, 5);
+        let beta_dyn = t.add_scalar(t.scale(t.sigmoid(g5), 0.80_f64), 0.20_f64);
 
-        let mut e1_reified = vec![[0.0_f64; DIM]; k1];
+        let mut e1_reified = Vec::with_capacity(k1);
         for k in 0..k1 {
-            let mut combined = [0.0_f64; DIM];
-            for d in 0..DIM {
-                let dh = next_h1[k][d] - state.h1[k][d];
-                combined[d] = next_h1[k][d] + beta_dyn * dh + 0.65_f64 * e_up[k][d];
-            }
-            e1_reified[k] = mat_vec(self.u_up_12(), &combined);
+            let dh = t.sub(next_h1[k], state.h1[k]);
+            let dh_s = t.scalar_mul(dh, beta_dyn);
+            let s1 = t.add(next_h1[k], dh_s);
+            let s2 = t.add(s1, t.scale(e_up[k], 0.70_f64));
+            e1_reified.push(t.mat_vec(p.u_up_12, s2, DIM, DIM));
         }
 
-        let mut lat2_msg = vec![[0.0_f64; DIM]; k2];
-        for src in 0..k2 {
-            lat2_msg[src] = mat_vec(self.u_lat2(), &state.h2[src]);
-        }
+        let lat2_msg: Vec<usize> = state
+            .h2
+            .iter()
+            .map(|&hm| t.mat_vec(p.u_lat2, hm, DIM, DIM))
+            .collect();
 
+        let mut next_h2 = Vec::with_capacity(k2);
         for dst in 0..k2 {
-            let mut acc = [0.0_f64; DIM];
-
+            let mut acc = p.b2;
             if !cut_vertical {
                 for src1 in 0..k1 {
-                    let w = self.w_up_12(dst, src1);
-                    if w != 0.0_f64 {
-                        for d in 0..DIM {
-                            acc[d] += w * e1_reified[src1][d];
-                        }
+                    if let Some(w) = p.w_up_12(t, dst, src1) {
+                        let term = t.scalar_mul(e1_reified[src1], w);
+                        acc = t.add(acc, term);
                     }
                 }
             }
-
             for src in 0..k2 {
                 if let Some(mask) = cut_l2 {
-                    let s_dst = ((mask >> dst.min(30)) & 1) != 0;
-                    let s_src = ((mask >> src.min(30)) & 1) != 0;
-                    if s_dst != s_src {
+                    let sd = ((mask >> dst.min(30)) & 1) != 0;
+                    let ss = ((mask >> src.min(30)) & 1) != 0;
+                    if sd != ss {
                         continue;
                     }
                 }
-                let w = self.w_lat2(dst, src);
-                if w != 0.0_f64 {
-                    for d in 0..DIM {
-                        acc[d] += w * lat2_msg[src][d];
-                    }
+                if let Some(w) = p.w_lat2(t, dst, src) {
+                    let term = t.scalar_mul(lat2_msg[src], w);
+                    acc = t.add(acc, term);
                 }
             }
-
-            for d in 0..DIM {
-                next_h2[dst][d] =
-                    (1.0_f64 - alpha2) * state.h2[dst][d] + alpha2 * (acc[d] + b2[d]).tanh();
-            }
-            rms_norm(&mut next_h2[dst]);
+            let drv = t.tanh(acc);
+            let old_part = t.scalar_mul(state.h2[dst], one_m_a2);
+            let new_part = t.scalar_mul(drv, alpha2);
+            let raw = t.add(old_part, new_part);
+            next_h2.push(t.rms_norm(raw, 0.25_f64));
         }
 
-        let mut next_state = CircState {
-            x: next_x,
+        let mut next_state = NmState {
             h1: next_h1,
             h2: next_h2,
         };
 
-        // 4. Réfutation endogène conservatrice (ne freine jamais une trajectoire déjà en progrès)
+        // 4. Réfutation endogène conservatrice (teste une contre-hypothèse L1+L2)
         if use_refutation
             && cut_l1.is_none()
             && cut_l2.is_none()
             && !cut_vertical
             && k1 > 0
             && k2 > 0
-            && scale_mask == [true, true, true]
+            && task_mask == [true, true, true]
         {
-            let gain_curr = multi_scale_gain(&view.graph, &unfold.r_hat, v);
-            let unf_base = self.unfold_top_down(&next_state, None, false);
-            let gain_base = multi_scale_gain(&view.graph, &unf_base.r_hat, v);
-
-            // Teste activement une contre-hypothèse sur le nœud dominant L1 et L2
-            let peak1 = next_state
-                .h1
-                .iter()
-                .enumerate()
-                .max_by(|a, b| dot(a.1, a.1).total_cmp(&dot(b.1, b.1)))
-                .map(|(i, _)| i)
+            let peak1 = (0..k1)
+                .max_by(|&a, &b| {
+                    let na: f64 = t.val(next_state.h1[a]).iter().map(|x| x * x).sum();
+                    let nb: f64 = t.val(next_state.h1[b]).iter().map(|x| x * x).sum();
+                    na.total_cmp(&nb)
+                })
                 .unwrap_or(0);
-            let peak2 = next_state
-                .h2
-                .iter()
-                .enumerate()
-                .max_by(|a, b| dot(a.1, a.1).total_cmp(&dot(b.1, b.1)))
-                .map(|(i, _)| i)
+            let peak2 = (0..k2)
+                .max_by(|&a, &b| {
+                    let na: f64 = t.val(next_state.h2[a]).iter().map(|x| x * x).sum();
+                    let nb: f64 = t.val(next_state.h2[b]).iter().map(|x| x * x).sum();
+                    na.total_cmp(&nb)
+                })
                 .unwrap_or(0);
 
             let mut refuted = next_state.clone();
-            let p1 = mat_vec(self.u_ref1(), &refuted.h1[peak1]);
-            for d in 0..DIM {
-                refuted.h1[peak1][d] -= 0.35_f64 * p1[d].tanh();
-            }
-            rms_norm(&mut refuted.h1[peak1]);
+            let p1 = t.tanh(t.mat_vec(p.u_ref1, refuted.h1[peak1], DIM, DIM));
+            let r1 = t.sub(refuted.h1[peak1], t.scale(p1, 0.35_f64));
+            refuted.h1[peak1] = t.rms_norm(r1, 0.25_f64);
 
-            let p2 = mat_vec(self.u_ref2(), &refuted.h2[peak2]);
-            for d in 0..DIM {
-                refuted.h2[peak2][d] -= 0.35_f64 * p2[d].tanh();
-            }
-            rms_norm(&mut refuted.h2[peak2]);
+            let p2 = t.tanh(t.mat_vec(p.u_ref2, refuted.h2[peak2], DIM, DIM));
+            let r2 = t.sub(refuted.h2[peak2], t.scale(p2, 0.35_f64));
+            refuted.h2[peak2] = t.rms_norm(r2, 0.25_f64);
 
-            let unf_ref = self.unfold_top_down(&refuted, None, false);
-            let gain_ref = multi_scale_gain(&view.graph, &unf_ref.r_hat, v);
+            let (_, ev_base) =
+                Self::unfold_tables(t, p, view, tables, &next_state, None, false, task_mask);
+            let (_, ev_ref) =
+                Self::unfold_tables(t, p, view, tables, &refuted, None, false, task_mask);
 
-            if gain_ref > gain_base + 1e-4_f64 {
+            if t.scalar(ev_ref.gain_mix) > t.scalar(ev_base.gain_mix) + 1e-4_f64 {
                 next_state = refuted;
-            } else if gain_base >= gain_curr {
-                // Consolide ce qui a survécu à la tentative de réfutation
-                for d in 0..DIM {
-                    let d1 = next_state.h1[peak1][d] - refuted.h1[peak1][d];
-                    next_state.h1[peak1][d] += 0.10_f64 * d1;
-                    let d2 = next_state.h2[peak2][d] - refuted.h2[peak2][d];
-                    next_state.h2[peak2][d] += 0.10_f64 * d2;
-                }
-                rms_norm(&mut next_state.h1[peak1]);
-                rms_norm(&mut next_state.h2[peak2]);
+            } else if t.scalar(ev_base.gain_mix) >= t.scalar(ev.gain_mix) {
+                let d1 = t.sub(next_state.h1[peak1], refuted.h1[peak1]);
+                let c1 = t.add(next_state.h1[peak1], t.scale(d1, 0.10_f64));
+                next_state.h1[peak1] = t.rms_norm(c1, 0.25_f64);
+
+                let d2 = t.sub(next_state.h2[peak2], refuted.h2[peak2]);
+                let c2 = t.add(next_state.h2[peak2], t.scale(d2, 0.10_f64));
+                next_state.h2[peak2] = t.rms_norm(c2, 0.25_f64);
             }
         }
 
         next_state
     }
 
-    pub(crate) fn run_abduction(
-        &self,
+    pub(crate) fn run_abduction_tape(
+        t: &mut Tape,
+        p: &ParamsTape,
         view: &RelationalView,
+        tables: &NonMarkovTables,
         budget: usize,
         use_refutation: bool,
+        task_mask: [bool; 3],
         capture_steps: &[usize],
-        record_phi: bool,
-    ) -> AbductionTrace {
-        self.run_abduction_masked(
-            view,
-            budget,
-            use_refutation,
-            [true, true, true],
-            capture_steps,
-            record_phi,
-        )
-    }
-
-    pub(crate) fn run_abduction_masked(
-        &self,
-        view: &RelationalView,
-        budget: usize,
-        use_refutation: bool,
-        scale_mask: [bool; 3],
-        capture_steps: &[usize],
-        record_phi: bool,
-    ) -> AbductionTrace {
-        let mut state = CircState::zeros(view.v_size, K1, K2);
-        let mut snapshots = Vec::new();
-        let mut phi_history = Vec::new();
-
+    ) -> (NmState, Vec<(usize, NmState)>) {
+        let mut st = Self::zero_state(t, K1, K2);
+        let mut snaps = Vec::new();
         if capture_steps.contains(&0) {
-            snapshots.push((0, state.clone()));
-        }
-        if record_phi {
-            phi_history.push(
-                self.evaluate_phi_state(view, &state, 0, use_refutation)
-                    .phi_sharp,
-            );
+            snaps.push((0, st.clone()));
         }
         if budget == 0 {
-            return AbductionTrace {
-                state,
-                snapshots,
-                phi_history,
-            };
+            return (st, snaps);
         }
 
-        state = CircState::seeded(view);
+        st = Self::seeded_state(t);
         for step in 1..=budget {
-            state = self.abductive_step(
+            st = Self::abductive_step(
+                t,
+                p,
                 view,
-                &state,
+                tables,
+                &st,
                 use_refutation,
-                scale_mask,
-                false,
+                task_mask,
                 None,
                 None,
                 false,
             );
             if capture_steps.contains(&step) {
-                snapshots.push((step, state.clone()));
+                snaps.push((step, st.clone()));
             }
-            if record_phi {
-                phi_history.push(
-                    self.evaluate_phi_state(view, &state, step, use_refutation)
-                        .phi_sharp,
-                );
+        }
+        (st, snaps)
+    }
+
+    /// Trouve la coupe minimale exacte C* hors-tape (zéro allocation de gradient),
+    /// afin d'appliquer le théorème de l'enveloppe sur la tape d'autograd.
+    fn find_min_cut_offtape(
+        &self,
+        view: &RelationalView,
+        raw: &RawState,
+    ) -> Option<CutSpec> {
+        let k1 = raw.h1.len();
+        let k2 = raw.h2.len();
+        if k1 <= 1 || k2 <= 1 {
+            return None;
+        }
+        let mut ft = Tape::new(false);
+        let fp = ParamsTape::from_model(&mut ft, self);
+        let st = raw.into_tape(&mut ft);
+
+        let full_next = Self::abductive_step(
+            &mut ft,
+            &fp,
+            view,
+            &view.obs,
+            &st,
+            false,
+            [true, true, true],
+            None,
+            None,
+            false,
+        );
+        let (_, ev_full) = Self::unfold_tables(
+            &mut ft,
+            &fp,
+            view,
+            &view.obs,
+            &full_next,
+            None,
+            false,
+            [true, true, true],
+        );
+
+        let tvd_eval = |ft: &Tape, ev_cut: &TablesEval| -> f64 {
+            let mut tot = 0.0_f64;
+            for m in 0..3 {
+                let mut sc = 0.0_f64;
+                for (i, e) in view.obs.tables[m].iter().enumerate() {
+                    let pa = ft.val(ev_full.probs[m][i]);
+                    let pb = ft.val(ev_cut.probs[m][i]);
+                    let mut l1 = 0.0_f64;
+                    for (&a, &b) in pa.iter().zip(pb.iter()) {
+                        l1 += (a - b).abs();
+                    }
+                    sc += e.weight * 0.5_f64 * l1;
+                }
+                tot += TASK_W[m] * sc;
+            }
+            tot
+        };
+
+        let mut best_spec = CutSpec::Vertical;
+        let mut min_div = f64::INFINITY;
+
+        // 1. Coupes L1
+        let masks1 = 1u32 << (k1.min(10) - 1);
+        for mask in 1..masks1 {
+            let cn = Self::abductive_step(
+                &mut ft,
+                &fp,
+                view,
+                &view.obs,
+                &st,
+                false,
+                [true, true, true],
+                Some(mask),
+                None,
+                false,
+            );
+            let (_, ev_c) = Self::unfold_tables(
+                &mut ft,
+                &fp,
+                view,
+                &view.obs,
+                &cn,
+                Some(mask),
+                false,
+                [true, true, true],
+            );
+            let d = tvd_eval(&ft, &ev_c);
+            if d < min_div {
+                min_div = d;
+                best_spec = CutSpec::L1(mask);
             }
         }
 
-        AbductionTrace {
-            state,
-            snapshots,
-            phi_history,
+        // 2. Coupes L2
+        let masks2 = 1u32 << (k2.min(10) - 1);
+        for mask in 1..masks2 {
+            let cn = Self::abductive_step(
+                &mut ft,
+                &fp,
+                view,
+                &view.obs,
+                &st,
+                false,
+                [true, true, true],
+                None,
+                Some(mask),
+                false,
+            );
+            let (_, ev_c) = Self::unfold_tables(
+                &mut ft,
+                &fp,
+                view,
+                &view.obs,
+                &cn,
+                None,
+                false,
+                [true, true, true],
+            );
+            let d = tvd_eval(&ft, &ev_c);
+            if d < min_div {
+                min_div = d;
+                best_spec = CutSpec::L2(mask);
+            }
         }
+
+        // 3. Coupe verticale L1 <-> L2
+        let vn = Self::abductive_step(
+            &mut ft,
+            &fp,
+            view,
+            &view.obs,
+            &st,
+            false,
+            [true, true, true],
+            None,
+            None,
+            true,
+        );
+        let (_, ev_v) = Self::unfold_tables(
+            &mut ft,
+            &fp,
+            view,
+            &view.obs,
+            &vn,
+            None,
+            true,
+            [true, true, true],
+        );
+        let dv = tvd_eval(&ft, &ev_v);
+        if dv < min_div {
+            best_spec = CutSpec::Vertical;
+        }
+
+        Some(best_spec)
+    }
+
+    fn tables_pred_tvd(
+        t: &mut Tape,
+        tables: &NonMarkovTables,
+        a: &TablesEval,
+        b: &TablesEval,
+    ) -> usize {
+        let mut tot = t.leaf_scalar(0.0_f64);
+        for m in 0..3 {
+            if tables.tables[m].is_empty() {
+                continue;
+            }
+            let mut sc = t.leaf_scalar(0.0_f64);
+            for (i, e) in tables.tables[m].iter().enumerate() {
+                let d = t.smooth_l1_half(a.probs[m][i], b.probs[m][i]);
+                sc = t.add(sc, t.scale(d, e.weight));
+            }
+            tot = t.add(tot, t.scale(sc, TASK_W[m]));
+        }
+        tot
+    }
+
+    /// Évaluation complète et différentiable de φ_sharp V4 sur la Tape.
+    pub(crate) fn evaluate_phi_tape(
+        &self,
+        t: &mut Tape,
+        p: &ParamsTape,
+        view: &RelationalView,
+        state: &NmState,
+        budget: usize,
+        use_refutation: bool,
+        pre_proj_temp: Option<&NmState>,
+        pre_proj_comp: Option<&NmState>,
+    ) -> PhiTapeOut {
+        if view.v_size <= 1 || view.seq.len() < 16 || view.obs.tables[0].is_empty() {
+            let z = t.leaf_scalar(0.0_f64);
+            let neg = t.leaf_scalar(-1.0_f64);
+            return PhiTapeOut {
+                phi_sharp: z,
+                shaping_score: neg,
+                report: PhiReport {
+                    generativity: 0.0,
+                    discrimination: 0.0,
+                    projection: 0.0,
+                    proj_temp: 0.0,
+                    proj_comp: 0.0,
+                    phi_cut: 0.0,
+                    s_ref: 0.0,
+                    s_disp: 0.0,
+                    s_abs: 0.0,
+                    residual_norm: 1.0,
+                    phi_sharp: 0.0,
+                    shaping_score: -1.0,
+                },
+            };
+        }
+
+        // 1. Générativité & Discrimination au-dessus de H(P_marg)
+        let (_, ev_e) = Self::unfold_tables(
+            t,
+            p,
+            view,
+            &view.obs,
+            state,
+            None,
+            false,
+            [true, true, true],
+        );
+        let gen_raw = ev_e.gain_mix;
+
+        let (_, ev_neg) = Self::unfold_tables(
+            t,
+            p,
+            view,
+            &view.shuf,
+            state,
+            None,
+            false,
+            [true, true, true],
+        );
+        let disc_raw = t.clamp(t.sub(gen_raw, ev_neg.gain_mix), -1.0_f64, 1.0_f64);
+
+        // 2. Projection immunisée contre l'écho : min(P_temp, P_comp)
+        let (pt_raw, pc_raw) = if budget == 0 || state.h1.is_empty() || state.h2.is_empty() {
+            (t.leaf_scalar(0.0_f64), t.leaf_scalar(0.0_f64))
+        } else {
+            let mid = view.seq.len() / 2;
+            let first_half = view.subslice_same_vocab(0, mid);
+            let second_half = view.subslice_same_vocab(mid, view.seq.len());
+
+            let owned_pt;
+            let st_pt = if let Some(s) = pre_proj_temp {
+                s
+            } else {
+                owned_pt = Self::run_abduction_tape(
+                    t,
+                    p,
+                    &first_half,
+                    &first_half.obs,
+                    budget,
+                    use_refutation,
+                    [true, true, true],
+                    &[],
+                )
+                .0;
+                &owned_pt
+            };
+            let (_, ev_pt) = Self::unfold_tables(
+                t,
+                p,
+                view,
+                &second_half.obs,
+                st_pt,
+                None,
+                false,
+                [true, true, true],
+            );
+
+            // Projection compositionnelle P_comp : abduit sur {next, mid}, déplie skip3 masqué
+            let owned_pc;
+            let st_pc = if let Some(s) = pre_proj_comp {
+                s
+            } else {
+                owned_pc = Self::run_abduction_tape(
+                    t,
+                    p,
+                    view,
+                    &view.obs,
+                    budget,
+                    false,
+                    [true, true, false],
+                    &[],
+                )
+                .0;
+                &owned_pc
+            };
+            let (_, ev_pc) = Self::unfold_tables(
+                t,
+                p,
+                view,
+                &view.obs,
+                st_pc,
+                None,
+                false,
+                [false, false, true],
+            );
+            (ev_pt.gain_mix, ev_pc.task_gains[2])
+        };
+        let proj_raw = t.min_scalar(pt_raw, pc_raw);
+
+        // 3. Irréductibilité de circulation Φ_cut = Φ_mip(coupe min) * Φ_diff
+        let k1 = state.h1.len();
+        let k2 = state.h2.len();
+        let phi_cut = if budget == 0 || k1 <= 1 || k2 <= 1 {
+            t.leaf_scalar(0.0_f64)
+        } else {
+            let mut min_n1 = t.smooth_norm(state.h1[0]);
+            for k in 1..k1 {
+                let nk = t.smooth_norm(state.h1[k]);
+                min_n1 = t.min_scalar(min_n1, nk);
+            }
+            let mut min_n2 = t.smooth_norm(state.h2[0]);
+            for m in 1..k2 {
+                let nm = t.smooth_norm(state.h2[m]);
+                min_n2 = t.min_scalar(min_n2, nm);
+            }
+            let mut min_dist = t.smooth_dist(state.h1[0], state.h1[1]);
+            for a in 0..k1 {
+                for b in (a + 1)..k1 {
+                    let d = t.smooth_dist(state.h1[a], state.h1[b]);
+                    min_dist = t.min_scalar(min_dist, d);
+                }
+            }
+            for a in 0..k2 {
+                for b in (a + 1)..k2 {
+                    let d = t.smooth_dist(state.h2[a], state.h2[b]);
+                    min_dist = t.min_scalar(min_dist, d);
+                }
+            }
+            let f1 = t.tanh(t.scale(min_n1, 3.0_f64));
+            let f2 = t.tanh(t.scale(min_n2, 3.0_f64));
+            let fd = t.tanh(t.scale(min_dist, 3.0_f64));
+            let f12 = t.mul(f1, f2);
+            let phi_diff = t.mul(f12, fd);
+
+            if t.scalar(phi_diff) <= 1e-9_f64 {
+                t.leaf_scalar(0.0_f64)
+            } else {
+                let raw_st = RawState::from_tape(t, state);
+                if let Some(best_cut) = self.find_min_cut_offtape(view, &raw_st) {
+                    let full_next = Self::abductive_step(
+                        t,
+                        p,
+                        view,
+                        &view.obs,
+                        state,
+                        false,
+                        [true, true, true],
+                        None,
+                        None,
+                        false,
+                    );
+                    let (_, ev_full) = Self::unfold_tables(
+                        t,
+                        p,
+                        view,
+                        &view.obs,
+                        &full_next,
+                        None,
+                        false,
+                        [true, true, true],
+                    );
+
+                    let (cl1, cl2, cv) = match best_cut {
+                        CutSpec::L1(m) => (Some(m), None, false),
+                        CutSpec::L2(m) => (None, Some(m), false),
+                        CutSpec::Vertical => (None, None, true),
+                    };
+                    let cut_next = Self::abductive_step(
+                        t,
+                        p,
+                        view,
+                        &view.obs,
+                        state,
+                        false,
+                        [true, true, true],
+                        cl1,
+                        cl2,
+                        cv,
+                    );
+                    let (_, ev_cut) = Self::unfold_tables(
+                        t,
+                        p,
+                        view,
+                        &view.obs,
+                        &cut_next,
+                        cl1,
+                        cv,
+                        [true, true, true],
+                    );
+                    let div = Self::tables_pred_tvd(t, &view.obs, &ev_full, &ev_cut);
+                    let mip = t.clamp(t.tanh(t.scale(div, 10.0_f64)), 0.0_f64, 1.0_f64);
+                    t.mul(mip, phi_diff)
+                } else {
+                    t.leaf_scalar(0.0_f64)
+                }
+            }
+        };
+
+        // 4. Survie sous Réfutation (S_ref), Déplacement (S_disp) et Abstraction (S_abs)
+        let (s_ref_raw, s_disp_raw, s_abs_raw) =
+            if budget == 0 || t.scalar(gen_raw) <= 1e-6_f64 || k1 == 0 || k2 == 0 {
+                (
+                    t.leaf_scalar(0.0_f64),
+                    t.leaf_scalar(0.0_f64),
+                    t.leaf_scalar(0.0_f64),
+                )
+            } else {
+                let denom = t.max_scalar(gen_raw, t.leaf_scalar(0.05_f64));
+
+                // (a) S_ref : attaque du nœud L1 dominant + 2 pas de réparation active
+                let peak1 = (0..k1)
+                    .max_by(|&a, &b| {
+                        let na: f64 = t.val(state.h1[a]).iter().map(|x| x * x).sum();
+                        let nb: f64 = t.val(state.h1[b]).iter().map(|x| x * x).sum();
+                        na.total_cmp(&nb)
+                    })
+                    .unwrap_or(0);
+                let mut att = state.clone();
+                att.h1[peak1] = t.leaf(vec![0.0_f64; DIM]);
+                for _ in 0..2 {
+                    att = Self::abductive_step(
+                        t,
+                        p,
+                        view,
+                        &view.obs,
+                        &att,
+                        false,
+                        [true, true, true],
+                        None,
+                        None,
+                        false,
+                    );
+                }
+                let (_, ev_rep) = Self::unfold_tables(
+                    t,
+                    p,
+                    view,
+                    &view.obs,
+                    &att,
+                    None,
+                    false,
+                    [true, true, true],
+                );
+                let sr = t.div_scalar(ev_rep.gain_mix, denom);
+
+                // (b) S_disp : (H1*, H2*) verrouillés, évalués sur fenêtre déplacée [1/4, 3/4]
+                let q1 = view.seq.len() / 4;
+                let q3 = (3 * view.seq.len()) / 4;
+                let shifted = view.subslice_same_vocab(q1, q3);
+                let (_, ev_disp) = Self::unfold_tables(
+                    t,
+                    p,
+                    view,
+                    &shifted.obs,
+                    state,
+                    None,
+                    false,
+                    [true, true, true],
+                );
+                let sd = t.div_scalar(ev_disp.gain_mix, denom);
+
+                // (c) S_abs : efface H1*, régénère H1_abs depuis H2* seul (verrou anti-gel strict)
+                let h1_abs = Self::regenerate_h1_from_h2(t, p, &state.h2, k1);
+                let abs_st = NmState {
+                    h1: h1_abs,
+                    h2: state.h2.clone(),
+                };
+                let (_, ev_abs) = Self::unfold_tables(
+                    t,
+                    p,
+                    view,
+                    &view.obs,
+                    &abs_st,
+                    None,
+                    false,
+                    [true, true, true],
+                );
+                let sa = t.div_scalar(ev_abs.gain_mix, denom);
+
+                (sr, sd, sa)
+            };
+
+        let s_ref = t.clamp(s_ref_raw, 0.0_f64, 1.0_f64);
+        let s_disp = t.clamp(s_disp_raw, 0.0_f64, 1.0_f64);
+        let s_abs = t.clamp(s_abs_raw, 0.0_f64, 1.0_f64);
+
+        let s_prod = t.mul(t.mul(s_ref, s_disp), s_abs);
+        let s_abd = t.pow_scalar(s_prod, 1.0_f64 / 3.0_f64);
+
+        let res_c = t.clamp(ev_e.residual_l1, 0.0_f64, 1.0_f64);
+        let res_fac = t.add_scalar(t.scale(res_c, -0.5_f64), 1.0_f64);
+
+        let g_c = t.clamp(gen_raw, 0.0_f64, 1.0_f64);
+        let d_c = t.clamp(disc_raw, 0.0_f64, 1.0_f64);
+        let p_c = t.clamp(proj_raw, 0.0_f64, 1.0_f64);
+
+        let base_min = t.min_scalar(t.min_scalar(g_c, d_c), p_c);
+        let p1 = t.mul(base_min, phi_cut);
+        let p2 = t.mul(p1, s_abd);
+        let phi_sharp = t.mul(p2, res_fac);
+
+        // Verrou anti-Goodhart strict : zéro gradient vers Φ_cut / R / D / A tant que G, D, P <= 0
+        let shaping_score = if t.scalar(gen_raw) > 0.0_f64
+            && t.scalar(disc_raw) > 0.0_f64
+            && t.scalar(proj_raw) > 0.0_f64
+        {
+            let sa_br = t.clamp(s_abs_raw, -0.5_f64, 1.0_f64);
+            let sr_br = t.clamp(s_ref_raw, -0.5_f64, 1.0_f64);
+            let sd_br = t.clamp(s_disp_raw, -0.5_f64, 1.0_f64);
+            let b0 = t.add(phi_sharp, t.scale(base_min, 0.08_f64));
+            let b1 = t.add(b0, t.scale(sa_br, 0.06_f64));
+            let b2 = t.add(b1, t.scale(sr_br, 0.04_f64));
+            let b3 = t.add(b2, t.scale(sd_br, 0.04_f64));
+            t.add(b3, t.scale(phi_cut, 0.04_f64))
+        } else {
+            let min_raw = t.min_scalar(t.min_scalar(gen_raw, disc_raw), proj_raw);
+            let avg_raw = t.scale(t.add(t.add(gen_raw, disc_raw), proj_raw), 1.0_f64 / 3.0_f64);
+            let s1 = t.add(t.scale(min_raw, 0.55_f64), t.scale(avg_raw, 0.25_f64));
+            t.sub(s1, t.scale(res_c, 0.10_f64))
+        };
+
+        let report = PhiReport {
+            generativity: t.scalar(g_c),
+            discrimination: t.scalar(d_c),
+            projection: t.scalar(p_c),
+            proj_temp: t.scalar(pt_raw).clamp(0.0_f64, 1.0_f64),
+            proj_comp: t.scalar(pc_raw).clamp(0.0_f64, 1.0_f64),
+            phi_cut: t.scalar(phi_cut),
+            s_ref: t.scalar(s_ref),
+            s_disp: t.scalar(s_disp),
+            s_abs: t.scalar(s_abs),
+            residual_norm: t.scalar(res_c),
+            phi_sharp: t.scalar(phi_sharp),
+            shaping_score: t.scalar(shaping_score),
+        };
+
+        PhiTapeOut {
+            phi_sharp,
+            shaping_score,
+            report,
+        }
+    }
+
+    /// Helpers hors-tape rapides pour l'inférence et l'évaluation.
+    pub(crate) fn run_abduction_raw(
+        &self,
+        view: &RelationalView,
+        budget: usize,
+        use_refutation: bool,
+        capture_steps: &[usize],
+    ) -> (RawState, Vec<(usize, RawState)>) {
+        let mut t = Tape::new(false);
+        let p = ParamsTape::from_model(&mut t, self);
+        let (st, snaps) = Self::run_abduction_tape(
+            &mut t,
+            &p,
+            view,
+            &view.obs,
+            budget,
+            use_refutation,
+            [true, true, true],
+            capture_steps,
+        );
+        let raw_snaps = snaps
+            .into_iter()
+            .map(|(step, s)| (step, RawState::from_tape(&t, &s)))
+            .collect();
+        (RawState::from_tape(&t, &st), raw_snaps)
+    }
+
+    pub(crate) fn evaluate_phi_raw(
+        &self,
+        view: &RelationalView,
+        raw: &RawState,
+        budget: usize,
+        use_refutation: bool,
+    ) -> PhiReport {
+        let mut t = Tape::new(false);
+        let p = ParamsTape::from_model(&mut t, self);
+        let st = raw.into_tape(&mut t);
+        self.evaluate_phi_tape(&mut t, &p, view, &st, budget, use_refutation, None, None)
+            .report
     }
 
     pub(crate) fn evaluate_phi(
@@ -883,368 +1560,114 @@ impl PhisharpV3 {
         budget: usize,
         use_refutation: bool,
     ) -> PhiReport {
-        let trace = self.run_abduction(view, budget, use_refutation, &[], false);
-        self.evaluate_phi_state(view, &trace.state, budget, use_refutation)
+        let (raw, _) = self.run_abduction_raw(view, budget, use_refutation, &[]);
+        self.evaluate_phi_raw(view, &raw, budget, use_refutation)
     }
 
-    /// φ_sharp V3 :
-    /// - Conjonction sans compensation : min(G, D, P) avec P = min(P_temp, P_scale)
-    /// - Φ_cut = Φ_mip(coupes de canaux seules) * Φ_diff(différenciation, sans punir DropL1)
-    /// - S_abd = (S_ref * S_disp * S_abs)^(1/3) : réparation sous attaque + déplacement + abstraction H2->H1
-    /// - Terme de résidu + verrou anti-Goodhart strict
-    pub(crate) fn evaluate_phi_state(
+    pub(crate) fn unfold_predictions_raw(
         &self,
         view: &RelationalView,
-        state: &CircState,
-        budget: usize,
-        use_refutation: bool,
-    ) -> PhiReport {
-        let v = view.v_size;
-        if v <= 1 || view.seq.len() < 16 {
-            return PhiReport {
-                generativity: 0.0,
-                discrimination: 0.0,
-                projection: 0.0,
-                proj_temp: 0.0,
-                proj_scale: 0.0,
-                phi_cut: 0.0,
-                s_ref: 0.0,
-                s_disp: 0.0,
-                s_abs: 0.0,
-                residual_norm: 1.0,
-                phi_sharp: 0.0,
-                shaping_score: -1.0,
-            };
+        raw: &RawState,
+        cut_vertical: bool,
+    ) -> ([Vec<Vec<f64>>; 3], f64, f64, f64) {
+        let mut t = Tape::new(false);
+        let p = ParamsTape::from_model(&mut t, self);
+        let st = raw.into_tape(&mut t);
+        let (_, ev) = Self::unfold_tables(
+            &mut t,
+            &p,
+            view,
+            &view.obs,
+            &st,
+            None,
+            cut_vertical,
+            [true, true, true],
+        );
+        let mut preds: [Vec<Vec<f64>>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        for m in 0..3 {
+            for &pid in &ev.probs[m] {
+                preds[m].push(t.val(pid).to_vec());
+            }
         }
-
-        let unfold = self.unfold_top_down(state, None, false);
-
-        // 1. Générativité et Discrimination au-dessus des marginales P_marg
-        let gen_raw = multi_scale_gain(&view.graph, &unfold.r_hat, v);
-        let neg_gain = multi_scale_gain(&view.shuf_graph, &unfold.r_hat, v);
-        let disc_raw = (gen_raw - neg_gain).clamp(-1.0_f64, 1.0_f64);
-
-        // 2. Projection immunisée contre l'écho : min(P_temp, P_scale)
-        let (proj_temp_raw, proj_scale_raw) = if budget == 0 || state.h1.is_empty() || state.h2.is_empty() {
-            (0.0_f64, 0.0_f64)
-        } else {
-            let mid = view.seq.len() / 2;
-            let first_half = view.subslice_same_vocab(0, mid);
-            let second_half = view.subslice_same_vocab(mid, view.seq.len());
-            let tr_half = self.run_abduction(&first_half, budget, use_refutation, &[], false);
-            let unf_half = self.unfold_top_down(&tr_half.state, None, false);
-            let pt = multi_scale_gain(&second_half.graph, &unf_half.r_hat, v);
-
-            // Projection inter-échelles : abduit en masquant lag-2, déplie T^2 sur R^(2)
-            let tr_sc = self.run_abduction_masked(
-                view,
-                budget,
-                false,
-                [true, false, true],
-                &[],
-                false,
-            );
-            let unf_sc = self.unfold_top_down(&tr_sc.state, None, false);
-            let ps = scale_gain(
-                &view.graph.r[1],
-                &unf_sc.r_hat[1],
-                &view.graph.w[1],
-                view.graph.h_marg[1],
-                v,
-            );
-            (pt, ps)
-        };
-        let proj_raw = proj_temp_raw.min(proj_scale_raw);
-
-        // 3. Irréductibilité de circulation Φ_cut = Φ_mip * Φ_diff (ZÉRO ablation de nœud)
-        let k1 = state.h1.len();
-        let k2 = state.h2.len();
-        let phi_cut = if budget == 0 || k1 <= 1 || k2 <= 1 {
-            0.0_f64
-        } else {
-            let mut min_n1 = f64::INFINITY;
-            for h in &state.h1 {
-                min_n1 = min_n1.min(vec_norm(h));
-            }
-            let mut min_n2 = f64::INFINITY;
-            for h in &state.h2 {
-                min_n2 = min_n2.min(vec_norm(h));
-            }
-            let mut min_dist = f64::INFINITY;
-            for a in 0..k1 {
-                for b in (a + 1)..k1 {
-                    min_dist = min_dist.min(vec_dist(&state.h1[a], &state.h1[b]));
-                }
-            }
-            for a in 0..k2 {
-                for b in (a + 1)..k2 {
-                    min_dist = min_dist.min(vec_dist(&state.h2[a], &state.h2[b]));
-                }
-            }
-            let phi_diff = (min_n1 * 3.0_f64).tanh()
-                * (min_n2 * 3.0_f64).tanh()
-                * (min_dist * 3.0_f64).tanh();
-
-            if phi_diff <= 1e-9_f64 {
-                0.0_f64
-            } else {
-                let full_next = self.abductive_step(
-                    view,
-                    state,
-                    false,
-                    [true, true, true],
-                    false,
-                    None,
-                    None,
-                    false,
-                );
-                let pred_full = self.unfold_top_down(&full_next, None, false);
-
-                let mut min_div = f64::INFINITY;
-
-                // Coupes de canaux internes L1
-                let masks1 = 1u32 << (k1.min(10) - 1);
-                for mask in 1..masks1 {
-                    let cut_next = self.abductive_step(
-                        view,
-                        state,
-                        false,
-                        [true, true, true],
-                        false,
-                        Some(mask),
-                        None,
-                        false,
-                    );
-                    let pred_cut = self.unfold_top_down(&cut_next, Some(mask), false);
-                    let div =
-                        multi_scale_pred_tvd(&pred_full.r_hat, &pred_cut.r_hat, &view.graph.w, v);
-                    if div < min_div {
-                        min_div = div;
-                    }
-                }
-
-                // Coupes de canaux internes L2
-                let masks2 = 1u32 << (k2.min(10) - 1);
-                for mask in 1..masks2 {
-                    let cut_next = self.abductive_step(
-                        view,
-                        state,
-                        false,
-                        [true, true, true],
-                        false,
-                        None,
-                        Some(mask),
-                        false,
-                    );
-                    let pred_cut = self.unfold_top_down(&cut_next, None, false);
-                    let div =
-                        multi_scale_pred_tvd(&pred_full.r_hat, &pred_cut.r_hat, &view.graph.w, v);
-                    if div < min_div {
-                        min_div = div;
-                    }
-                }
-
-                // Coupe verticale L1 <-> L2
-                let vcut_next = self.abductive_step(
-                    view,
-                    state,
-                    false,
-                    [true, true, true],
-                    false,
-                    None,
-                    None,
-                    true,
-                );
-                let pred_vcut = self.unfold_top_down(&vcut_next, None, true);
-                let vdiv =
-                    multi_scale_pred_tvd(&pred_full.r_hat, &pred_vcut.r_hat, &view.graph.w, v);
-                if vdiv < min_div {
-                    min_div = vdiv;
-                }
-
-                ((min_div * 10.0_f64).tanh().clamp(0.0_f64, 1.0_f64)) * phi_diff
-            }
-        };
-
-        // 4. Survie sous les 3 épreuves abductives : Réfutation, Déplacement, Abstraction
-        let (s_ref, s_disp, s_abs) = if budget == 0 || gen_raw <= 1e-6_f64 || k1 == 0 || k2 == 0 {
-            (0.0_f64, 0.0_f64, 0.0_f64)
-        } else {
-            // (a) S_ref : attaque du nœud L1 dominant puis 2 pas de réparation active
-            let mut attacked = state.clone();
-            let peak1 = attacked
-                .h1
-                .iter()
-                .enumerate()
-                .max_by(|a, b| dot(a.1, a.1).total_cmp(&dot(b.1, b.1)))
-                .map(|(i, _)| i)
-                .unwrap_or(0);
-            attacked.h1[peak1] = [0.0_f64; DIM];
-            for _ in 0..2 {
-                attacked = self.abductive_step(
-                    view,
-                    &attacked,
-                    false,
-                    [true, true, true],
-                    false,
-                    None,
-                    None,
-                    false,
-                );
-            }
-            let unf_rep = self.unfold_top_down(&attacked, None, false);
-            let g_rep = multi_scale_gain(&view.graph, &unf_rep.r_hat, v);
-            let sr = (g_rep / gen_raw).clamp(0.0_f64, 1.0_f64);
-
-            // (b) S_disp : (H1*, H2*) verrouillés, ré-ancrage seul de X sur fenêtre déplacée
-            let q1 = view.seq.len() / 4;
-            let q3 = (3 * view.seq.len()) / 4;
-            let shifted = view.subslice_same_vocab(q1, q3);
-            let mut disp_st = state.clone();
-            for _ in 0..2 {
-                disp_st = self.abductive_step(
-                    &shifted,
-                    &disp_st,
-                    false,
-                    [true, true, true],
-                    true,
-                    None,
-                    None,
-                    false,
-                );
-            }
-            let unf_disp = self.unfold_top_down(&disp_st, None, false);
-            let g_disp = multi_scale_gain(&shifted.graph, &unf_disp.r_hat, v);
-            let sd = (g_disp / gen_raw).clamp(0.0_f64, 1.0_f64);
-
-            // (c) S_abs : efface H1* et force la régénération pure H2* -> H1_abs (verrou anti-gel)
-            let h1_abs = self.regenerate_h1_from_h2(&state.h2, k1);
-            let abs_st = CircState {
-                x: state.x.clone(),
-                h1: h1_abs,
-                h2: state.h2.clone(),
-            };
-            let unf_abs = self.unfold_top_down(&abs_st, None, false);
-            let g_abs = multi_scale_gain(&view.graph, &unf_abs.r_hat, v);
-            let sa = (g_abs / gen_raw).clamp(0.0_f64, 1.0_f64);
-
-            (sr, sd, sa)
-        };
-
-        let s_abd = (s_ref * s_disp * s_abs).cbrt();
-        let residual_norm = multi_scale_l1(&view.graph, &unfold.r_hat, v).clamp(0.0_f64, 1.0_f64);
-
-        let g_c = gen_raw.clamp(0.0_f64, 1.0_f64);
-        let d_c = disc_raw.clamp(0.0_f64, 1.0_f64);
-        let p_c = proj_raw.clamp(0.0_f64, 1.0_f64);
-
-        let base_min = g_c.min(d_c).min(p_c);
-        let phi_sharp = base_min * phi_cut * s_abd * (1.0_f64 - 0.5_f64 * residual_norm);
-
-        // Verrou anti-Goodhart strict : zéro récompense sur Φ_cut ou S_abd tant que G, D, P <= 0
-        let shaping_score = if gen_raw > 0.0_f64 && disc_raw > 0.0_f64 && proj_raw > 0.0_f64 {
-            phi_sharp + 0.05_f64 * base_min
-        } else {
-            let min_raw = gen_raw.min(disc_raw).min(proj_raw);
-            0.55_f64 * min_raw
-                + 0.25_f64 * (gen_raw + disc_raw + proj_raw) / 3.0_f64
-                - 0.10_f64 * residual_norm
-        };
-
-        PhiReport {
-            generativity: g_c,
-            discrimination: d_c,
-            projection: p_c,
-            proj_temp: proj_temp_raw.clamp(0.0_f64, 1.0_f64),
-            proj_scale: proj_scale_raw.clamp(0.0_f64, 1.0_f64),
-            phi_cut,
-            s_ref,
-            s_disp,
-            s_abs,
-            residual_norm,
-            phi_sharp,
-            shaping_score,
-        }
+        let ll = t.scalar(ev.ll_mix);
+        let mdl = t.scalar(mdl_tape_v4(&mut t, ev.ll_mix, &st, view.seq.len()));
+        let gain = t.scalar(ev.gain_mix);
+        (preds, ll, mdl, gain)
     }
 
-    /// Canal `ask` pur : itération verticale y_{t+1} = T_{H1*, H2*}(y_t) dans R^d,
-    /// sélectionnée par clôture de résidu auto-référentielle max [φ_sharp(E ⊕ ΔE) - φ_sharp(E)].
+    /// Canal `ask` pur : déploiement compositionnel dans R^DIM depuis les paires
+    /// à plus fort résidu (zéro autorégression sur E), sélectionné par clôture φ_sharp(E ⊕ ΔE).
     pub(crate) fn ask_emit(&self, view: &RelationalView, budget: usize, out_len: usize) -> Vec<u8> {
-        if view.vocab.is_empty() || view.seq.is_empty() {
+        if view.vocab.is_empty() || view.obs.tables[0].is_empty() {
             return Vec::new();
         }
-        let v = view.v_size;
-        let trace = self.run_abduction(view, budget, true, &[], false);
-        let unfold = self.unfold_top_down(&trace.state, None, false);
-        let phi_base = self
-            .evaluate_phi_state(view, &trace.state, budget, true)
-            .phi_sharp;
+        let (raw, _) = self.run_abduction_raw(view, budget, true, &[]);
+        let (preds, _, _, _) = self.unfold_predictions_raw(view, &raw, false);
+        let phi_base = self.evaluate_phi_raw(view, &raw, budget, true).phi_sharp;
 
-        let (h1_eff, v_flow, gate_h, g_act) = self.prepare_operator(&trace.state, None, false);
-        let mut read_keys = vec![[0.0_f64; DIM]; v];
-        for w in 0..v {
-            read_keys[w] = mat_vec(self.w_read(), &trace.state.x[w]);
-        }
-        let inv_tau = 0.60_f64 + 3.40_f64 * sigmoid(self.gates()[6]);
-
-        let mut node_res: Vec<(usize, f64)> = (0..v)
-            .filter(|&u| view.graph.w[0][u] > 0.0_f64)
-            .map(|u| {
-                let mut err = 0.0_f64;
-                for s in 0..3 {
-                    let mut l1 = 0.0_f64;
-                    for w in 0..v {
-                        l1 += (view.graph.r[s][u * v + w] - unfold.r_hat[s][u * v + w]).abs();
-                    }
-                    err += SCALE_W[s] * 0.5_f64 * l1;
+        let mut pair_res: Vec<(usize, usize, f64)> = view.obs.tables[0]
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                let mut l1 = 0.0_f64;
+                for (&pt, &pq) in e.target.iter().zip(preds[0][i].iter()) {
+                    l1 += (pt - pq).abs();
                 }
-                (u, err)
+                (e.u, e.v, 0.5_f64 * l1)
             })
             .collect();
-        node_res.sort_by(|a, b| b.1.total_cmp(&a.1));
+        pair_res.sort_by(|a, b| {
+            b.2.total_cmp(&a.2)
+                .then_with(|| a.0.cmp(&b.0))
+                .then_with(|| a.1.cmp(&b.1))
+        });
 
         let mut e_4grams: HashSet<[usize; 4]> = HashSet::new();
         for w in view.seq.windows(4) {
             e_4grams.insert([w[0], w[1], w[2], w[3]]);
         }
 
-        let n_cands = node_res.len().min(4).max(1);
+        let n_cands = pair_res.len().min(4).max(1);
         let mut best_cand = Vec::new();
         let mut best_score = f64::NEG_INFINITY;
-        let mut logits = vec![0.0_f64; v];
-        let mut probs = vec![0.0_f64; v];
 
         for c_i in 0..n_cands {
-            let anchor = if c_i < node_res.len() {
-                node_res[c_i].0
-            } else {
-                0
-            };
+            let (u0, v0, _) = pair_res[c_i];
+            let mut t = Tape::new(false);
+            let p = ParamsTape::from_model(&mut t, self);
+            let st = raw.into_tape(&mut t);
+            let f = Self::prepare_operator(&mut t, &p, view, &st, None, false);
 
-            let mut z = trace.state.x[anchor];
-            let mut cand_idx = Vec::with_capacity(out_len);
-            cand_idx.push(anchor);
-            let mut visits = vec![0usize; v];
-            visits[anchor] = 1;
+            let mut z_prev = f.basis[u0];
+            let mut z_curr = f.basis[v0];
+            let mut cand_idx = vec![u0, v0];
+            let mut visits = vec![0usize; view.v_size];
+            visits[u0] += 1;
+            visits[v0] += 1;
 
-            for _ in 1..out_len {
-                z = self.apply_operator_once(&z, &h1_eff, &v_flow, &gate_h, g_act, None);
-                for w in 0..v {
-                    logits[w] = inv_tau * dot(&z, &read_keys[w]);
-                }
-                softmax_slice(&logits, &mut probs);
+            for _ in 2..out_len {
+                let a = t.mat_vec(p.u_a, z_prev, DIM, DIM);
+                let b = t.mat_vec(p.u_b, z_curr, DIM, DIM);
+                let ab = t.mul(a, b);
+                let c = t.tanh(t.add(t.add(a, b), ab));
+                let (y, _) = Self::apply_op(&mut t, &f, c);
+                let logits = Self::read_logits(&mut t, &f, y);
+                let pr = t.softmax(logits);
+                let pv = t.val(pr);
 
                 let mut best_w = 0usize;
                 let mut best_p = f64::NEG_INFINITY;
-                for w in 0..v {
-                    let p = probs[w] / (1.0_f64 + 0.35_f64 * (visits[w] as f64));
-                    if p > best_p {
-                        best_p = p;
+                for (w, &pw) in pv.iter().enumerate() {
+                    let sc = pw / (1.0_f64 + 0.35_f64 * (visits[w] as f64));
+                    if sc > best_p {
+                        best_p = sc;
                         best_w = w;
                     }
                 }
                 visits[best_w] += 1;
                 cand_idx.push(best_w);
+                z_prev = z_curr;
+                z_curr = y; // Déroulement purement dans l'espace latent R^DIM
             }
 
             let mut ext_seq = view.seq.clone();
@@ -1275,31 +1698,19 @@ impl PhisharpV3 {
     }
 }
 
-/// Baseline MDL adaptée à l'état V3 (pénalise la longueur de description de X, H1, H2).
-pub(crate) fn mdl_graph_v3(
-    graph: &ScaleGraph,
-    r_hat: &[Vec<f64>; 3],
-    state: &CircState,
+/// Score MDL différentiable sur la Tape (pénalité BIC-like sur l'énergie de H1 et H2).
+pub(crate) fn mdl_tape_v4(
+    t: &mut Tape,
+    ll_mix: usize,
+    state: &NmState,
     seq_len: usize,
-    v: usize,
-) -> f64 {
-    let ll = log_likelihood_graph(graph, r_hat, v);
-    let mut lat_energy = 0.0_f64;
-    for h in state.h1.iter().chain(state.h2.iter()) {
-        for &val in h {
-            if val.abs() > 0.05_f64 {
-                lat_energy += val.abs();
-            }
-        }
-    }
-    let mut x_energy = 0.0_f64;
-    for x in &state.x {
-        for &val in x {
-            if val.abs() > 0.05_f64 {
-                x_energy += val.abs();
-            }
-        }
+) -> usize {
+    let mut energy = t.leaf_scalar(0.0_f64);
+    for &hid in state.h1.iter().chain(state.h2.iter()) {
+        let e = t.smooth_abs_sum(hid);
+        energy = t.add(energy, e);
     }
     let n = seq_len.max(2) as f64;
-    ll - 0.008_f64 * (lat_energy + 0.35_f64 * x_energy) * n.ln() / n
+    let pen_coeff = 0.012_f64 * n.ln() / n;
+    t.sub(ll_mix, t.scale(energy, pen_coeff))
 }
