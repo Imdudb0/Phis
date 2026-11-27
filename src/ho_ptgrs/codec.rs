@@ -1,5 +1,5 @@
 use super::meta_ops::{DefGraph, Instance};
-use super::rewriting::{PatternNode, Rule};
+use super::rewriting::{PatternNode, Rule, PatternGraph};
 use super::rng::Rng;
 use super::term_graph::{SymbolId, TermGraph};
 
@@ -238,7 +238,7 @@ impl EpisodicCodec {
         self.encode_pattern(buf, &r.rhs);
     }
 
-    fn encode_pattern(&self, buf: &mut Vec<u8>, pat: &crate::rewriting::PatternGraph) {
+    fn encode_pattern(&self, buf: &mut Vec<u8>, pat: &PatternGraph) {
         buf.extend_from_slice(&self.inst_idx_codes[pat.root]);
         for (idx, node) in pat.nodes.iter().enumerate() {
             buf.extend_from_slice(&self.inst_tags[&InstTag::NodeSep]);
