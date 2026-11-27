@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 
-pub(crate) const DIM: usize = 8;
-pub(crate) const K1: usize = 6; // Nœuds causaux réifiés (Niveau 1)
-pub(crate) const K2: usize = 3; // Nœuds méta-relationnels (Niveau 2)
+pub(crate) const DIM: usize = 12; // Repère orthonormé exact jusqu'à V = 12
+pub(crate) const K1: usize = 6;   // Nœuds causaux concrets (Niveau 1)
+pub(crate) const K2: usize = 3;   // Moules méta-relationnels (Niveau 2)
 pub(crate) const DEFAULT_BUDGET: usize = 6;
-pub(crate) const SCALE_W: [f64; 3] = [0.50_f64, 0.30_f64, 0.20_f64];
+pub(crate) const MAX_CTX: usize = 48;
+pub(crate) const TASK_W: [f64; 3] = [0.45_f64, 0.35_f64, 0.20_f64]; // [next, mid, skip]
 
 // ============================================================================
 // 1. PRNG déterministe (SplitMix64 + Box-Muller, zéro dépendance)
@@ -56,96 +57,40 @@ impl Rng {
 }
 
 // ============================================================================
-// 2. Primitives algébriques
+// 2. Repère fixe orthonormé à L0 (strictement invariant par bijection, zéro fuite)
 // ============================================================================
 
-#[inline]
-pub(crate) fn sigmoid(x: f64) -> f64 {
-    1.0_f64 / (1.0_f64 + (-x.clamp(-20.0_f64, 20.0_f64)).exp())
-}
-
-#[inline]
-pub(crate) fn mat_vec(mat: &[f64], x: &[f64; DIM]) -> [f64; DIM] {
-    let mut y = [0.0_f64; DIM];
-    for r in 0..DIM {
-        let mut acc = 0.0_f64;
-        let base = r * DIM;
-        for c in 0..DIM {
-            acc += mat[base + c] * x[c];
-        }
-        y[r] = acc;
-    }
-    y
-}
-
-#[inline]
-pub(crate) fn dot(a: &[f64; DIM], b: &[f64; DIM]) -> f64 {
-    let mut s = 0.0_f64;
-    for i in 0..DIM {
-        s += a[i] * b[i];
-    }
-    s
-}
-
-#[inline]
-pub(crate) fn vec_norm(v: &[f64; DIM]) -> f64 {
-    dot(v, v).sqrt()
-}
-
-#[inline]
-pub(crate) fn vec_dist(a: &[f64; DIM], b: &[f64; DIM]) -> f64 {
-    let mut s = 0.0_f64;
-    for i in 0..DIM {
-        let d = a[i] - b[i];
-        s += d * d;
-    }
-    s.sqrt()
-}
-
-#[inline]
-pub(crate) fn rms_norm(v: &mut [f64; DIM]) {
-    let mean_sq = dot(v, v) / (DIM as f64);
-    if mean_sq < 1e-18_f64 {
-        return;
-    }
-    let denom = (mean_sq + 0.25_f64).sqrt();
-    for x in v.iter_mut() {
-        *x /= denom;
-    }
-}
-
-pub(crate) fn softmax_slice(logits: &[f64], out: &mut [f64]) {
-    let mut max_l = f64::NEG_INFINITY;
-    for &l in logits {
-        if l > max_l {
-            max_l = l;
-        }
-    }
-    let mut sum_e = 0.0_f64;
-    for (o, &l) in out.iter_mut().zip(logits.iter()) {
-        let e = if l < -1e8_f64 {
-            0.0_f64
+/// Construit V vecteurs fixes dans R^DIM dépendant UNIQUEMENT de l'indice d'ordre
+/// d'apparition u in 0..V (strictement invariant par bijection d'alphabet,
+/// strictement orthonormé pour V <= DIM, et immuable pendant le déploiement).
+pub(crate) fn build_fixed_basis(v_size: usize) -> Vec<Vec<f64>> {
+    let mut basis: Vec<Vec<f64>> = Vec::with_capacity(v_size);
+    for u in 0..v_size {
+        if u < DIM {
+            let mut v = vec![0.0_f64; DIM];
+            v[u] = 1.0_f64;
+            basis.push(v);
         } else {
-            (l - max_l).exp()
-        };
-        *o = e;
-        sum_e += e;
-    }
-    if sum_e <= 1e-15_f64 {
-        let u = 1.0_f64 / (out.len().max(1) as f64);
-        for o in out.iter_mut() {
-            *o = u;
+            // Vecteur pseudo-orthogonal déterministe sur la sphère unité de R^DIM
+            let mut rng = Rng::new(0x517C_C1B7_2722_0A95u64 ^ ((u as u64).wrapping_mul(0x9E37_79B9)));
+            let mut v = vec![0.0_f64; DIM];
+            let mut sq = 0.0_f64;
+            for x in &mut v {
+                *x = rng.next_normal();
+                sq += (*x) * (*x);
+            }
+            let inv = 1.0_f64 / sq.sqrt().max(1e-12_f64);
+            for x in &mut v {
+                *x *= inv;
+            }
+            basis.push(v);
         }
-    } else {
-        let inv = 1.0_f64 / sum_e;
-        for o in out.iter_mut() {
-            *o *= inv;
-        }
     }
+    basis
 }
 
 // ============================================================================
-// 3. PTGRS purement générique (entraînement fermé ; C réservée à l'étalonnage)
+// 3. PTGRS générique & OOD (C réservée exclusivement à l'étalonnage post-hoc)
 // ============================================================================
 
 #[derive(Clone)]
@@ -163,19 +108,20 @@ pub(crate) struct PtgrsCause {
     pub(crate) terminals: Vec<u8>,
 }
 
-pub(crate) struct MultiScaleGroundTruth {
-    pub(crate) r1: HashMap<(u8, u8), f64>,
-    pub(crate) r2: HashMap<(u8, u8), f64>,
-    pub(crate) r3: HashMap<(u8, u8), f64>,
+pub(crate) struct NonMarkovGroundTruth {
+    pub(crate) next: HashMap<(u8, u8, u8), f64>, // P(w | u, v)
+    pub(crate) mid: HashMap<(u8, u8, u8), f64>,  // P(v | u, _, w)
+    pub(crate) skip: HashMap<(u8, u8, u8), f64>, // P(z | u, v, _)
 }
 
 impl PtgrsCause {
+    /// Générateur d'entraînement strictement générique (aucun format NL ni moule ciblé).
     pub(crate) fn sample_generic(rng: &mut Rng) -> Self {
         let mut pool: Vec<u8> = (0u8..=255).collect();
         rng.shuffle(&mut pool);
 
-        let n_nonterms = 3 + rng.range_usize(3);
-        let n_terms = 5 + rng.range_usize(6);
+        let n_nonterms = 3 + rng.range_usize(3); // 3..5 non-terminaux
+        let n_terms = 5 + rng.range_usize(5);    // 5..9 terminaux
         let nonterms = &pool[0..n_nonterms];
         let terminals = pool[n_nonterms..n_nonterms + n_terms].to_vec();
 
@@ -216,12 +162,13 @@ impl PtgrsCause {
         }
     }
 
+    /// Famille OOD (barreau 1) : double branchement récursif emboîté.
     pub(crate) fn sample_ood(rng: &mut Rng, depth_family: usize) -> Self {
         let mut pool: Vec<u8> = (0u8..=255).collect();
         rng.shuffle(&mut pool);
 
         let n_nonterms = 4 + depth_family.min(4);
-        let n_terms = 7 + rng.range_usize(6);
+        let n_terms = 7 + rng.range_usize(4); // 7..10 terminaux
         let nonterms = &pool[0..n_nonterms];
         let terminals = pool[n_nonterms..n_nonterms + n_terms].to_vec();
 
@@ -286,60 +233,70 @@ impl PtgrsCause {
         out
     }
 
-    pub(crate) fn ground_truth_multi_scale(
+    /// Distribution observationnelle non-markovienne de référence de C (jamais vue en entraînement).
+    pub(crate) fn ground_truth_non_markov(
         &self,
         rng: &mut Rng,
         max_depth: usize,
-    ) -> MultiScaleGroundTruth {
-        let mut c1: HashMap<(u8, u8), usize> = HashMap::new();
-        let mut s1: HashMap<u8, usize> = HashMap::new();
-        let mut c2: HashMap<(u8, u8), usize> = HashMap::new();
-        let mut s2: HashMap<u8, usize> = HashMap::new();
-        let mut c3: HashMap<(u8, u8), usize> = HashMap::new();
-        let mut s3: HashMap<u8, usize> = HashMap::new();
+    ) -> NonMarkovGroundTruth {
+        let mut c_next: HashMap<(u8, u8, u8), usize> = HashMap::new();
+        let mut s_next: HashMap<(u8, u8), usize> = HashMap::new();
+        let mut c_mid: HashMap<(u8, u8, u8), usize> = HashMap::new();
+        let mut s_mid: HashMap<(u8, u8), usize> = HashMap::new();
+        let mut c_skip: HashMap<(u8, u8, u8), usize> = HashMap::new();
+        let mut s_skip: HashMap<(u8, u8), usize> = HashMap::new();
 
-        for _ in 0..24 {
+        for _ in 0..32 {
             let sample = self.emit_effect(rng, max_depth, 180);
-            for w in sample.windows(2) {
-                *c1.entry((w[0], w[1])).or_insert(0) += 1;
-                *s1.entry(w[0]).or_insert(0) += 1;
-            }
             for w in sample.windows(3) {
-                *c2.entry((w[0], w[2])).or_insert(0) += 1;
-                *s2.entry(w[0]).or_insert(0) += 1;
+                *c_next.entry((w[0], w[1], w[2])).or_insert(0) += 1;
+                *s_next.entry((w[0], w[1])).or_insert(0) += 1;
+
+                *c_mid.entry((w[0], w[2], w[1])).or_insert(0) += 1;
+                *s_mid.entry((w[0], w[2])).or_insert(0) += 1;
             }
             for w in sample.windows(4) {
-                *c3.entry((w[0], w[3])).or_insert(0) += 1;
-                *s3.entry(w[0]).or_insert(0) += 1;
+                *c_skip.entry((w[0], w[1], w[3])).or_insert(0) += 1;
+                *s_skip.entry((w[0], w[1])).or_insert(0) += 1;
             }
         }
 
-        let norm = |c: HashMap<(u8, u8), usize>, s: HashMap<u8, usize>| -> HashMap<(u8, u8), f64> {
+        let norm = |c: HashMap<(u8, u8, u8), usize>,
+                    s: HashMap<(u8, u8), usize>|
+         -> HashMap<(u8, u8, u8), f64> {
             let mut out = HashMap::with_capacity(c.len());
-            for ((u, v), cnt) in c {
-                let tot = *s.get(&u).unwrap_or(&1) as f64;
-                out.insert((u, v), (cnt as f64) / tot);
+            for ((a, b, t), cnt) in c {
+                let tot = *s.get(&(a, b)).unwrap_or(&1) as f64;
+                out.insert((a, b, t), (cnt as f64) / tot);
             }
             out
         };
 
-        MultiScaleGroundTruth {
-            r1: norm(c1, s1),
-            r2: norm(c2, s2),
-            r3: norm(c3, s3),
+        NonMarkovGroundTruth {
+            next: norm(c_next, s_next),
+            mid: norm(c_mid, s_mid),
+            skip: norm(c_skip, s_skip),
         }
     }
 }
 
 // ============================================================================
-// 4. Vue relationnelle multi-échelle (100 % invariante par bijection)
+// 4. Vue relationnelle NON-MARKOVIENNE (relations ternaires, 100 % bijective)
 // ============================================================================
 
 #[derive(Clone)]
-pub(crate) struct ScaleGraph {
-    pub(crate) r: [Vec<f64>; 3],
-    pub(crate) w: [Vec<f64>; 3],
-    pub(crate) h_marg: [f64; 3],
+pub(crate) struct CtxEntry {
+    pub(crate) u: usize,
+    pub(crate) v: usize,
+    pub(crate) weight: f64,
+    pub(crate) target: Vec<f64>, // Distribution conditionnelle empirique de taille v_size
+}
+
+#[derive(Clone)]
+pub(crate) struct NonMarkovTables {
+    pub(crate) tables: [Vec<CtxEntry>; 3], // 0: (u,v)->w, 1: (u,w)->mid, 2: (u,v)->skip3
+    pub(crate) h_marg: [f64; 3],           // Entropie croisée de référence unigramme P_marg
+    pub(crate) h_markov1: [f64; 3],        // Entropie croisée du meilleur modèle markovien d'ordre 1
 }
 
 #[derive(Clone)]
@@ -348,63 +305,119 @@ pub(crate) struct RelationalView {
     pub(crate) seq: Vec<usize>,
     pub(crate) v_size: usize,
     pub(crate) p_marg: Vec<f64>,
-    pub(crate) graph: ScaleGraph,
-    pub(crate) shuf_graph: ScaleGraph,
-    pub(crate) node_init: Vec<[f64; DIM]>,
+    pub(crate) basis: Vec<Vec<f64>>, // Repère fixe immuable L0 (v_size x DIM)
+    pub(crate) obs: NonMarkovTables,
+    pub(crate) shuf: NonMarkovTables, // Contre-exemple E- à marginales P_marg exactes
 }
 
-pub(crate) fn build_scale_graph(seq: &[usize], v_size: usize, p_marg: &[f64]) -> ScaleGraph {
-    let mut r = [
-        vec![0.0_f64; v_size * v_size],
-        vec![0.0_f64; v_size * v_size],
-        vec![0.0_f64; v_size * v_size],
-    ];
-    let mut w = [
-        vec![0.0_f64; v_size],
-        vec![0.0_f64; v_size],
-        vec![0.0_f64; v_size],
-    ];
+fn build_ctx_tables(seq: &[usize], v_size: usize, p_marg: &[f64]) -> NonMarkovTables {
+    // Modèles markoviens d'ordre 1 empiriques (pour mesurer le gain strictement non-markovien)
+    let mut m1_lag1 = vec![vec![1e-6_f64; v_size]; v_size];
+    let mut m1_lag2 = vec![vec![1e-6_f64; v_size]; v_size];
+    for w in seq.windows(2) {
+        if w[0] < v_size && w[1] < v_size {
+            m1_lag1[w[0]][w[1]] += 1.0_f64;
+        }
+    }
+    for w in seq.windows(3) {
+        if w[0] < v_size && w[2] < v_size {
+            m1_lag2[w[0]][w[2]] += 1.0_f64;
+        }
+    }
+    for row in m1_lag1.iter_mut().chain(m1_lag2.iter_mut()) {
+        let s: f64 = row.iter().sum();
+        for x in row.iter_mut() {
+            *x /= s.max(1e-12_f64);
+        }
+    }
+
+    let mut counts: [HashMap<(usize, usize), (f64, Vec<f64>)>; 3] =
+        [HashMap::new(), HashMap::new(), HashMap::new()];
+
+    for w in seq.windows(3) {
+        let (a, b, c) = (w[0], w[1], w[2]);
+        if a < v_size && b < v_size && c < v_size {
+            let e0 = counts[0]
+                .entry((a, b))
+                .or_insert_with(|| (0.0_f64, vec![0.0_f64; v_size]));
+            e0.0 += 1.0_f64;
+            e0.1[c] += 1.0_f64;
+
+            let e1 = counts[1]
+                .entry((a, c))
+                .or_insert_with(|| (0.0_f64, vec![0.0_f64; v_size]));
+            e1.0 += 1.0_f64;
+            e1.1[b] += 1.0_f64;
+        }
+    }
+    for w in seq.windows(4) {
+        let (a, b, d) = (w[0], w[1], w[3]);
+        if a < v_size && b < v_size && d < v_size {
+            let e2 = counts[2]
+                .entry((a, b))
+                .or_insert_with(|| (0.0_f64, vec![0.0_f64; v_size]));
+            e2.0 += 1.0_f64;
+            e2.1[d] += 1.0_f64;
+        }
+    }
+
+    let mut tables: [Vec<CtxEntry>; 3] = [Vec::new(), Vec::new(), Vec::new()];
     let mut h_marg = [1.0_f64; 3];
+    let mut h_markov1 = [1.0_f64; 3];
 
-    for (s_idx, lag) in [1usize, 2, 3].into_iter().enumerate() {
-        if seq.len() <= lag || v_size == 0 {
-            continue;
-        }
-        let mut counts = vec![0.0_f64; v_size * v_size];
-        let mut row_sums = vec![0.0_f64; v_size];
-        let mut total = 0.0_f64;
+    for t_idx in 0..3 {
+        // Tri déterministe : fréquence décroissante, puis (u, v) croissant (100 % invariant bijection)
+        let mut items: Vec<((usize, usize), f64, Vec<f64>)> = counts[t_idx]
+            .drain()
+            .map(|(k, (cnt, vec))| (k, cnt, vec))
+            .collect();
+        items.sort_by(|a, b| {
+            b.1.total_cmp(&a.1)
+                .then_with(|| a.0.0.cmp(&b.0.0))
+                .then_with(|| a.0.1.cmp(&b.0.1))
+        });
+        items.truncate(MAX_CTX);
 
-        for t in 0..(seq.len() - lag) {
-            let u = seq[t];
-            let v = seq[t + lag];
-            if u < v_size && v < v_size {
-                counts[u * v_size + v] += 1.0_f64;
-                row_sums[u] += 1.0_f64;
-                total += 1.0_f64;
-            }
-        }
-        if total <= 0.0_f64 {
+        let tot: f64 = items.iter().map(|x| x.1).sum();
+        if tot <= 0.0_f64 {
             continue;
         }
 
         let mut hm = 0.0_f64;
-        for u in 0..v_size {
-            if row_sums[u] > 0.0_f64 {
-                let wu = row_sums[u] / total;
-                w[s_idx][u] = wu;
-                for v in 0..v_size {
-                    let p = counts[u * v_size + v] / row_sums[u];
-                    r[s_idx][u * v_size + v] = p;
-                    if p > 1e-12_f64 {
-                        hm -= wu * p * p_marg[v].max(1e-9_f64).ln();
-                    }
+        let mut hmk = 0.0_f64;
+        for ((u, v), cnt, mut vec) in items {
+            let weight = cnt / tot;
+            for x in &mut vec {
+                *x /= cnt;
+            }
+            for w in 0..v_size {
+                let p = vec[w];
+                if p > 1e-12_f64 {
+                    hm -= weight * p * p_marg[w].max(1e-9_f64).ln();
+                    let p_mk = match t_idx {
+                        0 => m1_lag1[v][w],
+                        1 => m1_lag1[u][w],
+                        _ => m1_lag2[v][w],
+                    };
+                    hmk -= weight * p * p_mk.max(1e-9_f64).ln();
                 }
             }
+            tables[t_idx].push(CtxEntry {
+                u,
+                v,
+                weight,
+                target: vec,
+            });
         }
-        h_marg[s_idx] = hm.max(0.05_f64);
+        h_marg[t_idx] = hm.max(0.05_f64);
+        h_markov1[t_idx] = hmk.max(0.05_f64);
     }
 
-    ScaleGraph { r, w, h_marg }
+    NonMarkovTables {
+        tables,
+        h_marg,
+        h_markov1,
+    }
 }
 
 impl RelationalView {
@@ -438,91 +451,10 @@ impl RelationalView {
             p_marg[u] = (freq[u] + 1e-6_f64) / (tot + 1e-6_f64 * (v_size as f64));
         }
 
-        let graph = build_scale_graph(&seq, v_size, &p_marg);
+        let basis = build_fixed_basis(v_size);
+        let obs = build_ctx_tables(&seq, v_size, &p_marg);
 
-        let mut bwd_c = vec![0.0_f64; v_size * v_size];
-        let mut bwd_s = vec![0.0_f64; v_size];
-        for win in seq.windows(2) {
-            if win[0] < v_size && win[1] < v_size {
-                bwd_c[win[1] * v_size + win[0]] += 1.0_f64;
-                bwd_s[win[1]] += 1.0_f64;
-            }
-        }
-
-        let mut last_pos = vec![None::<usize>; v_size];
-        let mut gap_sum = vec![0.0_f64; v_size];
-        let mut gap_cnt = vec![0.0_f64; v_size];
-        for (pos, &s) in seq.iter().enumerate() {
-            if s < v_size {
-                if let Some(prev) = last_pos[s] {
-                    gap_sum[s] += (pos - prev) as f64;
-                    gap_cnt[s] += 1.0_f64;
-                }
-                last_pos[s] = Some(pos);
-            }
-        }
-
-        let ln_v = (v_size.max(2) as f64).ln();
-        let mut node_init = vec![[0.0_f64; DIM]; v_size];
-
-        for u in 0..v_size {
-            if freq[u] <= 0.0_f64 {
-                continue;
-            }
-            let mut h1 = 0.0_f64;
-            let mut hb = 0.0_f64;
-            let mut h2 = 0.0_f64;
-            let mut h3 = 0.0_f64;
-            let mut deg_fwd = 0.0_f64;
-            let mut deg_bwd = 0.0_f64;
-            let mut align_12 = 0.0_f64;
-
-            for v in 0..v_size {
-                let p1 = graph.r[0][u * v_size + v];
-                let p2 = graph.r[1][u * v_size + v];
-                let p3 = graph.r[2][u * v_size + v];
-                let pb = if bwd_s[u] > 0.0_f64 {
-                    bwd_c[u * v_size + v] / bwd_s[u]
-                } else {
-                    0.0_f64
-                };
-
-                if p1 > 1e-12_f64 {
-                    h1 -= p1 * p1.ln();
-                    deg_fwd += 1.0_f64;
-                }
-                if pb > 1e-12_f64 {
-                    hb -= pb * pb.ln();
-                    deg_bwd += 1.0_f64;
-                }
-                if p2 > 1e-12_f64 {
-                    h2 -= p2 * p2.ln();
-                }
-                if p3 > 1e-12_f64 {
-                    h3 -= p3 * p3.ln();
-                }
-                align_12 += p1 * p2;
-            }
-
-            let asym = (deg_fwd - deg_bwd) / (v_size as f64);
-            let mean_gap = if gap_cnt[u] > 0.0_f64 {
-                (gap_sum[u] / gap_cnt[u]) / (v_size as f64 + 1.0_f64)
-            } else {
-                1.0_f64
-            };
-
-            node_init[u] = [
-                (p_marg[u] * (v_size as f64) - 1.0_f64).tanh(),
-                h1 / ln_v,
-                hb / ln_v,
-                h2 / ln_v,
-                h3 / ln_v,
-                asym.tanh(),
-                (align_12 * 3.0_f64).tanh(),
-                (1.0_f64 / (1.0_f64 + mean_gap)).tanh(),
-            ];
-        }
-
+        // Permutation déterministe 100 % invariante par bijection préservant exactement P_marg
         let mut shuf_seq = seq.clone();
         let mut shuf_rng = Rng::new(
             0xD1B5_4A32_D192_ED03u64
@@ -530,16 +462,16 @@ impl RelationalView {
                 ^ (v_size as u64),
         );
         shuf_rng.shuffle(&mut shuf_seq);
-        let shuf_graph = build_scale_graph(&shuf_seq, v_size, &p_marg);
+        let shuf = build_ctx_tables(&shuf_seq, v_size, &p_marg);
 
         Self {
             vocab,
             seq,
             v_size,
             p_marg,
-            graph,
-            shuf_graph,
-            node_init,
+            basis,
+            obs,
+            shuf,
         }
     }
 
@@ -551,169 +483,53 @@ impl RelationalView {
 }
 
 // ============================================================================
-// 5. Métriques d'information, équivalence externe C et corrélations
+// 5. Équivalence observationnelle non-markovienne avec C et corrélations
 // ============================================================================
 
-pub(crate) fn scale_gain(
-    target: &[f64],
-    pred: &[f64],
-    row_w: &[f64],
-    h_marg: f64,
-    v: usize,
-) -> f64 {
-    let mut nll = 0.0_f64;
-    let mut w_tot = 0.0_f64;
-    for u in 0..v {
-        let wu = row_w[u];
-        if wu <= 0.0_f64 {
-            continue;
-        }
-        w_tot += wu;
-        let base = u * v;
-        for w in 0..v {
-            let p = target[base + w];
-            if p > 1e-12_f64 {
-                let q = pred[base + w].max(1e-9_f64);
-                nll -= wu * p * q.ln();
-            }
-        }
-    }
-    if w_tot <= 0.0_f64 {
-        return 0.0_f64;
-    }
-    nll /= w_tot;
-    ((h_marg - nll) / h_marg.max(0.05_f64)).clamp(-1.0_f64, 1.0_f64)
-}
-
-pub(crate) fn multi_scale_gain(graph: &ScaleGraph, r_hat: &[Vec<f64>; 3], v: usize) -> f64 {
-    let mut acc = 0.0_f64;
-    for s in 0..3 {
-        acc += SCALE_W[s] * scale_gain(&graph.r[s], &r_hat[s], &graph.w[s], graph.h_marg[s], v);
-    }
-    acc.clamp(-1.0_f64, 1.0_f64)
-}
-
-pub(crate) fn multi_scale_l1(graph: &ScaleGraph, r_hat: &[Vec<f64>; 3], v: usize) -> f64 {
-    let mut total = 0.0_f64;
-    for s in 0..3 {
-        let mut sc = 0.0_f64;
-        let mut wt = 0.0_f64;
-        for u in 0..v {
-            let wu = graph.w[s][u];
-            if wu <= 0.0_f64 {
-                continue;
-            }
-            wt += wu;
-            let mut l1 = 0.0_f64;
-            let base = u * v;
-            for w in 0..v {
-                l1 += (graph.r[s][base + w] - r_hat[s][base + w]).abs();
-            }
-            sc += wu * 0.5_f64 * l1;
-        }
-        if wt > 0.0_f64 {
-            total += SCALE_W[s] * (sc / wt);
-        }
-    }
-    total
-}
-
-pub(crate) fn multi_scale_pred_tvd(
-    a: &[Vec<f64>; 3],
-    b: &[Vec<f64>; 3],
-    row_w: &[Vec<f64>; 3],
-    v: usize,
-) -> f64 {
-    let mut total = 0.0_f64;
-    for s in 0..3 {
-        let mut sc = 0.0_f64;
-        let mut wt = 0.0_f64;
-        for u in 0..v {
-            let wu = row_w[s][u];
-            if wu <= 0.0_f64 {
-                continue;
-            }
-            wt += wu;
-            let mut l1 = 0.0_f64;
-            let base = u * v;
-            for w in 0..v {
-                l1 += (a[s][base + w] - b[s][base + w]).abs();
-            }
-            sc += wu * 0.5_f64 * l1;
-        }
-        if wt > 0.0_f64 {
-            total += SCALE_W[s] * (sc / wt);
-        }
-    }
-    total
-}
-
-pub(crate) fn log_likelihood_graph(graph: &ScaleGraph, r_hat: &[Vec<f64>; 3], v: usize) -> f64 {
-    let mut ll = 0.0_f64;
-    for s in 0..3 {
-        let mut sc = 0.0_f64;
-        let mut wt = 0.0_f64;
-        for u in 0..v {
-            let wu = graph.w[s][u];
-            if wu <= 0.0_f64 {
-                continue;
-            }
-            wt += wu;
-            let base = u * v;
-            for w in 0..v {
-                let p = graph.r[s][base + w];
-                if p > 1e-12_f64 {
-                    sc += wu * p * r_hat[s][base + w].max(1e-9_f64).ln();
-                }
-            }
-        }
-        if wt > 0.0_f64 {
-            ll += SCALE_W[s] * (sc / wt);
-        }
-    }
-    ll
-}
-
-/// Récupération excédentaire normalisée de la structure conditionnelle de C au-dessus de P_marg.
-pub(crate) fn observational_equivalence_excess(
+/// Récupération excédentaire normalisée de la structure NON-MARKOVIENNE de C
+/// au-dessus de P_marg (sur les 3 tâches : next, bracket-mid, skip-3).
+pub(crate) fn observational_equivalence_nm(
     view: &RelationalView,
-    r_hat: &[Vec<f64>; 3],
-    truth: &MultiScaleGroundTruth,
+    preds: &[Vec<Vec<f64>>; 3],
+    truth: &NonMarkovGroundTruth,
 ) -> f64 {
-    let v = view.v_size;
-    let maps = [&truth.r1, &truth.r2, &truth.r3];
+    let maps = [&truth.next, &truth.mid, &truth.skip];
     let mut total = 0.0_f64;
 
-    for s in 0..3 {
+    for t_idx in 0..3 {
+        let entries = &view.obs.tables[t_idx];
         let mut rec_sum = 0.0_f64;
         let mut w_sum = 0.0_f64;
-        for u in 0..v {
-            let wu = view.graph.w[s][u];
-            if wu <= 0.0_f64 {
-                continue;
+
+        for (i, entry) in entries.iter().enumerate() {
+            if i >= preds[t_idx].len() {
+                break;
             }
-            let bu = view.vocab[u];
+            let bu = view.vocab[entry.u];
+            let bv = view.vocab[entry.v];
+            let pred = &preds[t_idx][i];
+
             let mut c_mass = 0.0_f64;
             let mut tvd_pred = 0.0_f64;
             let mut tvd_marg = 0.0_f64;
 
-            for w in 0..v {
+            for w in 0..view.v_size {
                 let bw = view.vocab[w];
-                let pt = *maps[s].get(&(bu, bw)).unwrap_or(&0.0_f64);
+                let pt = *maps[t_idx].get(&(bu, bv, bw)).unwrap_or(&0.0_f64);
                 c_mass += pt;
-                tvd_pred += (pt - r_hat[s][u * v + w]).abs();
+                tvd_pred += (pt - pred[w]).abs();
                 tvd_marg += (pt - view.p_marg[w]).abs();
             }
             if c_mass > 0.5_f64 {
                 let tvd_p = 0.5_f64 * tvd_pred;
                 let tvd_m = 0.5_f64 * tvd_marg;
                 let excess = ((tvd_m - tvd_p) / (tvd_m + 0.05_f64)).clamp(-1.0_f64, 1.0_f64);
-                rec_sum += wu * excess;
-                w_sum += wu;
+                rec_sum += entry.weight * excess;
+                w_sum += entry.weight;
             }
         }
         if w_sum > 0.0_f64 {
-            total += SCALE_W[s] * (rec_sum / w_sum);
+            total += TASK_W[t_idx] * (rec_sum / w_sum);
         }
     }
     total
