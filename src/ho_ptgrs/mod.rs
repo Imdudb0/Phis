@@ -5,6 +5,7 @@ pub mod meta_ops;
 pub mod rigidity;
 pub mod codec;
 pub mod generator;
+pub mod entities;
 
 use rng::*;
 use term_graph::*;
@@ -13,3 +14,4 @@ use meta_ops::*;
 use rigidity::*;
 use codec::*;
 use generator::*;
+use entities::*;
