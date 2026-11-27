@@ -5,10 +5,6 @@ use crate::autograd::Tape;
 use crate::core::*;
 use crate::model::*;
 
-// ============================================================================
-// 1. Objectifs et évaluation différentiable d'un échantillon (Adam exact)
-// ============================================================================
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TrainObjective {
     Untrained,
@@ -38,6 +34,26 @@ impl TrainObjective {
     }
 }
 
+fn combine_two_budgets(
+    t: &mut Tape,
+    score1: usize,
+    score2: usize,
+    mon1: usize,
+    mon2: usize,
+) -> usize {
+    let zero = t.leaf_scalar(0.0_f64);
+    let diff = t.sub(mon1, mon2);
+    let drop_pen = t.max_scalar(diff, zero);
+    let m12 = t.min_scalar(score1, score2);
+    let w1 = t.scale(score1, 0.45_f64);
+    let w2 = t.scale(score2, 0.45_f64);
+    let s = t.add(w1, w2);
+    let wm = t.scale(m12, 0.10_f64);
+    let s2 = t.add(s, wm);
+    let wp = t.scale(drop_pen, 0.20_f64);
+    t.sub(s2, wp)
+}
+
 fn sample_objective_and_grad(
     model: &PhisharpV4,
     view: &RelationalView,
@@ -65,7 +81,6 @@ fn sample_objective_and_grad(
 
     let score_node = match objective {
         TrainObjective::PhiSharp => {
-            // Trajectoires partagées pour P_temp et P_comp (capture à T et T+2 en un seul passage)
             let mid = view.seq.len() / 2;
             let first_half = view.subslice_same_vocab(0, mid);
             let (_, cap_pt) = PhisharpV4::run_abduction_tape(
@@ -109,15 +124,13 @@ fn sample_objective_and_grad(
                 Some(&cap_pt[1].1),
                 Some(&cap_pc[1].1),
             );
-            let zero = t.leaf_scalar(0.0_f64);
-            let drop_pen = t.max_scalar(t.sub(r1.phi_sharp, r2.phi_sharp), zero);
-            let m12 = t.min_scalar(r1.shaping_score, r2.shaping_score);
-            let s = t.add(
-                t.scale(r1.shaping_score, 0.45_f64),
-                t.scale(r2.shaping_score, 0.45_f64),
-            );
-            let s2 = t.add(s, t.scale(m12, 0.10_f64));
-            t.sub(s2, t.scale(drop_pen, 0.20_f64))
+            combine_two_budgets(
+                &mut t,
+                r1.shaping_score,
+                r2.shaping_score,
+                r1.phi_sharp,
+                r2.phi_sharp,
+            )
         }
         TrainObjective::Likelihood => {
             let (_, e1) = PhisharpV4::unfold_tables(
@@ -140,12 +153,7 @@ fn sample_objective_and_grad(
                 false,
                 [true, true, true],
             );
-            let zero = t.leaf_scalar(0.0_f64);
-            let drop_pen = t.max_scalar(t.sub(e1.ll_mix, e2.ll_mix), zero);
-            let m12 = t.min_scalar(e1.ll_mix, e2.ll_mix);
-            let s = t.add(t.scale(e1.ll_mix, 0.45_f64), t.scale(e2.ll_mix, 0.45_f64));
-            let s2 = t.add(s, t.scale(m12, 0.10_f64));
-            t.sub(s2, t.scale(drop_pen, 0.20_f64))
+            combine_two_budgets(&mut t, e1.ll_mix, e2.ll_mix, e1.ll_mix, e2.ll_mix)
         }
         TrainObjective::Mdl => {
             let (_, e1) = PhisharpV4::unfold_tables(
@@ -170,12 +178,7 @@ fn sample_objective_and_grad(
             );
             let s1 = mdl_tape_v4(&mut t, e1.ll_mix, st1, view.seq.len());
             let s2 = mdl_tape_v4(&mut t, e2.ll_mix, st2, view.seq.len());
-            let zero = t.leaf_scalar(0.0_f64);
-            let drop_pen = t.max_scalar(t.sub(s1, s2), zero);
-            let m12 = t.min_scalar(s1, s2);
-            let s = t.add(t.scale(s1, 0.45_f64), t.scale(s2, 0.45_f64));
-            let sc = t.add(s, t.scale(m12, 0.10_f64));
-            t.sub(sc, t.scale(drop_pen, 0.20_f64))
+            combine_two_budgets(&mut t, s1, s2, s1, s2)
         }
         TrainObjective::Untrained => t.leaf_scalar(0.0_f64),
     };
@@ -189,7 +192,6 @@ fn sample_objective_and_grad(
     (val, grad)
 }
 
-/// Vérification numérique exacte de l'autograd par différences finies centrées.
 pub(crate) fn run_grad_check(seed: u64) {
     let mut rng = Rng::new(seed);
     let model = PhisharpV4::new_random(&mut rng);
@@ -242,7 +244,6 @@ pub(crate) fn run_grad_check(seed: u64) {
     }
 }
 
-/// Entraînement fermé exact par Adam + autograd multi-threadé (zéro ES).
 pub(crate) fn train_model(
     out_path: &Path,
     steps: usize,
@@ -277,7 +278,7 @@ pub(crate) fn train_model(
     );
 
     for step in 1..=steps {
-        let t_budget = 3 + rng.range_usize(4); // T dans 3..=6
+        let t_budget = 3 + rng.range_usize(4);
         let t_next = t_budget + 2;
 
         let mut batch_views = Vec::with_capacity(batch_size);
@@ -313,7 +314,6 @@ pub(crate) fn train_model(
             *g *= inv_b;
             norm_sq += (*g) * (*g);
         }
-        // Clipping global du gradient pour stabilité des dynamiques récurrentes
         let g_norm = norm_sq.sqrt();
         if g_norm > 5.0_f64 {
             let sc = 5.0_f64 / g_norm;
@@ -391,10 +391,6 @@ pub(crate) fn train_model(
     );
     model
 }
-
-// ============================================================================
-// 2. Porte d'étalonnage V4 (équivalence non-markovienne C + 6 témoins)
-// ============================================================================
 
 pub(crate) struct CalibrationSummary {
     pub(crate) r_phi: f64,
@@ -618,10 +614,6 @@ pub(crate) fn run_calibration(model: &PhisharpV4, seed: u64) {
     }
 }
 
-// ============================================================================
-// 3. Barreau 1 : PTGRS OOD & Transfert hors-PTGRS
-// ============================================================================
-
 pub(crate) struct OodDepthStats {
     pub(crate) depth: usize,
     pub(crate) phi_t6: f64,
@@ -825,7 +817,6 @@ fn gen_frames(seed: u64, len: usize) -> Vec<u8> {
     out
 }
 
-/// Dyck / parenthésage emboîté non-markovien (3 types de paires : 0/1, 2/3, 4/5).
 fn gen_dyck(seed: u64, len: usize) -> Vec<u8> {
     let mut rng = Rng::new(seed);
     let mut stack: Vec<u8> = Vec::new();
@@ -950,19 +941,24 @@ pub(crate) fn evaluate_transfer(model: &PhisharpV4, seed: u64) -> TransferSummar
     }
 }
 
-// ============================================================================
-// 4. Comparaison contrôlée 4 voies (Step 0 vs LL vs MDL vs Phisharp V4)
-// ============================================================================
-
 pub(crate) fn run_compare(
     models: &[(&str, &PhisharpV4)],
     seed_cal: u64,
     seed_ood: u64,
     seed_tr: u64,
 ) {
-    let cals: Vec<_> = models.iter().map(|(_, m)| evaluate_calibration(m, seed_cal)).collect();
-    let oods: Vec<_> = models.iter().map(|(_, m)| evaluate_ood(m, seed_ood)).collect();
-    let trs: Vec<_> = models.iter().map(|(_, m)| evaluate_transfer(m, seed_tr)).collect();
+    let cals: Vec<_> = models
+        .iter()
+        .map(|(_, m)| evaluate_calibration(m, seed_cal))
+        .collect();
+    let oods: Vec<_> = models
+        .iter()
+        .map(|(_, m)| evaluate_ood(m, seed_ood))
+        .collect();
+    let trs: Vec<_> = models
+        .iter()
+        .map(|(_, m)| evaluate_transfer(m, seed_tr))
+        .collect();
 
     println!();
     println!("=============================================================================================");
@@ -978,7 +974,11 @@ pub(crate) fn run_compare(
     for (i, (label, _)) in models.iter().enumerate() {
         let c = &cals[i];
         let ep = c.phi_l1_dead.max(c.phi_l1_clone).max(c.phi_l2_clone);
-        let v = if c.pass_corr && c.pass_neg && c.pass_inv { "PASS" } else { "ARRÊT" };
+        let v = if c.pass_corr && c.pass_neg && c.pass_inv {
+            "PASS"
+        } else {
+            "ARRÊT"
+        };
         println!(
             "{:<14} | {:>7.4} | {:>+9.4} | {:>+7.4} {:>+7.4} | {:>6.4} {:>6.4} | {:>7.1e} | {:>6}",
             label, c.mean_phi, c.mean_eq, c.r_phi, c.s_phi, c.perm_max, ep, c.max_phi_diff, v
@@ -994,7 +994,11 @@ pub(crate) fn run_compare(
     for d_i in 0..3 {
         for (i, (label, _)) in models.iter().enumerate() {
             let d = &oods[i].depths[d_i];
-            let ret = if d.phi_t6 > 1e-6_f64 { d.phi_t10 / d.phi_t6 } else { 0.0_f64 };
+            let ret = if d.phi_t6 > 1e-6_f64 {
+                d.phi_t10 / d.phi_t6
+            } else {
+                0.0_f64
+            };
             println!(
                 "{:<14} | d={:<2} | {:>7.4} {:>7.4} {:>5.2}x | {:>7.4} | {:>5.3} {:>5.3} {:>5.3} {:>5.3} | {:>+8.4} {:>+8.4}",
                 label, d.depth, d.phi_t6, d.phi_t10, ret, d.no_ref_t6, d.g_t6, d.p_t6, d.phi_cut_t6, d.s_abs_t6, d.rec_t6, d.rec_t10
@@ -1053,7 +1057,10 @@ pub(crate) fn run_compare(
         println!("\n--- SYNTHÈSE CONTRÔLE SCEPTIQUE V4 ---");
         println!(
             "  OOD Rec_nm(C) moy (externe) : Step0={:+.4} | LL={:+.4} | MDL={:+.4} | V4 φ={:+.4}",
-            ood_r(0), ood_r(1), ood_r(2), ood_r(3)
+            ood_r(0),
+            ood_r(1),
+            ood_r(2),
+            ood_r(3)
         );
         println!(
             "  Transfert P_réel moy (8x)   : Step0={:.3}   | LL={:.3}   | MDL={:.3}   | V4 φ={:.3}",
