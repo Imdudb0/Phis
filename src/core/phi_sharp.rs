@@ -1029,8 +1029,8 @@ mod tests {
             }
         }
     }
-
-    #[test]
+    
+        #[test]
     fn test_full_phi_sharp_gradient_exact_finite_diff() {
         // Vérifie le gradient analytique COMPLET de \phi_\sharp(R, E) :
         // \lambda_2(L_{\bar{w}}) (via toutes les ablations + Fiedler) - \alpha \bar{\rho} - \beta V_stab
@@ -1040,35 +1040,55 @@ mod tests {
         let h = 8;
         let mut params = ModelParams::random_init(n, d, h, &mut rng);
         for v in &mut params.w_out_uni {
-            *v *= 2.5;
+            *v *= 4.0;
         }
         for v in &mut params.w_out_bi {
-            *v *= 2.5;
+            *v *= 4.0;
         }
 
-        // Séquence structurée (faible entropie) pour que \bar{\rho} < \bar{\rho}_0 et w_{ij} > 0
-        let pattern = [12u8, 45, 78, 12, 45, 99, 12, 45, 78, 33];
-        let mut bytes = Vec::new();
-        for _ in 0..6 {
-            bytes.extend_from_slice(&pattern);
+        // Deux régimes d'octets distincts (nœuds {0,1} vs {2,3,4}) pour briser la dégénérescence K_5
+        // et obtenir une coupe de Fiedler simple (\lambda_3 - \lambda_2 grand).
+        let mut bytes = Vec::with_capacity(60);
+        for _ in 0..12 {
+            bytes.extend_from_slice(&[12u8, 45]);
         }
+        for _ in 0..18 {
+            bytes.extend_from_slice(&[201u8, 234]);
+        }
+
         let eff = EffectSummary::from_bytes(&bytes, n);
         let probes = StabilityProbes::build(n, 2, 0.08, 0.15, 31415);
         let cfg = PhiSharpConfig {
             alpha: 0.4,
             beta: 0.3,
             lambda_bi: 0.5,
-            hinge_tau: 0.02,
+            hinge_tau: 0.005,
             smin_eps: 0.02,
             max_krylov: 16,
             max_inv_power: 6,
         };
 
         let mut r = params.encode_regional_pole(&eff, 4.0);
-        // Quelques pas de descente sur le résidu pour se placer en régime causal actif (\lambda_2 > 0)
-        for _ in 0..20 {
+        // Descente préliminaire pour abaisser \bar{\rho} et activer les arêtes causales
+        for _ in 0..25 {
             let (_, g_rho) = params.residual_and_grad_r(&r, &eff, cfg.lambda_bi);
-            r.axpy(-2.0, &g_rho);
+            r.axpy(-1.5, &g_rho);
+            r.clamp_to_ball(4.0);
+        }
+        // Léger goulot sur les arêtes inter-clusters ({0,1} <-> {2,3,4}) puis 3 pas de réalignement
+        for c in 0..d {
+            for i in 0..n {
+                for j in 0..n {
+                    if (i < 2) != (j < 2) {
+                        r.set(i, j, c, r.get(i, j, c) * 0.45);
+                    }
+                }
+            }
+        }
+        for _ in 0..3 {
+            let (_, g_rho) = params.residual_and_grad_r(&r, &eff, cfg.lambda_bi);
+            r.axpy(-0.5, &g_rho);
+            r.clamp_to_ball(4.0);
         }
 
         let (eval, grad_opt) = evaluate_phi_sharp(&params, &r, &eff, &probes, &cfg, true);
@@ -1078,7 +1098,7 @@ mod tests {
             "Des arêtes causales doivent être actives pour tester Hellmann-Feynman"
         );
         assert!(
-            eval.lambda2 > 1e-6 && (eval.fiedler.lambda3 - eval.lambda2).abs() > 1e-5,
+            eval.lambda2 > 1e-5 && (eval.fiedler.lambda3 - eval.lambda2).abs() > 1e-5,
             "lambda2={} doit être simple et > 0 (lambda3={})",
             eval.lambda2,
             eval.fiedler.lambda3
