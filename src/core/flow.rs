@@ -475,8 +475,8 @@ mod tests {
             assert!((tr2 - tr2_0[c]).abs() < 1e-11);
         }
     }
-
-    #[test]
+    
+        #[test]
     fn test_abductive_flow_lasalle_monotonicity_on_ho_ptgrs_episode() {
         // Génère un vrai fichier perceived.eff (opérateur \mu_bif) via crate::ho_ptgrs
         let mut gen_ = HoPtgrsGenerator::new(
@@ -497,21 +497,22 @@ mod tests {
         let h = 8;
         let mut rng = Rng::from_seed(777);
         let mut params = ModelParams::random_init(n, d, h, &mut rng);
-        for v in &mut params.w_out_uni {
+        for v in &mut params.w_rel_uni {
             *v *= 2.0;
         }
-        for v in &mut params.w_out_bi {
+        for v in &mut params.w_rel_bi {
             *v *= 2.0;
         }
 
         let effect = EffectSummary::from_bytes(&ep.perceived_eff, n);
         let probes = StabilityProbes::build(n, 2, 0.06, 0.1, 4242);
         let phi_cfg = PhiSharpConfig {
+            beta_iit: 10.0,
             alpha: 0.5,
             beta: 0.2,
             lambda_bi: 0.5,
-            hinge_tau: 0.03,
-            smin_eps: 0.03,
+            hinge_tau: 1e-4,
+            cap_eps: 1e-3,
             max_krylov: 16,
             max_inv_power: 4,
         };
