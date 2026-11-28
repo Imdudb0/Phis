@@ -1,13 +1,3 @@
-//! Phisharp V1 — Banc de réfutation et calcul de log phi_sharp(H, E).
-//!
-//! À déclarer dans `src/lib.rs` :
-//!   pub mod hypothesis_graph;
-//!   pub mod projector;
-//!   pub mod refutation;
-//!
-//! Puis exécuter :
-//!   cargo test
-
 #![forbid(unsafe_code)]
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -308,7 +298,7 @@ fn evaluate_masked_reconstruction(
             continue;
         }
 
-        let score = score_single_mask(obs, pred, &masked, &obs_out, &obs_in, cfg.residual_weights);
+        let score = score_single_mask(obs, pred, center, &masked, &obs_out, &obs_in, cfg.residual_weights);
         total_score += score;
         tested += 1;
     }
@@ -355,11 +345,10 @@ fn collect_masked_region(
     masked
 }
 
-/// Aligne E_hat sur le seul contexte visible (G_E \ masked), prédit aveuglément
-/// la zone masquée par topologie de frontière, puis mesure la fidélité démasquée.
 fn score_single_mask(
     obs: &ObservationGraph,
     pred: &ObservationGraph,
+    center: NodeId,
     masked: &BTreeSet<NodeId>,
     obs_out: &[Vec<(NodeId, RelId)>],
     obs_in: &[Vec<(NodeId, RelId)>],
@@ -368,120 +357,51 @@ fn score_single_mask(
     let n_obs = obs.node_count();
     let n_pred = pred.node_count();
 
-    // 1. Construction du sous-graphe strictement visible G_E \ masked.
-    let mut obs_to_vis: Vec<Option<NodeId>> = vec![None; n_obs];
-    let mut vis_to_obs: Vec<NodeId> = Vec::with_capacity(n_obs - masked.len());
-    let mut vis_nodes = Vec::with_capacity(n_obs - masked.len());
+    let mut pred_out: Vec<Vec<(NodeId, RelId)>> = vec![Vec::new(); n_pred];
+    let mut pred_in: Vec<Vec<(NodeId, RelId)>> = vec![Vec::new(); n_pred];
+    for &e in &pred.edges {
+        pred_out[e.src].push((e.dst, e.rel));
+        pred_in[e.dst].push((e.src, e.rel));
+    }
 
-    for (u, &sym) in obs.nodes.iter().enumerate() {
-        if !masked.contains(&u) {
-            obs_to_vis[u] = Some(vis_nodes.len());
-            vis_to_obs.push(u);
-            vis_nodes.push(sym);
+    // 1. Candidat de base : alignement sur le sous-graphe strictement visible.
+    let mut best_map =
+        align_visible_fallback(obs, pred, masked, obs_out, obs_in, weights);
+    let mut best_blind_cost = blind_alignment_cost(obs, pred, masked, &best_map, weights);
+
+    // 2. Candidats ancrés sur le trou `center` (100 % aveugles aux symboles de `masked`).
+    if (!obs_out[center].is_empty() || !obs_in[center].is_empty()) && best_blind_cost > 0.0 {
+        for cand in 0..n_pred {
+            let map = propagate_blind_from_hole(
+                obs, pred, center, cand, masked, obs_out, obs_in, &pred_out, &pred_in,
+            );
+            let cost = blind_alignment_cost(obs, pred, masked, &map, weights);
+            if cost < best_blind_cost - 1e-12 {
+                best_blind_cost = cost;
+                best_map = map;
+                if best_blind_cost == 0.0 {
+                    break;
+                }
+            }
         }
     }
 
-    let mut vis_edges = Vec::new();
-    for &e in &obs.edges {
-        if let (Some(vs), Some(vd)) = (obs_to_vis[e.src], obs_to_vis[e.dst]) {
-            vis_edges.push(ObsEdge::new(vs, vd, e.rel));
-        }
-    }
-    let visible_obs = ObservationGraph::new(vis_nodes, vis_edges);
-
-    // 2. Alignement aveugle aux nœuds/arêtes masqués.
-    let vis_residual = compute_residual(&visible_obs, pred, weights);
-    let mut obs_to_pred: Vec<Option<NodeId>> = vec![None; n_obs];
-    let mut pred_used = vec![false; n_pred];
-    for aligned in &vis_residual.aligned_nodes {
-        let orig_u = vis_to_obs[aligned.obs_node];
-        obs_to_pred[orig_u] = Some(aligned.pred_node);
-        pred_used[aligned.pred_node] = true;
-    }
-
-    // 3. Prédiction aveugle des nœuds masqués par propagation topologique depuis la frontière.
-    let mut unpredicted: BTreeSet<NodeId> = masked.clone();
-    loop {
-        let mut best_choice: Option<(usize, NodeId, NodeId)> = None;
-
-        for &w in &unpredicted {
-            // Collecte les contraintes relationnelles depuis les voisins déjà ancrés.
-            let mut in_anchors: Vec<(NodeId, RelId)> = Vec::new();
-            for &(u, rel) in &obs_in[w] {
-                if let Some(pu) = obs_to_pred[u] {
-                    in_anchors.push((pu, rel));
-                }
-            }
-            let mut out_anchors: Vec<(NodeId, RelId)> = Vec::new();
-            for &(v, rel) in &obs_out[w] {
-                if let Some(pv) = obs_to_pred[v] {
-                    out_anchors.push((pv, rel));
-                }
-            }
-            if in_anchors.is_empty() && out_anchors.is_empty() {
-                continue;
-            }
-
-            // Note : on ne consulte JAMAIS `obs.nodes[w]` ici (prédiction strictement aveugle).
-            for cand in 0..n_pred {
-                if pred_used[cand] {
-                    continue;
-                }
-                let mut matches = 0usize;
-                for &(pu, rel) in &in_anchors {
-                    if pred.edges.contains(&ObsEdge::new(pu, cand, rel)) {
-                        matches += 1;
-                    }
-                }
-                for &(pv, rel) in &out_anchors {
-                    if pred.edges.contains(&ObsEdge::new(cand, pv, rel)) {
-                        matches += 1;
-                    }
-                }
-                if matches == 0 {
-                    continue;
-                }
-
-                let is_better = match best_choice {
-                    None => true,
-                    Some((best_m, best_w, best_c)) => {
-                        matches > best_m
-                            || (matches == best_m && (w, cand) < (best_w, best_c))
-                    }
-                };
-                if is_better {
-                    best_choice = Some((matches, w, cand));
-                }
-            }
-        }
-
-        match best_choice {
-            Some((_, w, cand)) => {
-                obs_to_pred[w] = Some(cand);
-                pred_used[cand] = true;
-                unpredicted.remove(&w);
-            }
-            None => break,
-        }
-    }
-
-    // 4. Démasquage et évaluation de la reconstruction exacte (nœuds + arêtes masqués).
+    // 3. Démasquage et évaluation de la reconstruction exacte (nœuds + arêtes masqués).
     let mut total_items = 0usize;
     let mut correct_items = 0usize;
 
     for &w in masked {
         total_items += 1;
-        if let Some(pw) = obs_to_pred[w] {
+        if let Some(pw) = best_map[w] {
             if pred.nodes[pw] == obs.nodes[w] {
                 correct_items += 1;
             }
         }
     }
-
     for &e in &obs.edges {
         if masked.contains(&e.src) || masked.contains(&e.dst) {
             total_items += 1;
-            if let (Some(ps), Some(pd)) = (obs_to_pred[e.src], obs_to_pred[e.dst]) {
+            if let (Some(ps), Some(pd)) = (best_map[e.src], best_map[e.dst]) {
                 if pred.edges.contains(&ObsEdge::new(ps, pd, e.rel)) {
                     correct_items += 1;
                 }
@@ -494,6 +414,244 @@ fn score_single_mask(
     } else {
         (correct_items as f64) / (total_items as f64)
     }
+}
+
+fn align_visible_fallback(
+    obs: &ObservationGraph,
+    pred: &ObservationGraph,
+    masked: &BTreeSet<NodeId>,
+    obs_out: &[Vec<(NodeId, RelId)>],
+    obs_in: &[Vec<(NodeId, RelId)>],
+    weights: ResidualWeights,
+) -> Vec<Option<NodeId>> {
+    let n_obs = obs.node_count();
+    let n_pred = pred.node_count();
+
+    let mut obs_to_vis: Vec<Option<NodeId>> = vec![None; n_obs];
+    let mut vis_to_obs: Vec<NodeId> = Vec::with_capacity(n_obs - masked.len());
+    let mut vis_nodes = Vec::with_capacity(n_obs - masked.len());
+    for (u, &sym) in obs.nodes.iter().enumerate() {
+        if !masked.contains(&u) {
+            obs_to_vis[u] = Some(vis_nodes.len());
+            vis_to_obs.push(u);
+            vis_nodes.push(sym);
+        }
+    }
+    let mut vis_edges = Vec::new();
+    for &e in &obs.edges {
+        if let (Some(vs), Some(vd)) = (obs_to_vis[e.src], obs_to_vis[e.dst]) {
+            vis_edges.push(ObsEdge::new(vs, vd, e.rel));
+        }
+    }
+    let visible_obs = ObservationGraph::new(vis_nodes, vis_edges);
+    let vis_residual = compute_residual(&visible_obs, pred, weights);
+
+    let mut obs_to_pred: Vec<Option<NodeId>> = vec![None; n_obs];
+    let mut pred_used = vec![false; n_pred];
+    for aligned in &vis_residual.aligned_nodes {
+        let orig_u = vis_to_obs[aligned.obs_node];
+        obs_to_pred[orig_u] = Some(aligned.pred_node);
+        pred_used[aligned.pred_node] = true;
+    }
+
+    let mut unpredicted: BTreeSet<NodeId> = masked.clone();
+    loop {
+        let mut best_choice: Option<(usize, NodeId, NodeId)> = None;
+        for &w in &unpredicted {
+            for cand in 0..n_pred {
+                if pred_used[cand] {
+                    continue;
+                }
+                let mut matches = 0usize;
+                for &(u, rel) in &obs_in[w] {
+                    if let Some(pu) = obs_to_pred[u] {
+                        if pred.edges.contains(&ObsEdge::new(pu, cand, rel)) {
+                            matches += 1;
+                        }
+                    }
+                }
+                for &(v, rel) in &obs_out[w] {
+                    if let Some(pv) = obs_to_pred[v] {
+                        if pred.edges.contains(&ObsEdge::new(cand, pv, rel)) {
+                            matches += 1;
+                        }
+                    }
+                }
+                if matches == 0 {
+                    continue;
+                }
+                let is_better = match best_choice {
+                    None => true,
+                    Some((bm, bw, bc)) => matches > bm || (matches == bm && (w, cand) < (bw, bc)),
+                };
+                if is_better {
+                    best_choice = Some((matches, w, cand));
+                }
+            }
+        }
+        match best_choice {
+            Some((_, w, cand)) => {
+                obs_to_pred[w] = Some(cand);
+                pred_used[cand] = true;
+                unpredicted.remove(&w);
+            }
+            None => break,
+        }
+    }
+    obs_to_pred
+}
+
+#[allow(clippy::too_many_arguments)]
+fn propagate_blind_from_hole(
+    obs: &ObservationGraph,
+    pred: &ObservationGraph,
+    center: NodeId,
+    center_cand: NodeId,
+    masked: &BTreeSet<NodeId>,
+    obs_out: &[Vec<(NodeId, RelId)>],
+    obs_in: &[Vec<(NodeId, RelId)>],
+    pred_out: &[Vec<(NodeId, RelId)>],
+    pred_in: &[Vec<(NodeId, RelId)>],
+) -> Vec<Option<NodeId>> {
+    let n_obs = obs.node_count();
+    let n_pred = pred.node_count();
+    let mut map: Vec<Option<NodeId>> = vec![None; n_obs];
+    let mut pred_used = vec![false; n_pred];
+    let mut queue = VecDeque::new();
+
+    map[center] = Some(center_cand);
+    pred_used[center_cand] = true;
+    queue.push_back(center);
+
+    while let Some(u) = queue.pop_front() {
+        let pu = map[u].unwrap();
+
+        // Propagation sortante puis entrante, strictement aveugle aux symboles masqués.
+        for &(v, rel) in &obs_out[u] {
+            if map[v].is_some() {
+                continue;
+            }
+            let best_pv = pred_out[pu]
+                .iter()
+                .filter(|&&(pv, pr)| pr == rel && !pred_used[pv])
+                .max_by_key(|&&(pv, _)| {
+                    let sym_hit = usize::from(!masked.contains(&v) && pred.nodes[pv] == obs.nodes[v]);
+                    let edge_hits = count_anchored_edge_hits(v, pv, obs_out, obs_in, &map, pred);
+                    (sym_hit, edge_hits, usize::MAX - pv)
+                })
+                .map(|&(pv, _)| pv);
+            if let Some(pv) = best_pv {
+                map[v] = Some(pv);
+                pred_used[pv] = true;
+                queue.push_back(v);
+            }
+        }
+
+        for &(v, rel) in &obs_in[u] {
+            if map[v].is_some() {
+                continue;
+            }
+            let best_pv = pred_in[pu]
+                .iter()
+                .filter(|&&(pv, pr)| pr == rel && !pred_used[pv])
+                .max_by_key(|&&(pv, _)| {
+                    let sym_hit = usize::from(!masked.contains(&v) && pred.nodes[pv] == obs.nodes[v]);
+                    let edge_hits = count_anchored_edge_hits(v, pv, obs_out, obs_in, &map, pred);
+                    (sym_hit, edge_hits, usize::MAX - pv)
+                })
+                .map(|&(pv, _)| pv);
+            if let Some(pv) = best_pv {
+                map[v] = Some(pv);
+                pred_used[pv] = true;
+                queue.push_back(v);
+            }
+        }
+    }
+
+    // Complète les nœuds visibles restants (autres composantes connexes) par symbole visible.
+    for u in 0..n_obs {
+        if map[u].is_some() || masked.contains(&u) {
+            continue;
+        }
+        if let Some(pv) = (0..n_pred).find(|&p| !pred_used[p] && pred.nodes[p] == obs.nodes[u]) {
+            map[u] = Some(pv);
+            pred_used[pv] = true;
+        }
+    }
+    map
+}
+
+fn count_anchored_edge_hits(
+    v: NodeId,
+    pv: NodeId,
+    obs_out: &[Vec<(NodeId, RelId)>],
+    obs_in: &[Vec<(NodeId, RelId)>],
+    map: &[Option<NodeId>],
+    pred: &ObservationGraph,
+) -> usize {
+    let mut hits = 0usize;
+    for &(nb, rel) in &obs_out[v] {
+        if let Some(pnb) = map[nb] {
+            if pred.edges.contains(&ObsEdge::new(pv, pnb, rel)) {
+                hits += 1;
+            }
+        }
+    }
+    for &(nb, rel) in &obs_in[v] {
+        if let Some(pnb) = map[nb] {
+            if pred.edges.contains(&ObsEdge::new(pnb, pv, rel)) {
+                hits += 1;
+            }
+        }
+    }
+    hits
+}
+
+/// Coût d'alignement strictement aveugle : ne lit JAMAIS `obs.nodes[w]` pour `w` dans `masked`.
+fn blind_alignment_cost(
+    obs: &ObservationGraph,
+    pred: &ObservationGraph,
+    masked: &BTreeSet<NodeId>,
+    obs_to_pred: &[Option<NodeId>],
+    w: ResidualWeights,
+) -> f64 {
+    let mut pred_used = vec![false; pred.node_count()];
+    let mut cost = 0.0;
+
+    for (u, &mapped) in obs_to_pred.iter().enumerate() {
+        match mapped {
+            Some(pu) => {
+                pred_used[pu] = true;
+                if !masked.contains(&u) && obs.nodes[u] != pred.nodes[pu] {
+                    cost += w.conflict_node;
+                }
+            }
+            None => cost += w.missing_node,
+        }
+    }
+    for &used in &pred_used {
+        if !used {
+            cost += w.excess_node;
+        }
+    }
+
+    let mut matched_pred_edges: BTreeSet<ObsEdge> = BTreeSet::new();
+    for &e in &obs.edges {
+        match (obs_to_pred[e.src], obs_to_pred[e.dst]) {
+            (Some(ps), Some(pd)) => {
+                let pe = ObsEdge::new(ps, pd, e.rel);
+                if pred.edges.contains(&pe) {
+                    matched_pred_edges.insert(pe);
+                } else {
+                    cost += w.missing_edge;
+                }
+            }
+            _ => cost += w.missing_edge,
+        }
+    }
+    let excess_edges = pred.edges.len().saturating_sub(matched_pred_edges.len());
+    cost += (excess_edges as f64) * w.excess_edge;
+    cost
 }
 
 // ============================================================================
