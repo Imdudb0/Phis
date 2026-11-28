@@ -1,8 +1,3 @@
-//! Phisharp V1 — Projecteur Pi (exécuteur PTGRS) et graphe différentiel de résidu R_t.
-//!
-//! Placer dans le même dossier que `hypothesis_graph.rs`, puis compiler et tester :
-//!   rustc --edition 2024 --test projector.rs && ./projector
-
 #![forbid(unsafe_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -694,8 +689,10 @@ impl Default for ResidualWeights {
         Self {
             missing_node: 1.0,
             excess_node: 1.0,
-            // < missing_node + excess_node (2.0) pour préférer un conflit localisé à 2 dissociations.
-            conflict_node: 1.2,
+            // > missing_node + excess_node (2.0) pour ne jamais forcer un conflit entre
+            // deux nœuds sans arête commune, tout en restant < 4.0 pour préférer un conflit
+            // localisé dès qu'au moins 1 arête incidente coïncide (ex. "axc" vs "ayc").
+            conflict_node: 2.2,
             missing_edge: 1.0,
             excess_edge: 1.0,
             conflict_edge: 1.2,
