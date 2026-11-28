@@ -1314,7 +1314,7 @@ impl RelationalBackbone {
         obs: &ObservationGraph,
         residual: &ResidualGraph,
         mask: &ForwardMask,
-    ) -> Vec<TapeNode>
+    ) -> Vec<TapeNode> {
         let active_fams: Vec<usize> = (0..4).filter(|&i| mask.family_mask[i]).collect();
         if active_fams.is_empty() {
             return Vec::new();
@@ -1828,7 +1828,7 @@ pub fn subtb_loss_and_accumulate_grad(
         // Transition avant t -> t + 1 (ou STOP si t == m - 1).
         let f_mask = state.forward_mask();
         let f_actions = f_mask.to_actions(&state.config().alphabet);
-        let f_lps = backbone.forward_log_probs_on_tape(&mut tape, &enc, state, obs, residual, &f_mask);
+        let f_lps = backbone.forward_log_probs_on_tape(&mut tape, &enc, state, &traj.obs, residual, &f_mask);
         debug_assert_eq!(f_actions.len(), f_lps.len());
 
         let chosen_f = &traj.actions[t];
