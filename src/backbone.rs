@@ -1,17 +1,3 @@
-//! Phisharp V1 — Backbone relationnel non-réciproque, têtes factorisées GFlowNet,
-//! autograd vectoriel léger, perte Sub-Trajectory Balance et implémentation `AbductivePolicy`.
-//!
-//! À déclarer dans `src/lib.rs` :
-//!   pub mod hypothesis_graph;
-//!   pub mod projector;
-//!   pub mod refutation;
-//!   pub mod memory_controller;
-//!   pub mod ptgrs_synth;
-//!   pub mod backbone;
-//!
-//! Puis exécuter :
-//!   cargo test
-
 #![forbid(unsafe_code)]
 
 use std::collections::{BTreeMap, VecDeque};
@@ -20,7 +6,9 @@ use crate::hypothesis_graph::{
     AddNodeKind, BackwardAction, BackwardMask, Edge, EdgeKind, ForwardAction, ForwardMask,
     GraphConfig, HypothesisGraph, NodeId, NodeKind, SymbolId,
 };
-use crate::memory_controller::{AbductivePolicy, MaskedForwardView};
+use crate::memory_controller::{
+    AbductivePolicy, MaskedForwardView, ResidualGuidedHeuristicPolicy,
+};
 use crate::projector::{
     NodeAlignmentStatus, ObservationGraph, ResidualEdgeKind, ResidualGraph, project_and_residual,
 };
@@ -50,6 +38,94 @@ fn connect_category(kind: EdgeKind) -> usize {
         EdgeKind::Struct(0) => 3,
         EdgeKind::Struct(_) => 4,
         EdgeKind::SameAs => 5,
+    }
+}
+
+/// Calcule le plancher de pas atomiques nécessaire pour couvrir un effet `obs`
+/// sans couper prématurément les trajectoires de construction.
+#[inline]
+fn effective_traj_steps(base_max: usize, obs: &ObservationGraph) -> usize {
+    let min_for_effect = 2 * obs.node_count() + obs.edge_count() + 12;
+    base_max.max(min_for_effect)
+}
+
+/// Échantillonne une trajectoire complète H_0 -> ... -> H_T -> STOP avec n'importe quelle `AbductivePolicy`
+/// (utilisé pour l'amorçage off-policy via `ResidualGuidedHeuristicPolicy`, sans jamais lire H_true).
+pub fn sample_policy_trajectory<P: AbductivePolicy>(
+    policy: &mut P,
+    obs: &ObservationGraph,
+    graph_cfg: GraphConfig,
+    ref_cfg: RefutationConfig,
+    max_steps: usize,
+    temperature: f64,
+    epsilon_uniform: f64,
+    rng_seed: u64,
+) -> AbductiveTrajectory {
+    let mut rng = SplitMix64::new(rng_seed);
+    let mut state = HypothesisGraph::new(graph_cfg);
+    let mut states = Vec::new();
+    let mut residuals = Vec::new();
+    let mut actions = Vec::new();
+
+    let step_limit = max_steps.max(2);
+
+    for step in 0..step_limit {
+        let (_, residual) =
+            project_and_residual(&state, obs, ref_cfg.projector_cfg, ref_cfg.residual_weights);
+        let mask = state.forward_mask();
+        let legal = mask.to_actions(&state.config().alphabet);
+
+        let chosen = if step + 1 == step_limit && mask.allow_stop {
+            ForwardAction::Stop
+        } else {
+            let masked_view = MaskedForwardView {
+                mask,
+                legal_actions: legal.clone(),
+                blocked_count: 0,
+            };
+            let logits = policy.score_forward(&state, obs, &residual, &masked_view);
+            let idx = sample_from_log_probs(&logits, temperature, epsilon_uniform, &mut rng);
+            legal[idx]
+        };
+
+        states.push(state.clone());
+        residuals.push(residual);
+        actions.push(chosen);
+
+        if matches!(chosen, ForwardAction::Stop) {
+            break;
+        }
+        state = state
+            .apply_forward(&chosen)
+            .expect("Action issue de ForwardMask toujours légale");
+
+        if state
+            .forward_mask()
+            .to_actions(&state.config().alphabet)
+            .is_empty()
+        {
+            break;
+        }
+    }
+
+    if actions.last() != Some(&ForwardAction::Stop) {
+        let (_, residual) =
+            project_and_residual(&state, obs, ref_cfg.projector_cfg, ref_cfg.residual_weights);
+        states.push(state);
+        residuals.push(residual);
+        actions.push(ForwardAction::Stop);
+    }
+
+    let terminal_h = states.last().expect("Au moins H_1 présent");
+    let report = evaluate_phi_sharp(terminal_h, obs, ref_cfg);
+
+    AbductiveTrajectory {
+        obs: obs.clone(),
+        states,
+        residuals,
+        actions,
+        log_phi_sharp: report.log_phi_sharp,
+        terminal_residual_norm: report.residual.norm,
     }
 }
 
@@ -2034,7 +2110,6 @@ impl AdamOptimizer {
     }
 }
 
-/// Configuration d'entraînement Sub-Trajectory Balance pour Phisharp V1.
 #[derive(Clone, Copy, Debug)]
 pub struct SubTbTrainConfig {
     pub learning_rate: f64,
@@ -2045,6 +2120,10 @@ pub struct SubTbTrainConfig {
     pub replay_samples_per_step: usize,
     pub use_back_and_forth: bool,
     pub back_and_forth_steps: usize,
+    /// Probabilité par pas d'injecter une trajectoire off-policy via `ResidualGuidedHeuristicPolicy`.
+    pub guided_explore_prob: f64,
+    /// Température softmax utilisée pour la politique heuristique d'amorçage.
+    pub guided_temperature: f64,
     pub refutation_cfg: RefutationConfig,
 }
 
@@ -2053,12 +2132,14 @@ impl Default for SubTbTrainConfig {
         Self {
             learning_rate: 3e-3,
             subtb_lambda: 0.9,
-            max_trajectory_steps: 14,
+            max_trajectory_steps: 36,
             sample_temperature: 1.1,
             epsilon_uniform: 0.1,
             replay_samples_per_step: 2,
             use_back_and_forth: true,
-            back_and_forth_steps: 3,
+            back_and_forth_steps: 4,
+            guided_explore_prob: 0.6,
+            guided_temperature: 0.45,
             refutation_cfg: RefutationConfig::default(),
         }
     }
@@ -2100,25 +2181,26 @@ impl SubTbTrainer {
     pub fn replay_len(&self) -> usize {
         self.replay.len()
     }
-
-    /// Exécute un pas d'entraînement sur un lot d'échantillons PTGRS (uniquement E, jamais H_true).
+    
     pub fn train_step(
         &mut self,
         backbone: &mut RelationalBackbone,
         batch: &[TrainingSample],
     ) -> TrainStepMetrics {
         assert!(!batch.is_empty(), "Le batch d'entraînement ne peut pas être vide");
-        let mut trajectories = Vec::with_capacity(batch.len() + self.cfg.replay_samples_per_step + 1);
+        let mut trajectories =
+            Vec::with_capacity(batch.len() + self.cfg.replay_samples_per_step + 2);
 
         // 1. Trajectoires on-policy sur les effets E du batch PTGRS.
         for sample in batch {
+            let step_budget = effective_traj_steps(self.cfg.max_trajectory_steps, &sample.effect);
             let s_seed = self.rng.next_u64();
             let traj = sample_on_policy_trajectory(
                 backbone,
                 &sample.effect,
                 sample.recommended_graph_cfg.clone(),
                 self.cfg.refutation_cfg,
-                self.cfg.max_trajectory_steps,
+                step_budget,
                 self.cfg.sample_temperature,
                 self.cfg.epsilon_uniform,
                 s_seed,
@@ -2127,15 +2209,39 @@ impl SubTbTrainer {
             trajectories.push(traj);
         }
 
+        // 1b. Amorçage off-policy guidé par résidu (ResidualGuidedHeuristicPolicy, zéro fuite H_true).
+        if self.cfg.guided_explore_prob > 0.0
+            && self.rng.next_f64() < self.cfg.guided_explore_prob
+        {
+            let pick = (self.rng.next_u64() as usize) % batch.len();
+            let sample = &batch[pick];
+            let step_budget = effective_traj_steps(self.cfg.max_trajectory_steps, &sample.effect);
+            let g_seed = self.rng.next_u64();
+            let mut heuristic = ResidualGuidedHeuristicPolicy;
+            let g_traj = sample_policy_trajectory(
+                &mut heuristic,
+                &sample.effect,
+                sample.recommended_graph_cfg.clone(),
+                self.cfg.refutation_cfg,
+                step_budget,
+                self.cfg.guided_temperature,
+                0.05,
+                g_seed,
+            );
+            self.replay.push(g_traj.clone());
+            trajectories.push(g_traj);
+        }
+
         // 2. Trajectoire off-policy Back-and-Forth depuis un mode du replay buffer.
         if self.cfg.use_back_and_forth {
             if let Some(base) = self.replay.sample(&mut self.rng).cloned() {
+                let bf_budget = effective_traj_steps(self.cfg.max_trajectory_steps, &base.obs);
                 let bf_seed = self.rng.next_u64();
                 if let Some(bf_traj) = sample_back_and_forth_trajectory(
                     backbone,
                     &base,
                     self.cfg.back_and_forth_steps,
-                    self.cfg.max_trajectory_steps,
+                    bf_budget,
                     self.cfg.refutation_cfg,
                     self.cfg.sample_temperature,
                     self.cfg.epsilon_uniform,
