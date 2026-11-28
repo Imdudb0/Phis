@@ -565,7 +565,7 @@ impl TensorTape {
         let v = self.values[x][0];
         self.push(vec![v * v], TapeOp::Square(x))
     }
-    
+
     fn huber(&mut self, x: TapeNode, delta: f64) -> TapeNode {
         let v = self.values[x][0];
         let av = v.abs();
@@ -1244,7 +1244,7 @@ impl RelationalBackbone {
     pub fn param_count(&self) -> usize {
         self.params.len()
     }
-    
+
     #[inline]
     pub fn flow_param_range(&self) -> (usize, usize) {
         self.layout.flow_param_range
@@ -1322,7 +1322,7 @@ impl RelationalBackbone {
             concat_ctx,
         );
         let global_ctx = tape.tanh(g_lin);
-        
+
         EncodedState {
             hyp_nodes: h[tri.hyp_range.0..tri.hyp_range.1].to_vec(),
             sym_nodes: h[tri.sym_range.0..tri.sym_range.1].to_vec(),
@@ -1358,7 +1358,7 @@ impl RelationalBackbone {
         if active_fams.is_empty() {
             return Vec::new();
         }
-        
+
         let fam_ctx = tape.linear(
             &self.params,
             self.layout.pf_fam_w,
@@ -1715,7 +1715,29 @@ pub struct AbductiveTrajectory {
     pub terminal_residual_norm: f64,
 }
 
-/// Regroupe les indices des actions P_F de `legal_actions` menant au même graphe canonique que `chosen`.
+/// Signature O(1) invariante par automorphisme pour pré-filtrer deux arêtes candidates.
+#[inline]
+fn edge_endpoint_signature(
+    state: &HypothesisGraph,
+    edge: Edge,
+) -> ((NodeKind, usize, bool), (NodeKind, usize, bool)) {
+    let a = (
+        state.nodes()[edge.src],
+        state.total_degree(edge.src),
+        state.membership(edge.src).is_some(),
+    );
+    let b = (
+        state.nodes()[edge.dst],
+        state.total_degree(edge.dst),
+        state.membership(edge.dst).is_some(),
+    );
+    if edge.kind == EdgeKind::SameAs && a > b {
+        (b, a)
+    } else {
+        (a, b)
+    }
+}
+
 fn canonical_forward_equivalence_indices(
     state: &HypothesisGraph,
     legal_actions: &[ForwardAction],
@@ -1723,22 +1745,25 @@ fn canonical_forward_equivalence_indices(
     next_state: &HypothesisGraph,
 ) -> Vec<usize> {
     match *chosen {
-        // AddNode et Stop sont toujours canoniquement uniques.
         ForwardAction::AddNode(_) | ForwardAction::Stop => legal_actions
             .iter()
             .position(|a| a == chosen)
             .into_iter()
             .collect(),
         ForwardAction::Connect(target_edge) => {
-            let target_key = next_state.canonical_key();
+            let target_sig = edge_endpoint_signature(state, target_edge);
+            let mut target_key: Option<crate::hypothesis_graph::CanonicalKey> = None;
             let mut indices = Vec::new();
             for (idx, a) in legal_actions.iter().enumerate() {
                 if let ForwardAction::Connect(e) = *a {
                     if e == target_edge {
                         indices.push(idx);
-                    } else if e.kind == target_edge.kind {
+                    } else if e.kind == target_edge.kind
+                        && edge_endpoint_signature(state, e) == target_sig
+                    {
+                        let tk = target_key.get_or_insert_with(|| next_state.canonical_key());
                         if let Ok(cand) = state.apply_forward(a) {
-                            if cand.canonical_key() == target_key {
+                            if &cand.canonical_key() == tk {
                                 indices.push(idx);
                             }
                         }
@@ -1748,16 +1773,26 @@ fn canonical_forward_equivalence_indices(
             indices
         }
         ForwardAction::Abstract(target_node) => {
-            let target_kind = state.nodes()[target_node];
-            let target_key = next_state.canonical_key();
+            let target_sig = (
+                state.nodes()[target_node],
+                state.total_degree(target_node),
+                state.membership(target_node).is_some(),
+            );
+            let mut target_key: Option<crate::hypothesis_graph::CanonicalKey> = None;
             let mut indices = Vec::new();
             for (idx, a) in legal_actions.iter().enumerate() {
                 if let ForwardAction::Abstract(v) = *a {
                     if v == target_node {
                         indices.push(idx);
-                    } else if state.nodes()[v] == target_kind {
+                    } else if (
+                        state.nodes()[v],
+                        state.total_degree(v),
+                        state.membership(v).is_some(),
+                    ) == target_sig
+                    {
+                        let tk = target_key.get_or_insert_with(|| next_state.canonical_key());
                         if let Ok(cand) = state.apply_forward(a) {
-                            if cand.canonical_key() == target_key {
+                            if &cand.canonical_key() == tk {
                                 indices.push(idx);
                             }
                         }
@@ -1769,14 +1804,13 @@ fn canonical_forward_equivalence_indices(
     }
 }
 
-/// Regroupe les indices des actions P_B sur `next_state` menant au même graphe canonique que `prev_state`.
 fn canonical_backward_equivalence_indices(
     prev_state: &HypothesisGraph,
     next_state: &HypothesisGraph,
     chosen_forward: &ForwardAction,
     legal_backward: &[BackwardAction],
 ) -> Vec<usize> {
-    let prev_key = prev_state.canonical_key();
+    let mut prev_key: Option<crate::hypothesis_graph::CanonicalKey> = None;
     let mut indices = Vec::new();
 
     match *chosen_forward {
@@ -1785,26 +1819,27 @@ fn canonical_backward_equivalence_indices(
                 AddNodeKind::Rule => NodeKind::Rule,
                 AddNodeKind::Conc(c) => NodeKind::Conc(c),
             };
+            // Tout nœud isolé de même `NodeKind` dans `next_state` donne un parent canoniquement identique.
             for (idx, ba) in legal_backward.iter().enumerate() {
                 if let BackwardAction::DelNode(v) = *ba {
                     if next_state.nodes()[v] == expected_node_kind {
-                        if let Ok(cand) = next_state.apply_backward(ba) {
-                            if cand.canonical_key() == prev_key {
-                                indices.push(idx);
-                            }
-                        }
+                        indices.push(idx);
                     }
                 }
             }
         }
         ForwardAction::Connect(target_edge) => {
+            let target_sig = edge_endpoint_signature(next_state, target_edge);
             for (idx, ba) in legal_backward.iter().enumerate() {
                 if let BackwardAction::DelEdge(e) = *ba {
                     if e == target_edge {
                         indices.push(idx);
-                    } else if e.kind == target_edge.kind {
+                    } else if e.kind == target_edge.kind
+                        && edge_endpoint_signature(next_state, e) == target_sig
+                    {
+                        let pk = prev_key.get_or_insert_with(|| prev_state.canonical_key());
                         if let Ok(cand) = next_state.apply_backward(ba) {
-                            if cand.canonical_key() == prev_key {
+                            if &cand.canonical_key() == pk {
                                 indices.push(idx);
                             }
                         }
@@ -1816,14 +1851,25 @@ fn canonical_backward_equivalence_indices(
             let NodeKind::Conc(orig_sym) = prev_state.nodes()[target_node] else {
                 return indices;
             };
+            let target_sig = (
+                next_state.total_degree(target_node),
+                next_state.membership(target_node).is_some(),
+            );
             for (idx, ba) in legal_backward.iter().enumerate() {
                 if let BackwardAction::UnAbstract { node, symbol } = *ba {
                     if symbol == orig_sym {
                         if node == target_node {
                             indices.push(idx);
-                        } else if let Ok(cand) = next_state.apply_backward(ba) {
-                            if cand.canonical_key() == prev_key {
-                                indices.push(idx);
+                        } else if (
+                            next_state.total_degree(node),
+                            next_state.membership(node).is_some(),
+                        ) == target_sig
+                        {
+                            let pk = prev_key.get_or_insert_with(|| prev_state.canonical_key());
+                            if let Ok(cand) = next_state.apply_backward(ba) {
+                                if &cand.canonical_key() == pk {
+                                    indices.push(idx);
+                                }
                             }
                         }
                     }
@@ -1836,8 +1882,8 @@ fn canonical_backward_equivalence_indices(
     indices
 }
 
-pub const DEFAULT_SUBTB_REWARD_BETA: f64 = 3.0;
-pub const DEFAULT_SUBTB_HUBER_DELTA: f64 = 10.0;
+pub const DEFAULT_SUBTB_REWARD_BETA: f64 = 2.0;
+pub const DEFAULT_SUBTB_HUBER_DELTA: f64 = 25.0;
 pub const DEFAULT_SUBTB_SOFT_FLOOR: f64 = -40.0;
 
 /// Compression strictement monotone sous `soft_floor` : garde une pente négative
@@ -1948,41 +1994,52 @@ pub fn subtb_loss_with_options(
             log_pb.push(tape.log_sum_exp(b_nodes));
         }
     }
-
-    // 2. Assemblage Sub-Trajectory Balance dans la phase ordonnée (reward_beta > 1).
+    
+    // 2. Sub-Trajectory Balance ancré sur le terminal :
+    //    - Tous les suffixes (i -> m) ancrés sur target_log_r (poids total ~75%, zéro decay 0.9^36)
+    //    - Toutes les transitions locales 1-pas (i -> i+1) pour la cohérence de flux (poids ~25%)
     let target_log_r = scaled_target_log_reward(traj.log_phi_sharp, reward_beta, soft_floor);
-    let lam = subtb_lambda.clamp(1e-4, 1.0);
+    let local_w = 0.35 * subtb_lambda.clamp(0.0, 1.0);
     let mut weight_sum = 0.0;
-    let mut weighted_terms: Vec<(f64, TapeNode)> = Vec::with_capacity((m * (m + 1)) / 2);
+    let mut weighted_terms: Vec<(f64, TapeNode)> = Vec::with_capacity(2 * m);
 
+    // 2a. Paires ancrées au puits terminal (i, m) pour i = 0..m (dont Trajectory Balance i = 0).
     for i in 0..m {
-        for j in (i + 1)..=m {
-            let w_ij = lam.powi((j - i) as i32);
-            weight_sum += w_ij;
+        let mut terms: Vec<(f64, TapeNode)> = Vec::with_capacity(2 * (m - i) + 1);
+        terms.push((1.0, log_f[i]));
+        for &lp in &log_pf[i..m] {
+            terms.push((1.0, lp));
+        }
+        for &lp in &log_pb[i..(m - 1)] {
+            terms.push((-1.0, lp));
+        }
+        let delta = tape.linear_comb(-target_log_r, terms);
+        let err = if huber_delta > 0.0 {
+            tape.huber(delta, huber_delta)
+        } else {
+            tape.square(delta)
+        };
+        weight_sum += 1.0;
+        weighted_terms.push((1.0, err));
+    }
 
-            let mut terms: Vec<(f64, TapeNode)> = Vec::with_capacity(2 * (j - i) + 2);
-            terms.push((1.0, log_f[i]));
-            for &lp in &log_pf[i..j] {
-                terms.push((1.0, lp));
-            }
-            let const_bias = if j < m {
-                terms.push((-1.0, log_f[j]));
-                0.0
-            } else {
-                -target_log_r
-            };
-            let pb_end = j.min(m - 1);
-            for &lp in &log_pb[i..pb_end] {
-                terms.push((-1.0, lp));
-            }
-
-            let delta = tape.linear_comb(const_bias, terms);
+    // 2b. Paires locales Detailed Balance (i, i + 1) pour i = 0..(m - 1).
+    if local_w > 0.0 {
+        for i in 0..(m - 1) {
+            let terms = vec![
+                (1.0, log_f[i]),
+                (1.0, log_pf[i]),
+                (-1.0, log_f[i + 1]),
+                (-1.0, log_pb[i]),
+            ];
+            let delta = tape.linear_comb(0.0, terms);
             let err = if huber_delta > 0.0 {
                 tape.huber(delta, huber_delta)
             } else {
                 tape.square(delta)
             };
-            weighted_terms.push((w_ij, err));
+            weight_sum += local_w;
+            weighted_terms.push((local_w, err));
         }
     }
 
@@ -2230,6 +2287,14 @@ impl TrajectoryReplayBuffer {
         self.elite.is_empty() && self.recent.is_empty()
     }
 
+        /// Score d'élite normalisé par |E| afin que les grands effets (diff 1..3)
+    /// ne soient jamais évincés par les effets triviaux de 3 nœuds (diff 0).
+    #[inline]
+    fn elite_score(t: &AbductiveTrajectory) -> f64 {
+        let denom = t.obs.node_count().max(1) as f64;
+        t.log_phi_sharp / denom
+    }
+
     pub fn push(&mut self, traj: AbductiveTrajectory) {
         if self.recent.len() >= self.max_recent {
             self.recent.pop_front();
@@ -2239,8 +2304,11 @@ impl TrajectoryReplayBuffer {
         if self.elite.len() < self.max_elite {
             self.elite.push(traj);
             self.sort_elite();
-        } else if let Some(worst) = self.elite.last() {
-            if traj.log_phi_sharp > worst.log_phi_sharp {
+        } else {
+            let new_score = Self::elite_score(&traj);
+            let worst_score = Self::elite_score(self.elite.last().unwrap());
+            // Accepte toute amélioration normalisée OU rafraîchit le dernier slot sur résidu nul.
+            if new_score > worst_score || traj.terminal_residual_norm == 0.0 {
                 let last = self.elite.len() - 1;
                 self.elite[last] = traj;
                 self.sort_elite();
@@ -2250,7 +2318,7 @@ impl TrajectoryReplayBuffer {
 
     fn sort_elite(&mut self) {
         self.elite
-            .sort_by(|a, b| b.log_phi_sharp.total_cmp(&a.log_phi_sharp));
+            .sort_by(|a, b| Self::elite_score(b).total_cmp(&Self::elite_score(a)));
     }
 
     fn sample(&self, rng: &mut SplitMix64) -> Option<&AbductiveTrajectory> {
@@ -2267,7 +2335,7 @@ impl TrajectoryReplayBuffer {
             self.recent.get(idx)
         }
     }
-    
+
     pub fn best_elite_residual(&self) -> f64 {
         self.elite
             .first()
@@ -2339,7 +2407,7 @@ impl AdamOptimizer {
             self.v[i] = self.beta2 * self.v[i] + (1.0 - self.beta2) * g * g;
             let m_hat = self.m[i] / bc1;
             let v_hat = self.v[i] / bc2;
-            
+
             let eff_lr = if i >= self.flow_range.0 && i < self.flow_range.1 {
                 self.lr * self.flow_lr_mult
             } else {
@@ -2388,7 +2456,12 @@ impl Default for SubTbTrainConfig {
             back_and_forth_steps: 4,
             guided_explore_prob: 1.0,
             guided_temperature: 0.2,
-            refutation_cfg: RefutationConfig::default(),
+            refutation_cfg: {
+                let mut rc = RefutationConfig::default();
+                rc.projector_cfg.max_nodes = 32;
+                rc.projector_cfg.max_steps = 32;
+                rc
+            },
         }
     }
 }
@@ -2435,7 +2508,7 @@ impl SubTbTrainer {
     pub fn replay_len(&self) -> usize {
         self.replay.len()
     }
-    
+
     /// Exécute un pas d'entraînement sur un lot d'échantillons PTGRS (uniquement E, jamais H_true).
     pub fn train_step(
         &mut self,
