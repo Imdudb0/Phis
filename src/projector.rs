@@ -5,11 +5,9 @@
 
 #![forbid(unsafe_code)]
 
-pub mod hypothesis_graph;
-
 use std::collections::{BTreeMap, BTreeSet};
 
-use hypothesis_graph::{Block, EdgeKind, HypothesisGraph, NodeId, NodeKind, RelId, SymbolId};
+use phisharp::hypothesis_graph::{Block, EdgeKind, HypothesisGraph, NodeId, NodeKind, RelId, SymbolId};
 
 /// Arête dirigée et typée dans un graphe d'observation (G_E ou E_hat).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
