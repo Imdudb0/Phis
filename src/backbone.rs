@@ -1890,7 +1890,7 @@ pub fn subtb_loss_with_options(
         // Transition avant t -> t + 1 (ou STOP si t == m - 1).
         let f_mask = state.forward_mask();
         let f_actions = f_mask.to_actions(&state.config().alphabet);
-        let f_lps = backbone.forward_log_probs_on_tape(&mut tape, &enc, &f_mask);
+        let f_lps = backbone.forward_log_probs_on_tape(&mut tape, &enc, state, &traj.obs, residual, &f_mask);
         debug_assert_eq!(f_actions.len(), f_lps.len());
 
         let chosen_f = &traj.actions[t];
