@@ -1,14 +1,3 @@
-//! Phisharp V1 — Contrôleur d'inférence `ask`, Mémoire Épisodique et boucle Back-and-Forth.
-//!
-//! À déclarer dans `src/lib.rs` :
-//!   pub mod hypothesis_graph;
-//!   pub mod projector;
-//!   pub mod refutation;
-//!   pub mod memory_controller;
-//!
-//! Puis exécuter :
-//!   cargo test
-
 #![forbid(unsafe_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -725,12 +714,55 @@ impl AbductivePolicy for ResidualGuidedHeuristicPolicy {
     fn score_forward(
         &mut self,
         state: &HypothesisGraph,
-        _obs: &ObservationGraph,
+        obs: &ObservationGraph,
         residual: &ResidualGraph,
         masked: &MaskedForwardView,
     ) -> Vec<f64> {
-        let missing_syms: BTreeSet<u8> = residual.missing_nodes.iter().map(|&(_, s)| s).collect();
-        let has_orphan_conc = (1..state.node_count()).any(|v| {
+        // 1. Multisets exacts des symboles et arêtes manquants dans R_t.
+        let mut missing_sym_counts: BTreeMap<u8, usize> = BTreeMap::new();
+        for &(_, sym) in &residual.missing_nodes {
+            *missing_sym_counts.entry(sym).or_insert(0) += 1;
+        }
+
+        let mut missing_edge_sigs: BTreeMap<(u8, u8, u8), usize> = BTreeMap::new();
+        for re in &residual.edges {
+            if let (crate::projector::ResidualEdgeKind::Missing(rel), Some((ou, ov))) =
+                (re.kind, re.obs_endpoints)
+            {
+                let sig = (obs.nodes[ou], rel, obs.nodes[ov]);
+                *missing_edge_sigs.entry(sig).or_insert(0) += 1;
+            }
+        }
+
+        // 2. Bornes topologiques observées dans G_E (degrés max + présence de 2-cycles).
+        let n_obs = obs.node_count();
+        let mut obs_out_deg = vec![0usize; n_obs];
+        let mut obs_in_deg = vec![0usize; n_obs];
+        let mut obs_has_2cycle = false;
+        for &e in &obs.edges {
+            obs_out_deg[e.src] += 1;
+            obs_in_deg[e.dst] += 1;
+            if obs
+                .edges
+                .contains(&crate::projector::ObsEdge::new(e.dst, e.src, e.rel))
+            {
+                obs_has_2cycle = true;
+            }
+        }
+        let max_obs_out = obs_out_deg.into_iter().max().unwrap_or(1).max(1);
+        let max_obs_in = obs_in_deg.into_iter().max().unwrap_or(1).max(1);
+
+        // 3. Degrés Struct actuels dans H_t et présence d'un nœud concret orphelin.
+        let n_hyp = state.node_count();
+        let mut hyp_struct_out = vec![0usize; n_hyp];
+        let mut hyp_struct_in = vec![0usize; n_hyp];
+        for &e in state.edges() {
+            if matches!(e.kind, EdgeKind::Struct(_)) {
+                hyp_struct_out[e.src] += 1;
+                hyp_struct_in[e.dst] += 1;
+            }
+        }
+        let has_orphan_conc = (1..n_hyp).any(|v| {
             matches!(state.nodes()[v], NodeKind::Conc(_)) && state.membership(v).is_none()
         });
 
@@ -740,47 +772,80 @@ impl AbductivePolicy for ResidualGuidedHeuristicPolicy {
             .map(|action| match *action {
                 ForwardAction::Stop => {
                     if residual.is_zero() {
-                        6.0
-                    } else if residual.norm < 2.0 {
+                        8.0
+                    } else if residual.norm <= 1.5 {
                         1.5
                     } else {
-                        -2.0
+                        -3.0
                     }
                 }
                 ForwardAction::AddNode(AddNodeKind::Conc(sym)) => {
-                    if missing_syms.contains(&sym) && !has_orphan_conc {
-                        3.0
-                    } else if missing_syms.contains(&sym) {
-                        1.2
+                    if residual.is_zero() || has_orphan_conc {
+                        -3.0
+                    } else if missing_sym_counts.contains_key(&sym) {
+                        3.8
                     } else {
-                        -0.5
+                        -3.0
                     }
                 }
                 ForwardAction::AddNode(AddNodeKind::Rule) => {
-                    if !residual.is_zero() && state.rule_count() == 0 {
-                        1.0
+                    if !residual.is_zero() && !has_orphan_conc && state.rule_count() == 0 {
+                        0.4
                     } else {
-                        -0.5
+                        -2.5
                     }
                 }
                 ForwardAction::Connect(edge) => match edge.kind {
                     EdgeKind::InSeed => {
-                        if !residual.missing_nodes.is_empty() {
-                            3.5
+                        if let NodeKind::Conc(sym) = state.nodes()[edge.dst] {
+                            if missing_sym_counts.contains_key(&sym) {
+                                5.5
+                            } else {
+                                -1.5
+                            }
                         } else {
-                            0.2
+                            -2.0
                         }
                     }
-                    EdgeKind::Struct(_) => {
-                        if residual.summary.missing_edges > 0 {
-                            3.2
+                    EdgeKind::Struct(rel) => {
+                        if residual.is_zero() {
+                            return -4.0;
+                        }
+                        let rev_exists = state
+                            .edges()
+                            .contains(&Edge::new(edge.dst, edge.src, EdgeKind::Struct(rel)));
+                        if rev_exists && !obs_has_2cycle {
+                            return -5.0;
+                        }
+                        if state.membership(edge.src) == Some(Block::Seed) {
+                            let over_deg = hyp_struct_out[edge.src] >= max_obs_out
+                                || hyp_struct_in[edge.dst] >= max_obs_in;
+                            if over_deg {
+                                return -4.5;
+                            }
+                            if let (NodeKind::Conc(su), NodeKind::Conc(sv)) =
+                                (state.nodes()[edge.src], state.nodes()[edge.dst])
+                            {
+                                if missing_edge_sigs.contains_key(&(su, rel, sv)) {
+                                    return 4.8;
+                                }
+                            }
+                            -4.0
                         } else {
-                            0.0
+                            // Arêtes Struct au sein d'un bloc RULE.
+                            if hyp_struct_out[edge.src] >= max_obs_out
+                                || hyp_struct_in[edge.dst] >= max_obs_in
+                            {
+                                -3.0
+                            } else {
+                                0.3
+                            }
                         }
                     }
-                    EdgeKind::InLhs | EdgeKind::InRhs | EdgeKind::SameAs => 1.0,
+                    EdgeKind::InLhs | EdgeKind::InRhs => 0.4,
+                    EdgeKind::SameAs => 0.6,
                 },
-                ForwardAction::Abstract(_) => 0.4,
+                ForwardAction::Abstract(_) => -0.5,
             })
             .collect()
     }
@@ -802,7 +867,13 @@ impl AbductivePolicy for ResidualGuidedHeuristicPolicy {
                     NodeKind::Conc(s) if excess_syms.contains(&s) => 2.5,
                     _ => 1.0,
                 },
-                BackwardAction::DelEdge(_) => 1.2,
+                BackwardAction::DelEdge(e) => {
+                    if matches!(e.kind, EdgeKind::Struct(_)) && residual.summary.excess_edges > 0 {
+                        2.5
+                    } else {
+                        1.0
+                    }
+                }
                 BackwardAction::UnAbstract { .. } => 0.3,
             })
             .collect()
