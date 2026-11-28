@@ -28,6 +28,136 @@ pub const NUM_TRIPARTITE_EDGE_TYPES: usize = 12;
 /// Catégories d'arêtes pour les têtes bilinéaires `CONNECT` et `DEL_EDGE` :
 /// [InSeed, InLhs, InRhs, Struct(0), Struct(>=1), SameAs].
 pub const NUM_CONNECT_CATS: usize = 6;
+/// Nombre de traits relationnels de paire injectés dans la tête `CONNECT` (0 ID brut d'octet).
+pub const CONNECT_PAIR_FEAT_DIM: usize = 6;
+
+struct ConnectPairStats {
+    obs_edge_sigs: BTreeMap<(SymbolId, u8, SymbolId), usize>,
+    missing_edge_sigs: BTreeMap<(SymbolId, u8, SymbolId), usize>,
+    missing_node_syms: BTreeMap<SymbolId, usize>,
+    obs_node_syms: BTreeMap<SymbolId, usize>,
+    max_obs_out: usize,
+    max_obs_in: usize,
+    obs_has_2cycle: bool,
+    hyp_struct_out: Vec<usize>,
+    hyp_struct_in: Vec<usize>,
+    total_obs_edges: f64,
+    total_missing_edges: f64,
+    total_obs_nodes: f64,
+    total_missing_nodes: f64,
+}
+
+impl ConnectPairStats {
+    fn build(state: &HypothesisGraph, obs: &ObservationGraph, residual: &ResidualGraph) -> Self {
+        let n_obs = obs.node_count();
+        let mut obs_out = vec![0usize; n_obs];
+        let mut obs_in = vec![0usize; n_obs];
+        let mut obs_has_2cycle = false;
+        let mut obs_edge_sigs: BTreeMap<(SymbolId, u8, SymbolId), usize> = BTreeMap::new();
+
+        for &e in &obs.edges {
+            obs_out[e.src] += 1;
+            obs_in[e.dst] += 1;
+            if obs
+                .edges
+                .contains(&crate::projector::ObsEdge::new(e.dst, e.src, e.rel))
+            {
+                obs_has_2cycle = true;
+            }
+            let sig = (obs.nodes[e.src], e.rel, obs.nodes[e.dst]);
+            *obs_edge_sigs.entry(sig).or_insert(0) += 1;
+        }
+
+        let mut missing_edge_sigs: BTreeMap<(SymbolId, u8, SymbolId), usize> = BTreeMap::new();
+        let mut total_missing_edges = 0usize;
+        for re in &residual.edges {
+            if let (ResidualEdgeKind::Missing(rel), Some((ou, ov))) = (re.kind, re.obs_endpoints) {
+                let sig = (obs.nodes[ou], rel, obs.nodes[ov]);
+                *missing_edge_sigs.entry(sig).or_insert(0) += 1;
+                total_missing_edges += 1;
+            }
+        }
+
+        let mut obs_node_syms: BTreeMap<SymbolId, usize> = BTreeMap::new();
+        for &sym in &obs.nodes {
+            *obs_node_syms.entry(sym).or_insert(0) += 1;
+        }
+        let mut missing_node_syms: BTreeMap<SymbolId, usize> = BTreeMap::new();
+        for &(_, sym) in &residual.missing_nodes {
+            *missing_node_syms.entry(sym).or_insert(0) += 1;
+        }
+
+        let n_hyp = state.node_count();
+        let mut hyp_struct_out = vec![0usize; n_hyp];
+        let mut hyp_struct_in = vec![0usize; n_hyp];
+        for &e in state.edges() {
+            if matches!(e.kind, EdgeKind::Struct(_)) {
+                hyp_struct_out[e.src] += 1;
+                hyp_struct_in[e.dst] += 1;
+            }
+        }
+
+        Self {
+            obs_edge_sigs,
+            missing_edge_sigs,
+            missing_node_syms,
+            obs_node_syms,
+            max_obs_out: obs_out.into_iter().max().unwrap_or(1).max(1),
+            max_obs_in: obs_in.into_iter().max().unwrap_or(1).max(1),
+            obs_has_2cycle,
+            hyp_struct_out,
+            hyp_struct_in,
+            total_obs_edges: obs.edge_count().max(1) as f64,
+            total_missing_edges: total_missing_edges.max(1) as f64,
+            total_obs_nodes: n_obs.max(1) as f64,
+            total_missing_nodes: residual.missing_nodes.len().max(1) as f64,
+        }
+    }
+
+    fn features(&self, state: &HypothesisGraph, edge: Edge) -> Vec<f64> {
+        let mut f = vec![0.0; CONNECT_PAIR_FEAT_DIM];
+        match edge.kind {
+            EdgeKind::Struct(rel) => {
+                if let (NodeKind::Conc(su), NodeKind::Conc(sv)) =
+                    (state.nodes()[edge.src], state.nodes()[edge.dst])
+                {
+                    let sig = (su, rel, sv);
+                    f[0] = (*self.missing_edge_sigs.get(&sig).unwrap_or(&0) as f64)
+                        / self.total_missing_edges;
+                    f[1] = (*self.obs_edge_sigs.get(&sig).unwrap_or(&0) as f64)
+                        / self.total_obs_edges;
+                }
+                let rev_exists = state
+                    .edges()
+                    .contains(&Edge::new(edge.dst, edge.src, EdgeKind::Struct(rel)));
+                if rev_exists && !self.obs_has_2cycle {
+                    f[2] = 1.0;
+                }
+                if self.hyp_struct_out[edge.src] >= self.max_obs_out
+                    || self.hyp_struct_in[edge.dst] >= self.max_obs_in
+                {
+                    f[3] = 1.0;
+                }
+            }
+            EdgeKind::InSeed => {
+                if let NodeKind::Conc(sym) = state.nodes()[edge.dst] {
+                    f[4] = (*self.missing_node_syms.get(&sym).unwrap_or(&0) as f64)
+                        / self.total_missing_nodes;
+                }
+                f[5] = 1.0;
+            }
+            EdgeKind::InLhs | EdgeKind::InRhs => {
+                if let NodeKind::Conc(sym) = state.nodes()[edge.dst] {
+                    f[4] = (*self.obs_node_syms.get(&sym).unwrap_or(&0) as f64)
+                        / self.total_obs_nodes;
+                }
+                f[5] = 1.0;
+            }
+            EdgeKind::SameAs => {}
+        }
+        f
+    }
+}
 
 #[inline]
 fn connect_category(kind: EdgeKind) -> usize {
@@ -839,6 +969,7 @@ struct ParamLayout {
     pf_conn_type_w: ParamMat,
     pf_conn_type_b: ParamSlice,
     pf_conn_bilin: [ParamMat; NUM_CONNECT_CATS],
+    pf_conn_pair_w: ParamSlice,
     pf_abs_w: ParamSlice,
     pf_abs_b: ParamSlice,
 
@@ -924,6 +1055,7 @@ impl ParamLayout {
         let pf_conn_type_w = a.mat(NUM_CONNECT_CATS, d);
         let pf_conn_type_b = a.slice(NUM_CONNECT_CATS);
         let pf_conn_bilin = std::array::from_fn(|_| a.mat(d, d));
+        let pf_conn_pair_w = a.slice(CONNECT_PAIR_FEAT_DIM);
         let pf_abs_w = a.slice(d);
         let pf_abs_b = a.slice(1);
 
@@ -956,6 +1088,7 @@ impl ParamLayout {
             pf_conn_type_w,
             pf_conn_type_b,
             pf_conn_bilin,
+            pf_conn_pair_w,
             pf_abs_w,
             pf_abs_b,
             pb_fam_w,
@@ -1035,6 +1168,7 @@ impl RelationalBackbone {
         for &m in &layout.pf_conn_bilin {
             init_mat(&mut params, m, &mut rng, 0.5);
         }
+        init_vec(&mut params, layout.pf_conn_pair_w, &mut rng, 0.5);
         init_vec(&mut params, layout.pf_abs_w, &mut rng, 0.5);
 
         init_mat(&mut params, layout.pb_fam_w, &mut rng, 0.5);
@@ -1172,14 +1306,15 @@ impl RelationalBackbone {
         tape.add_bias(&self.params, dot, self.layout.flow_b2)
     }
 
-    /// Tête factorisée P_F sur le tape : retourne les log-probabilités exactes
-    /// alignées 1-à-1 avec `mask.to_actions(&state.config().alphabet)`.
     fn forward_log_probs_on_tape(
         &self,
         tape: &mut TensorTape,
         enc: &EncodedState,
+        state: &HypothesisGraph,
+        obs: &ObservationGraph,
+        residual: &ResidualGraph,
         mask: &ForwardMask,
-    ) -> Vec<TapeNode> {
+    ) -> Vec<TapeNode>
         let active_fams: Vec<usize> = (0..4).filter(|&i| mask.family_mask[i]).collect();
         if active_fams.is_empty() {
             return Vec::new();
@@ -1257,6 +1392,9 @@ impl RelationalBackbone {
                 .collect();
             let cat_vec = tape.concat(cat_logits);
             let cat_lps = tape.log_softmax(cat_vec);
+            
+            let pair_stats = ConnectPairStats::build(state, obs, residual);
+            let w_pair = tape.param(&self.params, self.layout.pf_conn_pair_w);
 
             let mut scattered: Vec<Option<TapeNode>> = vec![None; mask.connect_edges.len()];
             for (cat_pos, &cat) in active_cats.iter().enumerate() {
@@ -1266,12 +1404,15 @@ impl RelationalBackbone {
                 let pair_scores: Vec<TapeNode> = by_cat[cat]
                     .iter()
                     .map(|&(_, edge)| {
-                        tape.bilinear(
+                        let bil = tape.bilinear(
                             &self.params,
                             self.layout.pf_conn_bilin[cat],
                             enc.hyp_nodes[edge.src],
                             enc.hyp_nodes[edge.dst],
-                        )
+                        );
+                        let pf = tape.const_vec(pair_stats.features(state, edge));
+                        let pf_dot = tape.dot(w_pair, pf);
+                        tape.add(bil, pf_dot)
                     })
                     .collect();
                 let pair_vec = tape.concat(pair_scores);
@@ -1471,7 +1612,7 @@ impl RelationalBackbone {
     ) -> Vec<f64> {
         let mut tape = TensorTape::new();
         let enc = self.encode_on_tape(&mut tape, state, obs, residual);
-        let lps = self.forward_log_probs_on_tape(&mut tape, &enc, mask);
+        let lps = self.forward_log_probs_on_tape(&mut tape, &enc, state, obs, residual, mask);
         lps.into_iter().map(|n| tape.scalar(n)).collect()
     }
 
@@ -1687,7 +1828,7 @@ pub fn subtb_loss_and_accumulate_grad(
         // Transition avant t -> t + 1 (ou STOP si t == m - 1).
         let f_mask = state.forward_mask();
         let f_actions = f_mask.to_actions(&state.config().alphabet);
-        let f_lps = backbone.forward_log_probs_on_tape(&mut tape, &enc, &f_mask);
+        let f_lps = backbone.forward_log_probs_on_tape(&mut tape, &enc, state, obs, residual, &f_mask);
         debug_assert_eq!(f_actions.len(), f_lps.len());
 
         let chosen_f = &traj.actions[t];
@@ -2181,7 +2322,7 @@ impl SubTbTrainer {
     pub fn replay_len(&self) -> usize {
         self.replay.len()
     }
-    
+
     pub fn train_step(
         &mut self,
         backbone: &mut RelationalBackbone,
