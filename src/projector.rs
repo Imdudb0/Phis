@@ -1532,7 +1532,7 @@ fn refine_local_search(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hypothesis_graph::{AddNodeKind, Edge, ForwardAction, GraphConfig};
+    use crate::hypothesis_graph::{AddNodeKind, Edge, ForwardAction, GraphConfig};
 
     fn apply_seq(mut g: HypothesisGraph, actions: &[ForwardAction]) -> HypothesisGraph {
         for a in actions {
