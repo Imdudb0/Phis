@@ -27,8 +27,8 @@ jobs:
 
       - name: Run Phisharp
         run: |
-          #cargo run --release -- train --out out/sharp.phis --steps 120
-          cargo run --release -- inspect --model out/sharp.phis
+          cargo run --release -- train --out out/sharp.phis --steps 120
+          #cargo run --release -- inspect --model out/sharp.phis
         env:
           RUSTFLAGS: "-C target-cpu=native"
 
