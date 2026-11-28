@@ -135,7 +135,7 @@ impl Default for TrainCliArgs {
             num_layers: 2,
             lr: 3e-3,
             max_traj_steps: 36,
-            guided_prob: 0.6,
+            guided_prob: 1.0,
             max_difficulty: 3,
             eval_samples: 4,
             eval_budget: 120,
@@ -276,15 +276,15 @@ fn run_train(args: &[String]) -> Result<(), String> {
             && (step_num == 1 || step_num % cli.log_every == 0 || step_num == cli.steps)
         {
             println!(
-                "  pas {:>4}/{} | diff={} | loss={:>8.4} | log_phi={:>7.3} | res={:>5.2} | |g|={:>6.3} | replay={}",
+                "  pas {:>4}/{} | diff={} | loss={:>7.3} | log_phi={:>7.3} | on_res={:>5.2} | elite_res={:>4.2} | |g|={:>6.2}",
                 step_num,
                 cli.steps,
                 current_diff,
                 metrics.mean_subtb_loss,
                 metrics.mean_log_phi_sharp,
-                metrics.mean_terminal_residual,
+                metrics.on_policy_residual,
+                metrics.elite_best_residual,
                 metrics.grad_norm,
-                trainer.replay_len()
             );
         }
     }
@@ -336,10 +336,10 @@ fn run_offline_validation(
     let ask_cfg = AskConfig {
         budget_steps: eval_budget,
         max_forward_run: 36,
-        forward_temperature: 0.85,
+        forward_temperature: 0.6,
         ..AskConfig::default()
     };
-    
+
     let controller = AskController::new(ask_cfg);
 
     let mut exact_hits = 0usize;
@@ -433,7 +433,7 @@ impl Default for AskCliArgs {
             max_rules: 3,
             max_edges: None,
             num_struct_rels: 1,
-            temp_f: 0.85,
+            temp_f: 0.6,
             temp_b: 1.0,
             seed: 0x5048_4953,
             show_trace: false,
