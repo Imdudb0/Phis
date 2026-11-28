@@ -27,9 +27,9 @@ jobs:
 
       - name: Run Phisharp
         run: |
-          #cargo run --release -- train --out out/sharp.phis --steps 200 --eval-budget 120
+          cargo run --release -- train --out out/sharp.phis --steps 200 --eval-budget 120
           #cargo run --release -- inspect --model out/sharp.phis
-          cargo run --release -- ask --model out/sharp.phis --file perceived.eff --budget 180
+          #cargo run --release -- ask --model out/sharp.phis --file perceived.eff --budget 180
         env:
           RUSTFLAGS: "-C target-cpu=native"
 
