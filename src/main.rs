@@ -1,10 +1,3 @@
-//! Phisharp V1 — Interface CLI (`train`, `ask`, `inspect`).
-//!
-//! Exemples :
-//!   cargo run --release -- train --out out/sharp.phis --steps 120
-//!   cargo run --release -- ask --model out/sharp.phis --file perceived.eff
-//!   cargo run --release -- inspect --model out/sharp.phis
-
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
@@ -65,10 +58,10 @@ fn print_usage() {
                  --hidden-dim <D>        Dimension cachée D (défaut : 24)\n\
                  --layers <L>            Couches non-réciproques L (défaut : 2)\n\
                  --lr <F>                Taux d'apprentissage AdamW (défaut : 0.003)\n\
-                 --max-traj-steps <N>    Profondeur max de trajectoire SubTB (défaut : 14)\n\
+                 --max-traj-steps <N>    Profondeur max de trajectoire SubTB (défaut : 36)\n\
                  --max-difficulty <0..3> Niveau final du curriculum PTGRS (défaut : 3)\n\
                  --eval-samples <N>      Tâches d'évaluation hors-ligne en fin de run (défaut : 4)\n\
-                 --eval-budget <B>       Budget Back-and-Forth en évaluation (défaut : 60)\n\
+                 --eval-budget <B>       Budget Back-and-Forth en évaluation (défaut : 120)\n\
                  --log-every <N>         Fréquence d'affichage des métriques (défaut : 10)\n\
                  --seed <U64>            Graine déterministe (défaut : 1346914643)\n\
          \n\
@@ -78,7 +71,7 @@ fn print_usage() {
                  --model <PATH>          Modèle binaire `.phis` (ex. out/sharp.phis)\n\
                  --file <PATH>           Fichier d'effet brut en octets (ex. perceived.eff)\n\
                  --budget <B>            Budget fixe de transitions P_F + P_B (défaut : 120)\n\
-                 --max-forward <N>       Longueur max d'une marche avant (défaut : 24)\n\
+                 --max-forward <N>       Longueur max d'une marche avant (défaut : 36)\n\
                  --max-modes <K>         Nombre max de bassins causaux archivés (défaut : 4)\n\
                  --max-nodes <N>         Borne V_max du graphe d'hypothèse (défaut : auto)\n\
                  --max-rules <N>         Borne R_max sur les règles (défaut : 3)\n\
@@ -123,6 +116,7 @@ struct TrainCliArgs {
     num_layers: usize,
     lr: f64,
     max_traj_steps: usize,
+    guided_prob: f64,
     max_difficulty: u8,
     eval_samples: usize,
     eval_budget: usize,
@@ -140,10 +134,11 @@ impl Default for TrainCliArgs {
             hidden_dim: 24,
             num_layers: 2,
             lr: 3e-3,
-            max_traj_steps: 14,
+            max_traj_steps: 36,
+            guided_prob: 0.6,
             max_difficulty: 3,
             eval_samples: 4,
-            eval_budget: 60,
+            eval_budget: 120,
             log_every: 10,
             seed: 0x5048_4953,
         }
@@ -172,6 +167,13 @@ fn parse_train_args(args: &[String]) -> Result<TrainCliArgs, String> {
                     return Err("--max-difficulty doit être compris entre 0 et 3".into());
                 }
                 cli.max_difficulty = d;
+            }
+            "--guided-prob" => {
+                let p: f64 = parse_val(next_val(args, &mut i, flag)?, flag)?;
+                if !(0.0..=1.0).contains(&p) {
+                    return Err("--guided-prob doit être compris entre 0.0 et 1.0".into());
+                }
+                cli.guided_prob = p;
             }
             "--eval-samples" => cli.eval_samples = parse_val(next_val(args, &mut i, flag)?, flag)?,
             "--eval-budget" => cli.eval_budget = parse_val(next_val(args, &mut i, flag)?, flag)?,
@@ -236,6 +238,7 @@ fn run_train(args: &[String]) -> Result<(), String> {
     let train_cfg = SubTbTrainConfig {
         learning_rate: cli.lr,
         max_trajectory_steps: cli.max_traj_steps,
+        guided_explore_prob: cli.guided_prob,
         ..SubTbTrainConfig::default()
     };
     let mut trainer = SubTbTrainer::new(&backbone, train_cfg, 32, 64, cli.seed ^ 0x1234_5678);
@@ -332,10 +335,11 @@ fn run_offline_validation(
 
     let ask_cfg = AskConfig {
         budget_steps: eval_budget,
-        max_forward_run: 16,
+        max_forward_run: 36,
         forward_temperature: 0.85,
         ..AskConfig::default()
     };
+    
     let controller = AskController::new(ask_cfg);
 
     let mut exact_hits = 0usize;
@@ -423,7 +427,7 @@ impl Default for AskCliArgs {
             model_path: None,
             file_path: None,
             budget_steps: 120,
-            max_forward_run: 24,
+            max_forward_run: 36,
             max_modes: 4,
             max_nodes: None,
             max_rules: 3,
