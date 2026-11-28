@@ -1867,7 +1867,72 @@ pub fn subtb_loss_with_options(
     loss_scale: f64,
     param_grads: &mut [f64],
 ) -> f64 {
-    // ... garder la section 1 (encodage des états H_0 .. H_T) strictement identique ...
+    let m = traj.states.len();
+    assert!(m >= 2, "Une trajectoire SubTB doit contenir au moins H_0 et H_1");
+    assert_eq!(traj.residuals.len(), m);
+    assert_eq!(traj.actions.len(), m);
+    assert_eq!(traj.actions[m - 1], ForwardAction::Stop);
+
+    let mut tape = TensorTape::new();
+
+    // 1. Encodage de tous les états H_0 .. H_T sur le même tape.
+    let mut log_f: Vec<TapeNode> = Vec::with_capacity(m);
+    let mut log_pf: Vec<TapeNode> = Vec::with_capacity(m);
+    let mut log_pb: Vec<TapeNode> = Vec::with_capacity(m - 1);
+
+    for t in 0..m {
+        let state = &traj.states[t];
+        let residual = &traj.residuals[t];
+        let enc = backbone.encode_on_tape(&mut tape, state, &traj.obs, residual);
+
+        log_f.push(backbone.log_flow_on_tape(&mut tape, &enc));
+
+        // Transition avant t -> t + 1 (ou STOP si t == m - 1).
+        let f_mask = state.forward_mask();
+        let f_actions = f_mask.to_actions(&state.config().alphabet);
+        let f_lps = backbone.forward_log_probs_on_tape(&mut tape, &enc, &f_mask);
+        debug_assert_eq!(f_actions.len(), f_lps.len());
+
+        let chosen_f = &traj.actions[t];
+        let eq_f = if t + 1 < m {
+            canonical_forward_equivalence_indices(state, &f_actions, chosen_f, &traj.states[t + 1])
+        } else {
+            f_actions
+                .iter()
+                .position(|a| a == &ForwardAction::Stop)
+                .into_iter()
+                .collect()
+        };
+        assert!(
+            !eq_f.is_empty(),
+            "Action avant {:?} introuvable à l'étape {t}",
+            chosen_f
+        );
+        let f_nodes: Vec<TapeNode> = eq_f.into_iter().map(|i| f_lps[i]).collect();
+        log_pf.push(tape.log_sum_exp(f_nodes));
+
+        // Transition arrière t -> t - 1 (pour t >= 1).
+        if t >= 1 {
+            let b_mask = state.backward_mask();
+            let b_actions = b_mask.to_actions(state.edges(), &state.config().alphabet);
+            let b_lps = backbone.backward_log_probs_on_tape(&mut tape, &enc, state, &b_mask);
+            debug_assert_eq!(b_actions.len(), b_lps.len());
+
+            let eq_b = canonical_backward_equivalence_indices(
+                &traj.states[t - 1],
+                state,
+                &traj.actions[t - 1],
+                &b_actions,
+            );
+            assert!(
+                !eq_b.is_empty(),
+                "Inverse arrière introuvable à l'étape {t} pour {:?}",
+                traj.actions[t - 1]
+            );
+            let b_nodes: Vec<TapeNode> = eq_b.into_iter().map(|i| b_lps[i]).collect();
+            log_pb.push(tape.log_sum_exp(b_nodes));
+        }
+    }
 
     // 2. Assemblage Sub-Trajectory Balance avec plancher log_phi et perte Huber.
     let target_log_phi = traj.log_phi_sharp.max(min_log_phi);
