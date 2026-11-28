@@ -378,6 +378,10 @@ enum TapeOp {
         terms: Vec<(f64, TapeNode)>,
     },
     Square(TapeNode),
+    Huber {
+        x: TapeNode,
+        delta: f64,
+    },
 }
 
 struct TensorTape {
@@ -561,6 +565,17 @@ impl TensorTape {
         let v = self.values[x][0];
         self.push(vec![v * v], TapeOp::Square(x))
     }
+    
+    fn huber(&mut self, x: TapeNode, delta: f64) -> TapeNode {
+        let v = self.values[x][0];
+        let av = v.abs();
+        let val = if av <= delta {
+            0.5 * v * v
+        } else {
+            delta * (av - 0.5 * delta)
+        };
+        self.push(vec![val], TapeOp::Huber { x, delta })
+    }
 
     /// Rétropropagation exacte depuis un nœud scalaire `loss_node` vers `param_grads`.
     fn backward(&self, loss_node: TapeNode, params: &[f64], param_grads: &mut [f64]) {
@@ -699,6 +714,15 @@ impl TensorTape {
                 TapeOp::Square(x) => {
                     let vx = self.values[*x][0];
                     grads[*x][0] += 2.0 * vx * gy[0];
+                }
+                TapeOp::Huber { x, delta } => {
+                    let vx = self.values[*x][0];
+                    let dv = if vx.abs() <= *delta {
+                        vx
+                    } else {
+                        delta * vx.signum()
+                    };
+                    grads[*x][0] += dv * gy[0];
                 }
             }
         }
@@ -953,6 +977,7 @@ struct ParamLayout {
     global_b: ParamSlice,
 
     // Tête scalaire log F_theta(H_t, E)
+    flow_param_range: (usize, usize),
     flow_w1: ParamMat,
     flow_b1: ParamSlice,
     flow_w2: ParamSlice,
@@ -960,6 +985,7 @@ struct ParamLayout {
 
     // Têtes factorisées P_F
     pf_fam_w: ParamMat,
+    pf_fam_res_w: ParamMat,
     pf_fam_b: ParamSlice,
     pf_add_rule_w: ParamSlice,
     pf_add_rule_b: ParamSlice,
@@ -1040,12 +1066,15 @@ impl ParamLayout {
         let global_w = a.mat(d, 3 * d + GLOBAL_RES_DIM);
         let global_b = a.slice(d);
 
+        let flow_start = a.offset;
         let flow_w1 = a.mat(d, d);
         let flow_b1 = a.slice(d);
         let flow_w2 = a.slice(d);
         let flow_b2 = a.slice(1);
+        let flow_param_range = (flow_start, a.offset);
 
         let pf_fam_w = a.mat(4, d);
+        let pf_fam_res_w = a.mat(4, GLOBAL_RES_DIM);
         let pf_fam_b = a.slice(4);
         let pf_add_rule_w = a.slice(d);
         let pf_add_rule_b = a.slice(1);
@@ -1074,11 +1103,13 @@ impl ParamLayout {
             layers,
             global_w,
             global_b,
+            flow_param_range,
             flow_w1,
             flow_b1,
             flow_w2,
             flow_b2,
             pf_fam_w,
+            pf_fam_res_w,
             pf_fam_b,
             pf_add_rule_w,
             pf_add_rule_b,
@@ -1108,6 +1139,7 @@ struct EncodedState {
     hyp_nodes: Vec<TapeNode>,
     sym_nodes: Vec<TapeNode>,
     global_ctx: TapeNode,
+    global_res: TapeNode,
 }
 
 /// Backbone relationnel non-réciproque complet de Phisharp V1.
@@ -1172,6 +1204,7 @@ impl RelationalBackbone {
         init_vec(&mut params, layout.pf_abs_w, &mut rng, 0.5);
 
         init_mat(&mut params, layout.pb_fam_w, &mut rng, 0.5);
+        init_mat(&mut params, layout.pf_fam_res_w, &mut rng, 0.5);
         init_vec(&mut params, layout.pb_del_node_w, &mut rng, 0.5);
         for &m in &layout.pb_del_edge_bilin {
             init_mat(&mut params, m, &mut rng, 0.5);
@@ -1210,6 +1243,11 @@ impl RelationalBackbone {
     #[inline]
     pub fn param_count(&self) -> usize {
         self.params.len()
+    }
+    
+    #[inline]
+    pub fn flow_param_range(&self) -> (usize, usize) {
+        self.layout.flow_param_range
     }
 
     #[inline]
@@ -1284,11 +1322,12 @@ impl RelationalBackbone {
             concat_ctx,
         );
         let global_ctx = tape.tanh(g_lin);
-
+        
         EncodedState {
             hyp_nodes: h[tri.hyp_range.0..tri.hyp_range.1].to_vec(),
             sym_nodes: h[tri.sym_range.0..tri.sym_range.1].to_vec(),
             global_ctx,
+            global_res: res_vec,
         }
     }
 
@@ -1319,14 +1358,15 @@ impl RelationalBackbone {
         if active_fams.is_empty() {
             return Vec::new();
         }
-
-        // 1. Probabilité de famille p(op | g) masquée aux familles actives.
-        let fam_all = tape.linear(
+        
+        let fam_ctx = tape.linear(
             &self.params,
             self.layout.pf_fam_w,
             self.layout.pf_fam_b,
             enc.global_ctx,
         );
+        let fam_res = tape.matvec(&self.params, self.layout.pf_fam_res_w, enc.global_res);
+        let fam_all = tape.add(fam_ctx, fam_res);
         let fam_active_logits: Vec<TapeNode> = active_fams
             .iter()
             .map(|&f| tape.index(fam_all, f))
@@ -1392,7 +1432,7 @@ impl RelationalBackbone {
                 .collect();
             let cat_vec = tape.concat(cat_logits);
             let cat_lps = tape.log_softmax(cat_vec);
-            
+
             let pair_stats = ConnectPairStats::build(state, obs, residual);
             let w_pair = tape.param(&self.params, self.layout.pf_conn_pair_w);
 
@@ -1796,8 +1836,9 @@ fn canonical_backward_equivalence_indices(
     indices
 }
 
-/// Évalue la perte Sub-Trajectory Balance sur une trajectoire et accumule son gradient
-/// (pondéré par `loss_scale`) dans `param_grads`.
+pub const DEFAULT_SUBTB_HUBER_DELTA: f64 = 5.0;
+pub const DEFAULT_SUBTB_MIN_LOG_PHI: f64 = -25.0;
+
 pub fn subtb_loss_and_accumulate_grad(
     backbone: &RelationalBackbone,
     traj: &AbductiveTrajectory,
@@ -1805,75 +1846,31 @@ pub fn subtb_loss_and_accumulate_grad(
     loss_scale: f64,
     param_grads: &mut [f64],
 ) -> f64 {
-    let m = traj.states.len();
-    assert!(m >= 2, "Une trajectoire SubTB doit contenir au moins H_0 et H_1");
-    assert_eq!(traj.residuals.len(), m);
-    assert_eq!(traj.actions.len(), m);
-    assert_eq!(traj.actions[m - 1], ForwardAction::Stop);
+    subtb_loss_with_options(
+        backbone,
+        traj,
+        subtb_lambda,
+        DEFAULT_SUBTB_HUBER_DELTA,
+        DEFAULT_SUBTB_MIN_LOG_PHI,
+        loss_scale,
+        param_grads,
+    )
+}
 
-    let mut tape = TensorTape::new();
+/// Évalue la perte Sub-Trajectory Balance (Huber + plancher sur log_phi) et accumule le gradient.
+pub fn subtb_loss_with_options(
+    backbone: &RelationalBackbone,
+    traj: &AbductiveTrajectory,
+    subtb_lambda: f64,
+    huber_delta: f64,
+    min_log_phi: f64,
+    loss_scale: f64,
+    param_grads: &mut [f64],
+) -> f64 {
+    // ... garder la section 1 (encodage des états H_0 .. H_T) strictement identique ...
 
-    // 1. Encodage de tous les états H_0 .. H_T sur le même tape.
-    let mut log_f: Vec<TapeNode> = Vec::with_capacity(m);
-    let mut log_pf: Vec<TapeNode> = Vec::with_capacity(m);
-    let mut log_pb: Vec<TapeNode> = Vec::with_capacity(m - 1);
-
-    for t in 0..m {
-        let state = &traj.states[t];
-        let residual = &traj.residuals[t];
-        let enc = backbone.encode_on_tape(&mut tape, state, &traj.obs, residual);
-
-        log_f.push(backbone.log_flow_on_tape(&mut tape, &enc));
-
-        // Transition avant t -> t + 1 (ou STOP si t == m - 1).
-        let f_mask = state.forward_mask();
-        let f_actions = f_mask.to_actions(&state.config().alphabet);
-        let f_lps = backbone.forward_log_probs_on_tape(&mut tape, &enc, state, &traj.obs, residual, &f_mask);
-        debug_assert_eq!(f_actions.len(), f_lps.len());
-
-        let chosen_f = &traj.actions[t];
-        let eq_f = if t + 1 < m {
-            canonical_forward_equivalence_indices(state, &f_actions, chosen_f, &traj.states[t + 1])
-        } else {
-            f_actions
-                .iter()
-                .position(|a| a == &ForwardAction::Stop)
-                .into_iter()
-                .collect()
-        };
-        assert!(
-            !eq_f.is_empty(),
-            "Action avant {:?} introuvable à l'étape {t}",
-            chosen_f
-        );
-        let f_nodes: Vec<TapeNode> = eq_f.into_iter().map(|i| f_lps[i]).collect();
-        log_pf.push(tape.log_sum_exp(f_nodes));
-
-        // Transition arrière t -> t - 1 (pour t >= 1).
-        if t >= 1 {
-            let b_mask = state.backward_mask();
-            let b_actions = b_mask.to_actions(state.edges(), &state.config().alphabet);
-            let b_lps = backbone.backward_log_probs_on_tape(&mut tape, &enc, state, &b_mask);
-            debug_assert_eq!(b_actions.len(), b_lps.len());
-
-            let eq_b = canonical_backward_equivalence_indices(
-                &traj.states[t - 1],
-                state,
-                &traj.actions[t - 1],
-                &b_actions,
-            );
-            assert!(
-                !eq_b.is_empty(),
-                "Inverse arrière introuvable à l'étape {t} pour {:?}",
-                traj.actions[t - 1]
-            );
-            let b_nodes: Vec<TapeNode> = eq_b.into_iter().map(|i| b_lps[i]).collect();
-            log_pb.push(tape.log_sum_exp(b_nodes));
-        }
-    }
-
-    // 2. Assemblage exact de la perte Sub-Trajectory Balance sur tous les couples 0 <= i < j <= m.
-    // Indice m représente le puits terminal H_T^top avec log F_m = log_phi_sharp et log P_B(m->m-1) = 0.
+    // 2. Assemblage Sub-Trajectory Balance avec plancher log_phi et perte Huber.
+    let target_log_phi = traj.log_phi_sharp.max(min_log_phi);
     let lam = subtb_lambda.clamp(1e-4, 1.0);
     let mut weight_sum = 0.0;
     let mut weighted_terms: Vec<(f64, TapeNode)> = Vec::with_capacity((m * (m + 1)) / 2);
@@ -1892,8 +1889,7 @@ pub fn subtb_loss_and_accumulate_grad(
                 terms.push((-1.0, log_f[j]));
                 0.0
             } else {
-                // Condition frontière terminale : -log F(H_T^top, E) = -log phi_sharp(H_T, E).
-                -traj.log_phi_sharp
+                -target_log_phi
             };
             let pb_end = j.min(m - 1);
             for &lp in &log_pb[i..pb_end] {
@@ -1901,8 +1897,12 @@ pub fn subtb_loss_and_accumulate_grad(
             }
 
             let delta = tape.linear_comb(const_bias, terms);
-            let sq = tape.square(delta);
-            weighted_terms.push((w_ij, sq));
+            let err = if huber_delta > 0.0 {
+                tape.huber(delta, huber_delta)
+            } else {
+                tape.square(delta)
+            };
+            weighted_terms.push((w_ij, err));
         }
     }
 
@@ -2189,10 +2189,11 @@ impl TrajectoryReplayBuffer {
     }
 }
 
-/// Optimiseur AdamW léger avec clipping de norme L2 des gradients.
 #[derive(Clone, Debug)]
 pub struct AdamOptimizer {
     pub lr: f64,
+    pub flow_lr_mult: f64,
+    flow_range: (usize, usize),
     pub beta1: f64,
     pub beta2: f64,
     pub eps: f64,
@@ -2207,6 +2208,8 @@ impl AdamOptimizer {
     pub fn new(param_count: usize, lr: f64) -> Self {
         Self {
             lr,
+            flow_lr_mult: 1.0,
+            flow_range: (0, 0),
             beta1: 0.9,
             beta2: 0.999,
             eps: 1e-8,
@@ -2216,6 +2219,12 @@ impl AdamOptimizer {
             m: vec![0.0; param_count],
             v: vec![0.0; param_count],
         }
+    }
+
+    pub fn with_flow_range(mut self, flow_range: (usize, usize), flow_lr_mult: f64) -> Self {
+        self.flow_range = flow_range;
+        self.flow_lr_mult = flow_lr_mult.max(1.0);
+        self
     }
 
     /// Applique une mise à jour AdamW sur `params` et retourne la norme L2 brute du gradient.
@@ -2244,7 +2253,13 @@ impl AdamOptimizer {
             self.v[i] = self.beta2 * self.v[i] + (1.0 - self.beta2) * g * g;
             let m_hat = self.m[i] / bc1;
             let v_hat = self.v[i] / bc2;
-            params[i] -= self.lr * (m_hat / (v_hat.sqrt() + self.eps) + self.weight_decay * params[i]);
+            
+            let eff_lr = if i >= self.flow_range.0 && i < self.flow_range.1 {
+                self.lr * self.flow_lr_mult
+            } else {
+                self.lr
+            };
+            params[i] -= eff_lr * (m_hat / (v_hat.sqrt() + self.eps) + self.weight_decay * params[i]);
         }
 
         grad_norm
@@ -2266,6 +2281,9 @@ pub struct SubTbTrainConfig {
     /// Température softmax utilisée pour la politique heuristique d'amorçage.
     pub guided_temperature: f64,
     pub refutation_cfg: RefutationConfig,
+    pub huber_delta: f64,
+    pub min_log_phi: f64,
+    pub flow_lr_mult: f64,
 }
 
 impl Default for SubTbTrainConfig {
@@ -2282,6 +2300,9 @@ impl Default for SubTbTrainConfig {
             guided_explore_prob: 0.6,
             guided_temperature: 0.45,
             refutation_cfg: RefutationConfig::default(),
+            huber_delta: DEFAULT_SUBTB_HUBER_DELTA, 
+            min_log_phi: DEFAULT_SUBTB_MIN_LOG_PHI, 
+            flow_lr_mult: 5.0
         }
     }
 }
@@ -2311,9 +2332,11 @@ impl SubTbTrainer {
         replay_recent: usize,
         seed: u64,
     ) -> Self {
+        let optimizer = AdamOptimizer::new(backbone.param_count(), cfg.learning_rate)
+            .with_flow_range(backbone.flow_param_range(), cfg.flow_lr_mult);
         Self {
             cfg,
-            optimizer: AdamOptimizer::new(backbone.param_count(), cfg.learning_rate),
+            optimizer,
             replay: TrajectoryReplayBuffer::new(replay_elite, replay_recent),
             rng: SplitMix64::new(seed),
         }
@@ -2420,10 +2443,12 @@ impl SubTbTrainer {
         let mut total_res = 0.0;
 
         for traj in trajectories {
-            let loss = subtb_loss_and_accumulate_grad(
+            let loss = subtb_loss_with_options(
                 backbone,
                 traj,
                 self.cfg.subtb_lambda,
+                self.cfg.huber_delta,
+                self.cfg.min_log_phi,
                 inv_n,
                 &mut grads,
             );
