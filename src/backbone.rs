@@ -1836,8 +1836,21 @@ fn canonical_backward_equivalence_indices(
     indices
 }
 
-pub const DEFAULT_SUBTB_HUBER_DELTA: f64 = 5.0;
-pub const DEFAULT_SUBTB_MIN_LOG_PHI: f64 = -25.0;
+pub const DEFAULT_SUBTB_REWARD_BETA: f64 = 3.0;
+pub const DEFAULT_SUBTB_HUBER_DELTA: f64 = 10.0;
+pub const DEFAULT_SUBTB_SOFT_FLOOR: f64 = -40.0;
+
+/// Compression strictement monotone sous `soft_floor` : garde une pente négative
+/// sur les mauvais états (pas de plateau plat) tout en bornant les explosions (-594).
+#[inline]
+fn scaled_target_log_reward(log_phi: f64, reward_beta: f64, soft_floor: f64) -> f64 {
+    let compressed = if log_phi >= soft_floor {
+        log_phi
+    } else {
+        soft_floor - (soft_floor - log_phi).ln_1p() * 8.0
+    };
+    reward_beta * compressed
+}
 
 pub fn subtb_loss_and_accumulate_grad(
     backbone: &RelationalBackbone,
@@ -1850,20 +1863,22 @@ pub fn subtb_loss_and_accumulate_grad(
         backbone,
         traj,
         subtb_lambda,
+        DEFAULT_SUBTB_REWARD_BETA,
         DEFAULT_SUBTB_HUBER_DELTA,
-        DEFAULT_SUBTB_MIN_LOG_PHI,
+        DEFAULT_SUBTB_SOFT_FLOOR,
         loss_scale,
         param_grads,
     )
 }
 
-/// Évalue la perte Sub-Trajectory Balance (Huber + plancher sur log_phi) et accumule le gradient.
+#[allow(clippy::too_many_arguments)]
 pub fn subtb_loss_with_options(
     backbone: &RelationalBackbone,
     traj: &AbductiveTrajectory,
     subtb_lambda: f64,
+    reward_beta: f64,
     huber_delta: f64,
-    min_log_phi: f64,
+    soft_floor: f64,
     loss_scale: f64,
     param_grads: &mut [f64],
 ) -> f64 {
@@ -1934,8 +1949,8 @@ pub fn subtb_loss_with_options(
         }
     }
 
-    // 2. Assemblage Sub-Trajectory Balance avec plancher log_phi et perte Huber.
-    let target_log_phi = traj.log_phi_sharp.max(min_log_phi);
+    // 2. Assemblage Sub-Trajectory Balance dans la phase ordonnée (reward_beta > 1).
+    let target_log_r = scaled_target_log_reward(traj.log_phi_sharp, reward_beta, soft_floor);
     let lam = subtb_lambda.clamp(1e-4, 1.0);
     let mut weight_sum = 0.0;
     let mut weighted_terms: Vec<(f64, TapeNode)> = Vec::with_capacity((m * (m + 1)) / 2);
@@ -1954,7 +1969,7 @@ pub fn subtb_loss_with_options(
                 terms.push((-1.0, log_f[j]));
                 0.0
             } else {
-                -target_log_phi
+                -target_log_r
             };
             let pb_end = j.min(m - 1);
             for &lp in &log_pb[i..pb_end] {
@@ -2252,6 +2267,12 @@ impl TrajectoryReplayBuffer {
             self.recent.get(idx)
         }
     }
+    
+    pub fn best_elite_residual(&self) -> f64 {
+        self.elite
+            .first()
+            .map_or(f64::NAN, |t| t.terminal_residual_norm)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -2335,20 +2356,19 @@ impl AdamOptimizer {
 pub struct SubTbTrainConfig {
     pub learning_rate: f64,
     pub subtb_lambda: f64,
+    pub reward_beta: f64,
+    pub huber_delta: f64,
+    pub soft_floor_log_phi: f64,
+    pub flow_lr_mult: f64,
     pub max_trajectory_steps: usize,
     pub sample_temperature: f64,
     pub epsilon_uniform: f64,
     pub replay_samples_per_step: usize,
     pub use_back_and_forth: bool,
     pub back_and_forth_steps: usize,
-    /// Probabilité par pas d'injecter une trajectoire off-policy via `ResidualGuidedHeuristicPolicy`.
     pub guided_explore_prob: f64,
-    /// Température softmax utilisée pour la politique heuristique d'amorçage.
     pub guided_temperature: f64,
     pub refutation_cfg: RefutationConfig,
-    pub huber_delta: f64,
-    pub min_log_phi: f64,
-    pub flow_lr_mult: f64,
 }
 
 impl Default for SubTbTrainConfig {
@@ -2356,18 +2376,19 @@ impl Default for SubTbTrainConfig {
         Self {
             learning_rate: 3e-3,
             subtb_lambda: 0.9,
+            reward_beta: DEFAULT_SUBTB_REWARD_BETA,
+            huber_delta: DEFAULT_SUBTB_HUBER_DELTA,
+            soft_floor_log_phi: DEFAULT_SUBTB_SOFT_FLOOR,
+            flow_lr_mult: 5.0,
             max_trajectory_steps: 36,
-            sample_temperature: 1.1,
-            epsilon_uniform: 0.1,
+            sample_temperature: 1.0,
+            epsilon_uniform: 0.05,
             replay_samples_per_step: 2,
             use_back_and_forth: true,
             back_and_forth_steps: 4,
-            guided_explore_prob: 0.6,
-            guided_temperature: 0.45,
+            guided_explore_prob: 1.0,
+            guided_temperature: 0.2,
             refutation_cfg: RefutationConfig::default(),
-            huber_delta: DEFAULT_SUBTB_HUBER_DELTA, 
-            min_log_phi: DEFAULT_SUBTB_MIN_LOG_PHI, 
-            flow_lr_mult: 5.0
         }
     }
 }
@@ -2377,6 +2398,10 @@ pub struct TrainStepMetrics {
     pub mean_subtb_loss: f64,
     pub mean_log_phi_sharp: f64,
     pub mean_terminal_residual: f64,
+    /// Résidu moyen des seules trajectoires on-policy générées par le backbone.
+    pub on_policy_residual: f64,
+    /// Meilleur résidu actuellement présent dans le replay buffer élite.
+    pub elite_best_residual: f64,
     pub grad_norm: f64,
     pub trajectories_used: usize,
 }
@@ -2410,7 +2435,8 @@ impl SubTbTrainer {
     pub fn replay_len(&self) -> usize {
         self.replay.len()
     }
-
+    
+    /// Exécute un pas d'entraînement sur un lot d'échantillons PTGRS (uniquement E, jamais H_true).
     pub fn train_step(
         &mut self,
         backbone: &mut RelationalBackbone,
@@ -2421,6 +2447,7 @@ impl SubTbTrainer {
             Vec::with_capacity(batch.len() + self.cfg.replay_samples_per_step + 2);
 
         // 1. Trajectoires on-policy sur les effets E du batch PTGRS.
+        let mut on_policy_res_sum = 0.0;
         for sample in batch {
             let step_budget = effective_traj_steps(self.cfg.max_trajectory_steps, &sample.effect);
             let s_seed = self.rng.next_u64();
@@ -2434,11 +2461,13 @@ impl SubTbTrainer {
                 self.cfg.epsilon_uniform,
                 s_seed,
             );
+            on_policy_res_sum += traj.terminal_residual_norm;
             self.replay.push(traj.clone());
             trajectories.push(traj);
         }
+        let on_policy_res = on_policy_res_sum / (batch.len() as f64);
 
-        // 1b. Amorçage off-policy guidé par résidu (ResidualGuidedHeuristicPolicy, zéro fuite H_true).
+        // 1b. Amorçage off-policy guidé par résidu (zéro bruit uniforme, zéro fuite H_true).
         if self.cfg.guided_explore_prob > 0.0
             && self.rng.next_f64() < self.cfg.guided_explore_prob
         {
@@ -2454,7 +2483,7 @@ impl SubTbTrainer {
                 self.cfg.refutation_cfg,
                 step_budget,
                 self.cfg.guided_temperature,
-                0.05,
+                0.0,
                 g_seed,
             );
             self.replay.push(g_traj.clone());
@@ -2489,7 +2518,11 @@ impl SubTbTrainer {
             }
         }
 
-        self.update_on_trajectories(backbone, &trajectories)
+        // 4. Mise à jour SubTB puis remplacement par la vraie métrique on-policy + élite.
+        let mut metrics = self.update_on_trajectories(backbone, &trajectories);
+        metrics.on_policy_residual = on_policy_res;
+        metrics.elite_best_residual = self.replay.best_elite_residual();
+        metrics
     }
 
     /// Met à jour les poids du backbone sur une liste explicite de trajectoires.
@@ -2512,8 +2545,9 @@ impl SubTbTrainer {
                 backbone,
                 traj,
                 self.cfg.subtb_lambda,
+                self.cfg.reward_beta,
                 self.cfg.huber_delta,
-                self.cfg.min_log_phi,
+                self.cfg.soft_floor_log_phi,
                 inv_n,
                 &mut grads,
             );
@@ -2523,10 +2557,14 @@ impl SubTbTrainer {
         }
 
         let grad_norm = self.optimizer.step(backbone.params_mut(), &grads);
+        let mean_res = total_res * inv_n;
+
         TrainStepMetrics {
             mean_subtb_loss: total_loss * inv_n,
             mean_log_phi_sharp: total_log_phi * inv_n,
-            mean_terminal_residual: total_res * inv_n,
+            mean_terminal_residual: mean_res,
+            on_policy_residual: mean_res,
+            elite_best_residual: self.replay.best_elite_residual(),
             grad_norm,
             trajectories_used: trajectories.len(),
         }
